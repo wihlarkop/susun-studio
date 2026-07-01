@@ -5,11 +5,101 @@ export type DaemonHealth = {
   api_version: string;
 };
 
+export type ProjectSummarySchemaVersion = {
+  major: number;
+  minor: number;
+};
+
+export type StudioProjectResource = {
+  name: string;
+  external: boolean;
+};
+
+export type StudioServicePort = {
+  host_ip: string | null;
+  published: string | null;
+  target: number;
+  protocol: string;
+};
+
+export type StudioServiceVolume = {
+  kind: string;
+  source: string | null;
+  target: string;
+  read_only: boolean;
+};
+
+export type StudioServiceSummary = {
+  name: string;
+  active: boolean;
+  image: string | null;
+  has_build: boolean;
+  profile_count: number;
+  profiles: string[];
+  port_count: number;
+  ports: StudioServicePort[];
+  volume_count: number;
+  volumes: StudioServiceVolume[];
+  network_count: number;
+  networks: string[];
+  config_count: number;
+  configs: string[];
+  secret_count: number;
+  secrets: string[];
+  dependency_count: number;
+  dependencies: string[];
+};
+
+export type StudioProjectSummary = {
+  schema_version: ProjectSummarySchemaVersion;
+  project_name: string | null;
+  project_instance: string | null;
+  service_count: number;
+  active_service_count: number;
+  network_count: number;
+  volume_count: number;
+  config_count: number;
+  secret_count: number;
+  networks: StudioProjectResource[];
+  volumes: StudioProjectResource[];
+  configs: StudioProjectResource[];
+  secrets: StudioProjectResource[];
+  has_errors: boolean;
+  diagnostic_count: number;
+  services: StudioServiceSummary[];
+};
+
+export type DiagnosticLabel = {
+  primary: boolean;
+  message: string;
+  source: string | null;
+  start: number;
+  end: number;
+  line: number | null;
+  column: number | null;
+};
+
+export type Diagnostic = {
+  code: string;
+  severity: string;
+  message: string;
+  help: string | null;
+  labels: DiagnosticLabel[];
+};
+
+export type DiagnosticsPayload = {
+  diagnostics: Diagnostic[];
+};
+
 export type StudioProject = {
   id: string;
   name: string;
   path: string;
   created_at_ms: number;
+  last_analyzed_at_ms: number | null;
+  has_errors: boolean | null;
+  summary: StudioProjectSummary | null;
+  diagnostics: DiagnosticsPayload | null;
 };
 
 export type StudioSettings = {
@@ -18,6 +108,20 @@ export type StudioSettings = {
 
 type ProjectListResponse = {
   projects: StudioProject[];
+};
+
+export type ImportProjectRequest = {
+  files: string[];
+  env_file?: string | null;
+  project_name?: string | null;
+  profiles?: string[];
+};
+
+export type ImportProjectResponse = {
+  project: StudioProject | null;
+  summary: StudioProjectSummary | null;
+  diagnostics: DiagnosticsPayload;
+  has_errors: boolean;
 };
 
 type DaemonRequestOptions = {
@@ -55,6 +159,22 @@ export async function createProject(
     ...options,
     method: "POST",
     body: project,
+  });
+}
+
+export async function importProject(
+  request: ImportProjectRequest,
+  options: DaemonRequestOptions = {},
+): Promise<ImportProjectResponse> {
+  return readJson("/v1/projects/import", {
+    ...options,
+    method: "POST",
+    body: {
+      files: request.files,
+      env_file: request.env_file ?? null,
+      project_name: request.project_name ?? null,
+      profiles: request.profiles ?? [],
+    },
   });
 }
 
