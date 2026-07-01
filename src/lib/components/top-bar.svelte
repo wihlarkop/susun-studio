@@ -2,7 +2,7 @@
   import * as Sidebar from "$lib/components/ui/sidebar/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
 
-  let { connected }: { connected: boolean } = $props();
+  let { connected, onImportClick }: { connected: boolean; onImportClick: () => void } = $props();
 </script>
 
 <header class="flex items-center justify-between gap-4">
@@ -13,5 +13,5 @@
       <h2 class="text-2xl leading-tight font-semibold">Projects</h2>
     </div>
   </div>
-  <Button disabled={!connected}>Import Project</Button>
+  <Button disabled={!connected} onclick={onImportClick}>Import Project</Button>
 </header>

@@ -5,9 +5,11 @@
   import HeroPanel from "$lib/components/hero-panel.svelte";
   import ProjectsTable from "$lib/components/projects-table.svelte";
   import SettingsStrip from "$lib/components/settings-strip.svelte";
+  import ImportProjectDialog from "$lib/components/import-project-dialog.svelte";
   import { createDaemonState } from "$lib/daemon/daemon-state.svelte";
 
   const daemonState = createDaemonState();
+  let importDialogOpen = $state(false);
 </script>
 
 <svelte:head>
@@ -18,7 +20,10 @@
   <AppSidebar healthState={daemonState.healthState} />
   <Sidebar.Inset>
     <div class="flex flex-col gap-6 p-6">
-      <TopBar connected={daemonState.healthState.kind === "connected"} />
+      <TopBar
+        connected={daemonState.healthState.kind === "connected"}
+        onImportClick={() => (importDialogOpen = true)}
+      />
       <HeroPanel healthState={daemonState.healthState} />
       <ProjectsTable
         projects={daemonState.projects}
@@ -28,3 +33,9 @@
     </div>
   </Sidebar.Inset>
 </Sidebar.Provider>
+
+<ImportProjectDialog
+  bind:open={importDialogOpen}
+  connected={daemonState.healthState.kind === "connected"}
+  onImport={daemonState.importProject}
+/>
