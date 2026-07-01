@@ -4,6 +4,7 @@ mod db;
 mod error;
 mod routes;
 mod state;
+mod susun_integration;
 
 use std::sync::Arc;
 
