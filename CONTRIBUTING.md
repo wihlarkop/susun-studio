@@ -12,20 +12,18 @@ Susun Studio is currently in planning/bootstrap mode.
 ## Tooling
 
 - Use Bun for frontend package management and scripts.
-- Use Rust for Tauri backend code.
-- Use Turso/libSQL for local state.
+- Use Rust for Tauri backend code and the Studio daemon.
+- Use Turso Database through the `turso` Rust crate for local daemon state.
 - Use Tauri for desktop packaging.
 
 ## Quality Gates
 
-When implementation starts, expected local checks are:
+Expected local checks are:
 
 ```powershell
 bun run check
-cd src-tauri
 cargo fmt --all --check
-cargo check
-cargo clippy --all-targets -- -D warnings
+cargo check --workspace
 ```
 
-Runtime and packaging checks will be added after the app is scaffolded.
+Runtime and packaging checks should stay lightweight until the feature code is ready for full Tauri builds.

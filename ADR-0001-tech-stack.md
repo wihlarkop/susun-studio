@@ -20,7 +20,7 @@ Use:
 - lucide-svelte for icons.
 - Studio-owned table helpers for normal tables.
 - Custom virtualized log/event views for high-volume streams.
-- Turso/libSQL for local state.
+- Turso Database through the `turso` Rust crate for local state.
 - Thin Rust Tauri integration hooks for client-side shell integration and daemon process coordination.
 - A separate user-level Rust daemon, `susun-studio-daemon`, as the primary backend boundary.
 - Loopback HTTP and WebSocket as the Phase 1 daemon transport.

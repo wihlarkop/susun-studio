@@ -1,33 +1,85 @@
 <script lang="ts">
+  import { onMount } from "svelte";
+
+  import {
+    defaultDaemonBaseUrl,
+    listProjects,
+    readDaemonHealth,
+    readSettings,
+    type DaemonHealth,
+    type StudioProject,
+    type StudioSettings,
+  } from "$lib/daemon/client";
+
   type NavItem = {
     label: string;
     description: string;
     active?: boolean;
   };
 
+  type HealthState =
+    | { kind: "checking"; label: "Checking"; detail: string; health?: undefined }
+    | { kind: "connected"; label: "Connected"; detail: string; health: DaemonHealth }
+    | { kind: "disconnected"; label: "Disconnected"; detail: string; health?: undefined };
+
   const navItems: NavItem[] = [
-    {
-      label: "Projects",
-      description: "Imported Compose workspaces",
-      active: true,
-    },
-    {
-      label: "Reports",
-      description: "Analysis and review history",
-    },
-    {
-      label: "Engines",
-      description: "Docker-compatible runtimes",
-    },
-    {
-      label: "Settings",
-      description: "Studio and daemon preferences",
-    },
+    { label: "Projects", description: "Imported Compose workspaces", active: true },
+    { label: "Reports", description: "Analysis and review history" },
+    { label: "Engines", description: "Docker-compatible runtimes" },
+    { label: "Settings", description: "Studio and daemon preferences" },
   ];
 
-  const projectRows = [
-    { name: "No projects imported", path: "Connect the daemon to add a workspace" },
-  ];
+  let healthState: HealthState = {
+    kind: "checking",
+    label: "Checking",
+    detail: `Reading ${defaultDaemonBaseUrl}/v1/health`,
+  };
+  let projects: StudioProject[] = [];
+  let settings: StudioSettings | undefined;
+  let workspaceDetail = "Persisted projects will appear here after the daemon API is wired.";
+
+  onMount(() => {
+    const controller = new AbortController();
+
+    async function refreshDaemonState() {
+      try {
+        const health = await readDaemonHealth(defaultDaemonBaseUrl, controller.signal);
+        const [projectList, daemonSettings] = await Promise.all([
+          listProjects({ signal: controller.signal }),
+          readSettings({ signal: controller.signal }),
+        ]);
+
+        projects = projectList;
+        settings = daemonSettings;
+        workspaceDetail = projectList.length
+          ? `${projectList.length} project${projectList.length === 1 ? "" : "s"} persisted by the local daemon.`
+          : "No projects are stored yet. Import will write through the daemon API.";
+        healthState = {
+          kind: "connected",
+          label: "Connected",
+          detail: `Daemon ${health.version} using API v${health.api_version}`,
+          health,
+        };
+      } catch (error) {
+        if (controller.signal.aborted) {
+          return;
+        }
+
+        projects = [];
+        settings = undefined;
+        workspaceDetail = "Start the local daemon to load projects and settings.";
+        healthState = {
+          kind: "disconnected",
+          label: "Disconnected",
+          detail: error instanceof Error ? error.message : "Daemon health request failed",
+        };
+      }
+    }
+
+    refreshDaemonState();
+
+    return () => controller.abort();
+  });
 </script>
 
 <svelte:head>
@@ -53,11 +105,11 @@
       {/each}
     </nav>
 
-    <div class="daemon-card">
+    <div class="daemon-card" class:connected={healthState.kind === "connected"}>
       <span class="status-dot" aria-hidden="true"></span>
       <div>
-        <strong>Daemon disconnected</strong>
-        <p>Phase 1 will connect through the local authenticated API.</p>
+        <strong>Daemon {healthState.label.toLowerCase()}</strong>
+        <p>{healthState.detail}</p>
       </div>
     </div>
   </aside>
@@ -68,7 +120,9 @@
         <p class="eyebrow">Phase 1 Foundation</p>
         <h2>Projects</h2>
       </div>
-      <button class="primary-action" type="button">Import Project</button>
+      <button class="primary-action" type="button" disabled={healthState.kind !== "connected"}>
+        Import Project
+      </button>
     </header>
 
     <section class="hero-panel" aria-labelledby="daemon-heading">
@@ -80,16 +134,21 @@
           events, and future engine tasks live behind the local daemon API.
         </p>
       </div>
-      <div class="health-box">
+      <div class="health-box" class:connected={healthState.kind === "connected"}>
         <span>Health</span>
-        <strong>Waiting</strong>
+        <strong>{healthState.label}</strong>
+        {#if healthState.health}
+          <small>{healthState.health.product}</small>
+        {:else}
+          <small>{defaultDaemonBaseUrl}</small>
+        {/if}
       </div>
     </section>
 
     <section class="workspace-grid" aria-label="Project overview">
       <div class="section-heading">
         <h3>Workspace Projects</h3>
-        <p>Persisted projects will appear here after the daemon API is wired.</p>
+        <p>{workspaceDetail}</p>
       </div>
 
       <div class="table-shell">
@@ -97,13 +156,25 @@
           <span>Name</span>
           <span>Path</span>
         </div>
-        {#each projectRows as project}
+        {#if projects.length > 0}
+          {#each projects as project}
+            <div class="table-row">
+              <span>{project.name}</span>
+              <span>{project.path}</span>
+            </div>
+          {/each}
+        {:else}
           <div class="table-row muted">
-            <span>{project.name}</span>
-            <span>{project.path}</span>
+            <span>No projects imported</span>
+            <span>Connect the daemon to add a workspace</span>
           </div>
-        {/each}
+        {/if}
       </div>
+    </section>
+
+    <section class="settings-strip" aria-label="Daemon settings">
+      <span>Default project root</span>
+      <strong>{settings?.default_project_root || "Not configured"}</strong>
     </section>
   </main>
 </div>
@@ -238,6 +309,10 @@
     background: #c2410c;
   }
 
+  .daemon-card.connected .status-dot {
+    background: #0f766e;
+  }
+
   .daemon-card strong {
     display: block;
     margin-bottom: 3px;
@@ -258,7 +333,8 @@
 
   .topbar,
   .hero-panel,
-  .workspace-grid {
+  .workspace-grid,
+  .settings-strip {
     width: min(100%, 1120px);
   }
 
@@ -292,6 +368,12 @@
     background: #0f766e;
   }
 
+  .primary-action:disabled {
+    border-color: #b8c3c6;
+    color: #64737a;
+    background: #dbe2e4;
+  }
+
   .hero-panel {
     display: grid;
     grid-template-columns: minmax(0, 1fr) 180px;
@@ -322,7 +404,13 @@
     background: #f3f6f6;
   }
 
-  .health-box span {
+  .health-box.connected {
+    background: #edf7f5;
+  }
+
+  .health-box span,
+  .health-box small,
+  .settings-strip span {
     color: #5b6870;
     font-size: 12px;
   }
@@ -376,6 +464,22 @@
     color: #5b6870;
   }
 
+  .settings-strip {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 12px 14px;
+    border: 1px solid #d5dddf;
+    border-radius: 8px;
+    background: #fff;
+  }
+
+  .settings-strip strong {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-size: 13px;
+  }
+
   @media (max-width: 760px) {
     .app-shell {
       grid-template-columns: 1fr;
@@ -392,7 +496,8 @@
       grid-template-columns: 1fr;
     }
 
-    .topbar {
+    .topbar,
+    .settings-strip {
       align-items: stretch;
       flex-direction: column;
     }
