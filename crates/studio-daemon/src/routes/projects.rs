@@ -1,4 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     Json,
@@ -8,7 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use turso::params;
 
-use crate::{auth::authorize, error::ApiError, state::AppState};
+use crate::{auth::authorize, error::ApiError, state::AppState, susun_integration};
 
 #[derive(Debug, Serialize)]
 pub struct ProjectListResponse {
@@ -101,4 +104,139 @@ fn now_ms() -> Result<i64, ApiError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ApiError::Clock)?;
     i64::try_from(duration.as_millis()).map_err(|_| ApiError::Clock)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportProjectRequest {
+    pub files: Vec<String>,
+    pub env_file: Option<String>,
+    pub project_name: Option<String>,
+    #[serde(default)]
+    pub profiles: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImportProjectResponse {
+    pub project: Option<ProjectResponse>,
+    pub summary: Option<susun::ProjectSummary>,
+    pub diagnostics: serde_json::Value,
+    pub has_errors: bool,
+}
+
+pub async fn import_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ImportProjectRequest>,
+) -> Result<(StatusCode, Json<ImportProjectResponse>), ApiError> {
+    authorize(&state, &headers)?;
+
+    if request.files.is_empty() {
+        return Err(ApiError::MissingComposeFiles);
+    }
+
+    let files = canonicalize_paths(&request.files)?;
+    let env_file = match &request.env_file {
+        Some(path) => Some(canonicalize_path(path)?),
+        None => None,
+    };
+
+    let analyzed = susun_integration::analyze_project(
+        &files,
+        env_file.as_ref(),
+        request.project_name.as_deref(),
+        &request.profiles,
+    )?;
+
+    let Some(source_id) = analyzed.source_id.clone() else {
+        return Ok((
+            StatusCode::OK,
+            Json(ImportProjectResponse {
+                project: None,
+                summary: None,
+                diagnostics: analyzed.diagnostics,
+                has_errors: true,
+            }),
+        ));
+    };
+
+    let now = now_ms()?;
+    let display_name = analyzed
+        .project_name
+        .clone()
+        .unwrap_or_else(|| source_id.clone());
+    let project_directory = analyzed.project_directory.to_string_lossy().into_owned();
+    let compose_files_json = serde_json::to_string(&request.files).unwrap_or_default();
+    let profiles_json = serde_json::to_string(&request.profiles).unwrap_or_default();
+    let summary_json = serde_json::to_string(&analyzed.summary).unwrap_or_default();
+    let diagnostics_json = analyzed.diagnostics.to_string();
+
+    let conn = state.db.connect()?;
+    conn.execute(
+        "INSERT INTO projects (
+            id, name, path, created_at_ms,
+            compose_files, env_file, project_name_override, profiles,
+            last_analyzed_at_ms, summary_json, diagnostics_json, has_errors
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            path = excluded.path,
+            compose_files = excluded.compose_files,
+            env_file = excluded.env_file,
+            project_name_override = excluded.project_name_override,
+            profiles = excluded.profiles,
+            last_analyzed_at_ms = excluded.last_analyzed_at_ms,
+            summary_json = excluded.summary_json,
+            diagnostics_json = excluded.diagnostics_json,
+            has_errors = excluded.has_errors",
+        params![
+            source_id.clone(),
+            display_name.clone(),
+            project_directory.clone(),
+            now,
+            compose_files_json,
+            request.env_file.clone(),
+            request.project_name.clone(),
+            profiles_json,
+            now,
+            summary_json,
+            diagnostics_json,
+            i64::from(analyzed.has_errors),
+        ],
+    )
+    .await?;
+
+    let mut created_rows = conn
+        .query(
+            "SELECT created_at_ms FROM projects WHERE id = ?1 LIMIT 1",
+            params![source_id.clone()],
+        )
+        .await?;
+    let created_at_ms = match created_rows.next().await? {
+        Some(row) => row.get(0)?,
+        None => now,
+    };
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ImportProjectResponse {
+            project: Some(ProjectResponse {
+                id: source_id,
+                name: display_name,
+                path: project_directory,
+                created_at_ms,
+            }),
+            summary: Some(analyzed.summary),
+            diagnostics: analyzed.diagnostics,
+            has_errors: analyzed.has_errors,
+        }),
+    ))
+}
+
+fn canonicalize_paths(paths: &[String]) -> Result<Vec<PathBuf>, ApiError> {
+    paths.iter().map(|path| canonicalize_path(path)).collect()
+}
+
+fn canonicalize_path(path: &str) -> Result<PathBuf, ApiError> {
+    std::fs::canonicalize(path)
+        .map_err(|source| ApiError::InvalidImport(format!("`{path}`: {source}")))
 }
