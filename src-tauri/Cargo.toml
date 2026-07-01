@@ -1,0 +1,21 @@
+[package]
+name = "susun-studio"
+version.workspace = true
+description = "Susun Studio desktop client"
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[lib]
+# The `_lib` suffix keeps the library name distinct from the binary on Windows.
+name = "susun_studio_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2.11.4", features = [] }
+tauri-plugin-opener = "2.5.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"

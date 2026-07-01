@@ -1,0 +1,18 @@
+[package]
+name = "susun-studio-daemon"
+version.workspace = true
+description = "Local daemon for Susun Studio"
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+axum = "0.8.9"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.7.0", features = ["cors"] }
+turso = { version = "0.7.0-pre.14", default-features = false }
