@@ -1,9 +1,12 @@
 import {
   defaultDaemonBaseUrl,
+  importProject as importProjectRequest,
   listProjects,
   readDaemonHealth,
   readSettings,
   type DaemonHealth,
+  type ImportProjectRequest,
+  type ImportProjectResponse,
   type StudioProject,
   type StudioSettings,
 } from "$lib/daemon/client";
@@ -68,6 +71,20 @@ export function createDaemonState() {
     return () => controller.abort();
   });
 
+  async function importProject(request: ImportProjectRequest): Promise<ImportProjectResponse> {
+    const response = await importProjectRequest(request);
+
+    if (response.project) {
+      const nextProjects = await listProjects();
+      projects = nextProjects;
+      workspaceDetail = nextProjects.length
+        ? `${nextProjects.length} project${nextProjects.length === 1 ? "" : "s"} persisted by the local daemon.`
+        : "No projects are stored yet. Import will write through the daemon API.";
+    }
+
+    return response;
+  }
+
   return {
     get healthState() {
       return healthState;
@@ -81,5 +98,6 @@ export function createDaemonState() {
     get workspaceDetail() {
       return workspaceDetail;
     },
+    importProject,
   };
 }
