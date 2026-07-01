@@ -4,12 +4,17 @@
   import TopBar from "$lib/components/top-bar.svelte";
   import HeroPanel from "$lib/components/hero-panel.svelte";
   import ProjectsTable from "$lib/components/projects-table.svelte";
+  import ProjectDetail from "$lib/components/project-detail.svelte";
   import SettingsStrip from "$lib/components/settings-strip.svelte";
   import ImportProjectDialog from "$lib/components/import-project-dialog.svelte";
   import { createDaemonState } from "$lib/daemon/daemon-state.svelte";
 
   const daemonState = createDaemonState();
   let importDialogOpen = $state(false);
+  let selectedProjectId = $state<string | null>(null);
+  const selectedProject = $derived(
+    daemonState.projects.find((project) => project.id === selectedProjectId) ?? null,
+  );
 </script>
 
 <svelte:head>
@@ -28,7 +33,10 @@
       <ProjectsTable
         projects={daemonState.projects}
         workspaceDetail={daemonState.workspaceDetail}
+        selectedId={selectedProjectId}
+        onSelect={(project) => (selectedProjectId = project.id)}
       />
+      <ProjectDetail project={selectedProject} />
       <SettingsStrip settings={daemonState.settings} />
     </div>
   </Sidebar.Inset>
