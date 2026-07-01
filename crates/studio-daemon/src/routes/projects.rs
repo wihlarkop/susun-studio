@@ -24,6 +24,10 @@ pub struct ProjectResponse {
     pub name: String,
     pub path: String,
     pub created_at_ms: i64,
+    pub last_analyzed_at_ms: Option<i64>,
+    pub has_errors: Option<bool>,
+    pub summary: Option<serde_json::Value>,
+    pub diagnostics: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,18 +45,32 @@ pub async fn list_projects(
     let conn = state.db.connect()?;
     let mut rows = conn
         .query(
-            "SELECT id, name, path, created_at_ms FROM projects ORDER BY created_at_ms DESC",
+            "SELECT id, name, path, created_at_ms, last_analyzed_at_ms, has_errors,
+                    summary_json, diagnostics_json
+             FROM projects ORDER BY created_at_ms DESC",
             (),
         )
         .await?;
     let mut projects = Vec::new();
 
     while let Some(row) = rows.next().await? {
+        let has_errors: Option<i64> = row.get(5)?;
+        let summary_json: Option<String> = row.get(6)?;
+        let diagnostics_json: Option<String> = row.get(7)?;
+
         projects.push(ProjectResponse {
             id: row.get(0)?,
             name: row.get(1)?,
             path: row.get(2)?,
             created_at_ms: row.get(3)?,
+            last_analyzed_at_ms: row.get(4)?,
+            has_errors: has_errors.map(|value| value != 0),
+            summary: summary_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok()),
+            diagnostics: diagnostics_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok()),
         });
     }
 
@@ -82,6 +100,10 @@ pub async fn create_project(
         name: name.to_owned(),
         path: path.to_owned(),
         created_at_ms,
+        last_analyzed_at_ms: None,
+        has_errors: None,
+        summary: None,
+        diagnostics: None,
     };
 
     let conn = state.db.connect()?;
@@ -118,7 +140,7 @@ pub struct ImportProjectRequest {
 #[derive(Debug, Serialize)]
 pub struct ImportProjectResponse {
     pub project: Option<ProjectResponse>,
-    pub summary: Option<susun::ProjectSummary>,
+    pub summary: Option<serde_json::Value>,
     pub diagnostics: serde_json::Value,
     pub has_errors: bool,
 }
@@ -167,6 +189,7 @@ pub async fn import_project(
     let project_directory = analyzed.project_directory.to_string_lossy().into_owned();
     let compose_files_json = serde_json::to_string(&request.files).unwrap_or_default();
     let profiles_json = serde_json::to_string(&request.profiles).unwrap_or_default();
+    let summary_value = serde_json::to_value(&analyzed.summary).unwrap_or(serde_json::Value::Null);
     let summary_json = serde_json::to_string(&analyzed.summary).unwrap_or_default();
     let diagnostics_json = analyzed.diagnostics.to_string();
 
@@ -224,8 +247,12 @@ pub async fn import_project(
                 name: display_name,
                 path: project_directory,
                 created_at_ms,
+                last_analyzed_at_ms: Some(now),
+                has_errors: Some(analyzed.has_errors),
+                summary: Some(summary_value.clone()),
+                diagnostics: Some(analyzed.diagnostics.clone()),
             }),
-            summary: Some(analyzed.summary),
+            summary: Some(summary_value),
             diagnostics: analyzed.diagnostics,
             has_errors: analyzed.has_errors,
         }),
