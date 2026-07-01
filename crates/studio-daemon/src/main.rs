@@ -1,8 +1,10 @@
+mod auth;
+mod config;
 mod db;
+mod error;
+mod state;
 
 use std::{
-    net::{AddrParseError, SocketAddr},
-    path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,70 +13,16 @@ use axum::{
     Json, Router,
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
     routing::get,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
-use turso::{Database, params};
+use turso::params;
 
-const DEFAULT_BIND_ADDR: &str = "127.0.0.1:7377";
-const DEFAULT_AUTH_TOKEN: &str = "susun-studio-dev-token";
-const BIND_ADDR_ENV: &str = "SUSUN_STUDIO_DAEMON_ADDR";
-const AUTH_TOKEN_ENV: &str = "SUSUN_STUDIO_DAEMON_TOKEN";
-const DB_PATH_ENV: &str = "SUSUN_STUDIO_DB_PATH";
-
-#[derive(Clone)]
-struct AppState {
-    db: Arc<Database>,
-    auth_token: Arc<str>,
-}
-
-#[derive(Debug, thiserror::Error)]
-enum DaemonError {
-    #[error("invalid {name} value `{value}`: {source}")]
-    InvalidBindAddr {
-        name: &'static str,
-        value: String,
-        source: AddrParseError,
-    },
-
-    #[error("database startup failed: {0}")]
-    Database(#[from] db::DbError),
-
-    #[error("failed to bind daemon listener on {addr}: {source}")]
-    Bind {
-        addr: SocketAddr,
-        source: std::io::Error,
-    },
-
-    #[error("daemon server failed: {0}")]
-    Serve(std::io::Error),
-}
-
-#[derive(Debug, thiserror::Error)]
-enum ApiError {
-    #[error("unauthorized")]
-    Unauthorized,
-
-    #[error("name is required")]
-    MissingName,
-
-    #[error("path is required")]
-    MissingPath,
-
-    #[error("database error: {0}")]
-    Database(#[from] turso::Error),
-
-    #[error("clock error")]
-    Clock,
-}
-
-#[derive(Debug, Serialize)]
-struct ErrorResponse {
-    error: String,
-}
+use auth::authorize;
+use error::{ApiError, DaemonError};
+use state::AppState;
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
@@ -117,12 +65,12 @@ async fn main() {
 }
 
 async fn run() -> Result<(), DaemonError> {
-    let bind_addr = bind_addr()?;
-    let db_path = db_path();
+    let bind_addr = config::bind_addr()?;
+    let db_path = config::db_path();
     let db = db::open_database(db_path.clone()).await?;
     let state = AppState {
         db: Arc::new(db),
-        auth_token: Arc::from(auth_token()),
+        auth_token: Arc::from(config::auth_token()),
     };
 
     let listener = TcpListener::bind(bind_addr)
@@ -143,27 +91,6 @@ async fn run() -> Result<(), DaemonError> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(DaemonError::Serve)
-}
-
-fn bind_addr() -> Result<SocketAddr, DaemonError> {
-    let value = std::env::var(BIND_ADDR_ENV).unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_owned());
-    value
-        .parse()
-        .map_err(|source| DaemonError::InvalidBindAddr {
-            name: BIND_ADDR_ENV,
-            value,
-            source,
-        })
-}
-
-fn auth_token() -> String {
-    std::env::var(AUTH_TOKEN_ENV).unwrap_or_else(|_| DEFAULT_AUTH_TOKEN.to_owned())
-}
-
-fn db_path() -> PathBuf {
-    std::env::var(DB_PATH_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(".susun-studio/studio.db"))
 }
 
 fn app(state: AppState) -> Router {
@@ -292,46 +219,11 @@ async fn update_settings(
     Ok(Json(settings))
 }
 
-fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    let Some(value) = headers.get("authorization") else {
-        return Err(ApiError::Unauthorized);
-    };
-
-    let Ok(value) = value.to_str() else {
-        return Err(ApiError::Unauthorized);
-    };
-
-    let expected = format!("Bearer {}", state.auth_token);
-    if value == expected {
-        Ok(())
-    } else {
-        Err(ApiError::Unauthorized)
-    }
-}
-
 fn now_ms() -> Result<i64, ApiError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ApiError::Clock)?;
     i64::try_from(duration.as_millis()).map_err(|_| ApiError::Clock)
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let status = match self {
-            Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::MissingName | Self::MissingPath => StatusCode::BAD_REQUEST,
-            Self::Database(_) | Self::Clock => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-
-        (
-            status,
-            Json(ErrorResponse {
-                error: self.to_string(),
-            }),
-        )
-            .into_response()
-    }
 }
 
 async fn shutdown_signal() {
