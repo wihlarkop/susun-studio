@@ -15,6 +15,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            wget
+
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2.2.0
         with:
