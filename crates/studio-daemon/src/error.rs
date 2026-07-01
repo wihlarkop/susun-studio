@@ -49,6 +49,9 @@ pub enum ApiError {
     #[error("database error: {0}")]
     Database(#[from] turso::Error),
 
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+
     #[error("clock error")]
     Clock,
 }
@@ -72,7 +75,7 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST
             }
             Self::InvalidImport(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::Database(_) | Self::Clock => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Database(_) | Self::Json(_) | Self::Clock => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
         (

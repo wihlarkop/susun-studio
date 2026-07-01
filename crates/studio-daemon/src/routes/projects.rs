@@ -9,6 +9,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
+use susun::ProjectSummary;
 use turso::params;
 
 use crate::{auth::authorize, error::ApiError, state::AppState, susun_integration};
@@ -26,7 +27,7 @@ pub struct ProjectResponse {
     pub created_at_ms: i64,
     pub last_analyzed_at_ms: Option<i64>,
     pub has_errors: Option<bool>,
-    pub summary: Option<serde_json::Value>,
+    pub summary: Option<ProjectSummary>,
     pub diagnostics: Option<serde_json::Value>,
 }
 
@@ -140,7 +141,7 @@ pub struct ImportProjectRequest {
 #[derive(Debug, Serialize)]
 pub struct ImportProjectResponse {
     pub project: Option<ProjectResponse>,
-    pub summary: Option<serde_json::Value>,
+    pub summary: Option<ProjectSummary>,
     pub diagnostics: serde_json::Value,
     pub has_errors: bool,
 }
@@ -189,8 +190,7 @@ pub async fn import_project(
     let project_directory = analyzed.project_directory.to_string_lossy().into_owned();
     let compose_files_json = serde_json::to_string(&request.files).unwrap_or_default();
     let profiles_json = serde_json::to_string(&request.profiles).unwrap_or_default();
-    let summary_value = serde_json::to_value(&analyzed.summary).unwrap_or(serde_json::Value::Null);
-    let summary_json = serde_json::to_string(&analyzed.summary).unwrap_or_default();
+    let summary_json = serde_json::to_string(&analyzed.summary)?;
     let diagnostics_json = analyzed.diagnostics.to_string();
 
     let conn = state.db.connect()?;
@@ -249,10 +249,10 @@ pub async fn import_project(
                 created_at_ms,
                 last_analyzed_at_ms: Some(now),
                 has_errors: Some(analyzed.has_errors),
-                summary: Some(summary_value.clone()),
+                summary: Some(analyzed.summary.clone()),
                 diagnostics: Some(analyzed.diagnostics.clone()),
             }),
-            summary: Some(summary_value),
+            summary: Some(analyzed.summary),
             diagnostics: analyzed.diagnostics,
             has_errors: analyzed.has_errors,
         }),
