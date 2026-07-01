@@ -15,6 +15,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Checkout susun (sibling path dependency)
+        uses: actions/checkout@v6
+        with:
+          repository: wihlarkop/susun
+          path: ../susun
+
       - name: Install Tauri Linux dependencies
         run: |
           sudo apt-get update
