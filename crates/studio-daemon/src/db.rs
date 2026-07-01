@@ -2,11 +2,18 @@ use std::path::PathBuf;
 
 use turso::{Connection, Database, params};
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial",
-    sql: include_str!("../migrations/0001_initial.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial",
+        sql: include_str!("../migrations/0001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "project_sources",
+        sql: include_str!("../migrations/0002_project_sources.sql"),
+    },
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
