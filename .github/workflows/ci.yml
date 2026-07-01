@@ -43,6 +43,12 @@ jobs:
       - name: Check frontend
         run: bun run check
 
+      - name: Lint frontend
+        run: bun run lint
+
+      - name: Check frontend formatting
+        run: bun run fmt:check
+
       - name: Check Rust formatting
         run: cargo fmt --all --check
 
