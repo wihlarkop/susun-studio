@@ -40,11 +40,23 @@ pub enum ApiError {
     #[error("path is required")]
     MissingPath,
 
+    #[error("at least one compose file is required")]
+    MissingComposeFiles,
+
+    #[error("invalid import: {0}")]
+    InvalidImport(String),
+
     #[error("database error: {0}")]
     Database(#[from] turso::Error),
 
     #[error("clock error")]
     Clock,
+}
+
+impl From<susun::Error> for ApiError {
+    fn from(error: susun::Error) -> Self {
+        Self::InvalidImport(error.to_string())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -56,7 +68,10 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::MissingName | Self::MissingPath => StatusCode::BAD_REQUEST,
+            Self::MissingName | Self::MissingPath | Self::MissingComposeFiles => {
+                StatusCode::BAD_REQUEST
+            }
+            Self::InvalidImport(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Database(_) | Self::Clock => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
