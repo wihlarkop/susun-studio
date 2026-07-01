@@ -15,15 +15,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Checkout susun (sibling path dependency)
-        uses: actions/checkout@v6
-        with:
-          repository: wihlarkop/susun
-          path: susun-src
-
-      - name: Link susun as a sibling directory
-        run: ln -s "$GITHUB_WORKSPACE/susun-src" "$GITHUB_WORKSPACE/../susun"
-
       - name: Install Tauri Linux dependencies
         run: |
           sudo apt-get update
@@ -57,6 +48,15 @@ jobs:
 
       - name: Check frontend formatting
         run: bun run fmt:check
+
+      - name: Checkout susun (sibling path dependency)
+        uses: actions/checkout@v6
+        with:
+          repository: wihlarkop/susun
+          path: susun-src
+
+      - name: Link susun as a sibling directory
+        run: ln -s "$GITHUB_WORKSPACE/susun-src" "$GITHUB_WORKSPACE/../susun"
 
       - name: Check Rust formatting
         run: cargo fmt --all --check
