@@ -1,32 +1,42 @@
 <script lang="ts">
   import * as Card from "$lib/components/ui/card/index.js";
-  import { Badge } from "$lib/components/ui/badge/index.js";
+  import { Button } from "$lib/components/ui/button/index.js";
+  import { Skeleton } from "$lib/components/ui/skeleton/index.js";
+  import { RefreshCw } from "@lucide/svelte";
   import { defaultDaemonBaseUrl } from "$lib/daemon/client";
   import type { HealthState } from "$lib/daemon/daemon-state.svelte";
 
-  let { healthState }: { healthState: HealthState } = $props();
+  let { healthState, onRetry }: { healthState: HealthState; onRetry: () => void } = $props();
 </script>
 
-<Card.Root>
-  <Card.Content class="flex flex-col gap-6 p-6 sm:flex-row sm:items-center sm:justify-between">
-    <div class="space-y-2">
-      <p class="text-xs font-semibold tracking-wide text-primary uppercase">
-        Local platform spine
-      </p>
-      <h3 class="text-xl font-semibold">Connect to Susun Studio daemon to begin</h3>
+{#if healthState.kind === "checking"}
+  <Card.Root>
+    <Card.Content class="flex items-center gap-4 p-6">
+      <Skeleton class="h-10 w-10 rounded-full" />
+      <div class="space-y-2">
+        <Skeleton class="h-4 w-64" />
+        <Skeleton class="h-3 w-40" />
+      </div>
+    </Card.Content>
+  </Card.Root>
+{:else if healthState.kind === "disconnected"}
+  <Card.Root>
+    <Card.Content class="flex flex-col gap-2 p-6">
+      <p class="text-xs font-semibold tracking-wide text-primary uppercase">Daemon offline</p>
+      <h3 class="text-xl font-semibold">Start the Susun Studio daemon to begin</h3>
       <p class="max-w-xl text-sm text-muted-foreground">
-        The desktop app is only the client. Workspaces, projects, settings, events, and future
-        engine tasks live behind the local daemon API.
+        The desktop app is only the client; projects, settings, and analysis live behind the
+        local daemon API at
+        <code class="rounded bg-muted px-1 py-0.5 font-mono text-xs">{defaultDaemonBaseUrl}</code>.
+        Run
+        <code class="rounded bg-muted px-1 py-0.5 font-mono text-xs">bun run daemon</code>
+        from the repository root. This page rechecks automatically every few seconds.
       </p>
-    </div>
-    <div class="flex min-w-40 flex-col gap-1 rounded-lg bg-muted p-4">
-      <span class="text-xs text-muted-foreground">Health</span>
-      <Badge variant={healthState.kind === "connected" ? "default" : "outline"} class="w-fit">
-        {healthState.label}
-      </Badge>
-      <span class="text-xs text-muted-foreground">
-        {healthState.health?.product ?? defaultDaemonBaseUrl}
-      </span>
-    </div>
-  </Card.Content>
-</Card.Root>
+      <p class="text-xs text-muted-foreground">{healthState.detail}</p>
+      <Button variant="outline" class="w-fit" onclick={onRetry}>
+        <RefreshCw />
+        Retry now
+      </Button>
+    </Card.Content>
+  </Card.Root>
+{/if}

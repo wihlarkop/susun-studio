@@ -124,6 +124,101 @@ export type ImportProjectResponse = {
   has_errors: boolean;
 };
 
+export type PlanActionSafety = "safe" | "caution" | "destructive";
+
+export type PlanAction = {
+  id: string;
+  kind: string;
+  resource: string;
+  safety: PlanActionSafety;
+  reason: string;
+  dependencies: string[];
+};
+
+export type PlanSummary = {
+  total_actions: number;
+  safe_actions: number;
+  caution_actions: number;
+  destructive_actions: number;
+};
+
+export type StudioPlan = {
+  id: string;
+  project_id: string;
+  operation: "up" | "down";
+  summary: PlanSummary;
+  actions: PlanAction[];
+  blocked_diagnostics: DiagnosticsPayload | null;
+  created_at_ms: number;
+};
+
+type PlanListResponse = {
+  plans: StudioPlan[];
+};
+
+export type EngineHealth = {
+  reachable: boolean;
+  api_version: string | null;
+  error: string | null;
+};
+
+export type EngineCapabilities = {
+  api_version: string | null;
+  supports_health: string;
+  supports_named_volumes: string;
+  supports_network_aliases: string;
+  supports_log_follow: string;
+  supports_build: string;
+  supports_mount_types: string[];
+  max_container_name_length: number | null;
+};
+
+export type StudioEngine = {
+  id: string;
+  provider_kind: string;
+  display_name: string;
+  enabled: boolean;
+  is_default: boolean;
+  last_health: EngineHealth | null;
+  last_health_at_ms: number | null;
+};
+
+type EngineListResponse = {
+  engines: StudioEngine[];
+};
+
+export type JobStatus = "running" | "succeeded" | "failed" | "cancelled";
+
+export type JobExecutionSummary = {
+  total_actions: number;
+  succeeded: number;
+  failed: number;
+  skipped: number;
+  cancelled: number;
+};
+
+export type JobAction = {
+  id: string;
+  action: string;
+  resource: string;
+};
+
+export type StudioJob = {
+  id: string;
+  kind: "up" | "down" | "build";
+  status: JobStatus;
+  project_id: string;
+  actions: JobAction[];
+  result: { summary: JobExecutionSummary } | null;
+  error: string | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+};
+
+type JobListResponse = {
+  jobs: StudioJob[];
+};
+
 type DaemonRequestOptions = {
   baseUrl?: string;
   token?: string;
@@ -176,6 +271,112 @@ export async function importProject(
       profiles: request.profiles ?? [],
     },
   });
+}
+
+export async function createUpPlan(
+  projectId: string,
+  options: DaemonRequestOptions = {},
+): Promise<StudioPlan> {
+  return readJson(`/v1/projects/${encodeURIComponent(projectId)}/plans/up`, {
+    ...options,
+    method: "POST",
+  });
+}
+
+export async function createDownPlan(
+  projectId: string,
+  options: DaemonRequestOptions = {},
+): Promise<StudioPlan> {
+  return readJson(`/v1/projects/${encodeURIComponent(projectId)}/plans/down`, {
+    ...options,
+    method: "POST",
+  });
+}
+
+export async function listProjectPlans(
+  projectId: string,
+  options: DaemonRequestOptions = {},
+): Promise<StudioPlan[]> {
+  const response = await readJson<PlanListResponse>(
+    `/v1/projects/${encodeURIComponent(projectId)}/plans`,
+    options,
+  );
+  return response.plans;
+}
+
+export async function readPlan(
+  planId: string,
+  options: DaemonRequestOptions = {},
+): Promise<StudioPlan> {
+  return readJson(`/v1/plans/${encodeURIComponent(planId)}`, options);
+}
+
+export async function listEngines(options: DaemonRequestOptions = {}): Promise<StudioEngine[]> {
+  const response = await readJson<EngineListResponse>("/v1/engines", options);
+  return response.engines;
+}
+
+export async function readEngineHealth(
+  engineId: string,
+  options: DaemonRequestOptions = {},
+): Promise<EngineHealth> {
+  return readJson(`/v1/engines/${encodeURIComponent(engineId)}/health`, options);
+}
+
+export async function readEngineCapabilities(
+  engineId: string,
+  options: DaemonRequestOptions = {},
+): Promise<EngineCapabilities> {
+  return readJson(`/v1/engines/${encodeURIComponent(engineId)}/capabilities`, options);
+}
+
+export async function runAction(
+  projectId: string,
+  action: "up" | "down" | "build",
+  options: DaemonRequestOptions = {},
+): Promise<StudioJob> {
+  return readJson(`/v1/projects/${encodeURIComponent(projectId)}/actions/${action}`, {
+    ...options,
+    method: "POST",
+  });
+}
+
+export async function cancelJob(
+  jobId: string,
+  options: DaemonRequestOptions = {},
+): Promise<{ cancelled: boolean }> {
+  return readJson(`/v1/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    ...options,
+    method: "POST",
+  });
+}
+
+export async function listJobs(options: DaemonRequestOptions = {}): Promise<StudioJob[]> {
+  const response = await readJson<JobListResponse>("/v1/jobs", options);
+  return response.jobs;
+}
+
+export async function readJob(
+  jobId: string,
+  options: DaemonRequestOptions = {},
+): Promise<StudioJob> {
+  return readJson(`/v1/jobs/${encodeURIComponent(jobId)}`, options);
+}
+
+// Native EventSource cannot send an Authorization header, so we first make an
+// authenticated POST for a short-lived, single-use, job-scoped ticket and put
+// only that ticket in the stream URL. The long-lived token never hits a URL.
+export async function subscribeJobEvents(jobId: string): Promise<EventSource> {
+  const { ticket } = await readJson<{ ticket: string; expires_at_ms: number }>(
+    `/v1/jobs/${encodeURIComponent(jobId)}/events/ticket`,
+    { method: "POST" },
+  );
+  const url = new URL(
+    `/v1/jobs/${encodeURIComponent(jobId)}/events`,
+    normalizeBaseUrl(defaultDaemonBaseUrl),
+  );
+  url.searchParams.set("ticket", ticket);
+  return new EventSource(url);
 }
 
 export async function readSettings(options: DaemonRequestOptions = {}): Promise<StudioSettings> {

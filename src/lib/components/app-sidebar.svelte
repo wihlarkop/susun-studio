@@ -2,6 +2,8 @@
   import * as Sidebar from "$lib/components/ui/sidebar/index.js";
   import { Badge } from "$lib/components/ui/badge/index.js";
   import { FileText, LayoutGrid, Server, Settings } from "@lucide/svelte";
+  import { displayPath } from "$lib/utils";
+  import type { StudioSettings } from "$lib/daemon/client";
   import type { HealthState } from "$lib/daemon/daemon-state.svelte";
 
   type NavItem = {
@@ -9,6 +11,7 @@
     description: string;
     icon: typeof LayoutGrid;
     active?: boolean;
+    planned?: boolean;
   };
 
   const navItems: NavItem[] = [
@@ -18,12 +21,30 @@
       icon: LayoutGrid,
       active: true,
     },
-    { label: "Reports", description: "Analysis and review history", icon: FileText },
-    { label: "Engines", description: "Docker-compatible runtimes", icon: Server },
-    { label: "Settings", description: "Studio and daemon preferences", icon: Settings },
+    {
+      label: "Reports",
+      description: "Analysis and review history (planned)",
+      icon: FileText,
+      planned: true,
+    },
+    {
+      label: "Engines",
+      description: "Docker-compatible runtimes (planned)",
+      icon: Server,
+      planned: true,
+    },
+    {
+      label: "Settings",
+      description: "Studio and daemon preferences (planned)",
+      icon: Settings,
+      planned: true,
+    },
   ];
 
-  let { healthState }: { healthState: HealthState } = $props();
+  let {
+    healthState,
+    settings,
+  }: { healthState: HealthState; settings: StudioSettings | undefined } = $props();
 </script>
 
 <Sidebar.Root collapsible="icon">
@@ -48,9 +69,17 @@
         <Sidebar.Menu>
           {#each navItems as item (item.label)}
             <Sidebar.MenuItem>
-              <Sidebar.MenuButton isActive={item.active} tooltipContent={item.description}>
+              <Sidebar.MenuButton
+                isActive={item.active}
+                tooltipContent={item.description}
+                aria-disabled={item.planned}
+                class={item.planned ? "opacity-60" : undefined}
+              >
                 <item.icon />
                 <span>{item.label}</span>
+                {#if item.planned}
+                  <Badge variant="outline" class="ml-auto text-xs">Soon</Badge>
+                {/if}
               </Sidebar.MenuButton>
             </Sidebar.MenuItem>
           {/each}
@@ -61,12 +90,19 @@
 
   <Sidebar.Footer>
     <div
-      class="flex items-center gap-2 rounded-md border p-2 group-data-[collapsible=icon]:hidden"
+      class="flex flex-col gap-2 rounded-md border p-2 group-data-[collapsible=icon]:hidden"
     >
-      <Badge variant={healthState.kind === "connected" ? "default" : "outline"}>
-        {healthState.label}
-      </Badge>
-      <p class="truncate text-xs text-muted-foreground">{healthState.detail}</p>
+      <div class="flex items-center gap-2">
+        <Badge variant={healthState.kind === "connected" ? "default" : "outline"}>
+          {healthState.label}
+        </Badge>
+        <p class="truncate text-xs text-muted-foreground">{healthState.detail}</p>
+      </div>
+      {#if settings?.default_project_root}
+        <p class="truncate text-xs text-muted-foreground" title={settings.default_project_root}>
+          Root: {displayPath(settings.default_project_root)}
+        </p>
+      {/if}
     </div>
   </Sidebar.Footer>
 </Sidebar.Root>
