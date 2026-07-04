@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod db;
 mod error;
+mod jobs;
 mod routes;
 mod state;
 mod susun_integration;
@@ -27,6 +28,8 @@ async fn run() -> Result<(), DaemonError> {
     let state = AppState {
         db: Arc::new(db),
         auth_token: Arc::from(config::auth_token()),
+        jobs: Arc::new(jobs::registry::JobRegistry::new()),
+        stream_tickets: Arc::new(jobs::tickets::StreamTickets::new()),
     };
 
     let listener = TcpListener::bind(bind_addr)

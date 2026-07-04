@@ -13,6 +13,26 @@ const MIGRATIONS: &[Migration] = &[
         name: "project_sources",
         sql: include_str!("../migrations/0002_project_sources.sql"),
     },
+    Migration {
+        version: 3,
+        name: "plans",
+        sql: include_str!("../migrations/0003_plans.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "plans_drop_fk",
+        sql: include_str!("../migrations/0004_plans_drop_fk.sql"),
+    },
+    Migration {
+        version: 5,
+        name: "engine_providers",
+        sql: include_str!("../migrations/0005_engine_providers.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "jobs",
+        sql: include_str!("../migrations/0006_jobs.sql"),
+    },
 ];
 
 #[derive(Debug, thiserror::Error)]
