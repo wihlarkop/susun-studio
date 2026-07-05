@@ -49,6 +49,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/projects/{id}/actions/clean", post(jobs::action_clean))
         .route("/v1/projects/{id}/actions/build", post(jobs::action_build))
         .route("/v1/jobs", get(jobs::list_jobs))
+        .route("/v1/projects/{id}/jobs", get(jobs::list_project_jobs))
         .route("/v1/jobs/{id}", get(jobs::read_job))
         .route("/v1/jobs/{id}/cancel", post(jobs::cancel_job))
         .route(

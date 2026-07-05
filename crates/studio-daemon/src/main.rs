@@ -26,6 +26,20 @@ async fn run() -> Result<(), DaemonError> {
     let bind_addr = config::bind_addr()?;
     let db_path = config::db_path();
     let db = db::open_database(db_path.clone()).await?;
+
+    match jobs::maintenance::reconcile_interrupted_jobs(&db).await {
+        Ok(fixed) if fixed > 0 => {
+            println!("reconciled {fixed} interrupted job(s) from a prior run")
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("job reconciliation failed (continuing anyway): {error}"),
+    }
+    match jobs::maintenance::sweep_old_jobs(&db).await {
+        Ok(removed) if removed > 0 => println!("pruned {removed} job(s) beyond retention limits"),
+        Ok(_) => {}
+        Err(error) => eprintln!("job retention sweep failed (continuing anyway): {error}"),
+    }
+
     let state = AppState {
         db: Arc::new(db),
         auth_token: Arc::from(config::auth_token()),

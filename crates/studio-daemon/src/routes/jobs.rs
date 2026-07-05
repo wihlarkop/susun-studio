@@ -3,7 +3,7 @@ use std::{
         Arc,
         atomic::{AtomicI64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -21,7 +21,7 @@ use crate::{
     susun_integration,
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct JobActionResponse {
     pub id: String,
     pub action: String,
@@ -38,6 +38,7 @@ pub struct JobResponse {
     pub actions: Vec<JobActionResponse>,
     pub result: Option<serde_json::Value>,
     pub error: Option<String>,
+    pub error_code: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -45,6 +46,16 @@ pub struct JobResponse {
 #[derive(Debug, Serialize)]
 pub struct JobListResponse {
     pub jobs: Vec<JobResponse>,
+}
+
+/// A hard safety net against a genuinely hung job (dead network, unresponsive
+/// engine) — generous on purpose since legitimate builds can be slow.
+const JOB_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+enum JobOutcome {
+    Finished(Result<susun::ExecutionReport, String>),
+    Cancelled,
+    TimedOut,
 }
 
 pub async fn action_up(
@@ -117,7 +128,7 @@ async fn start_up_job(
 
     let now = now_ms()?;
     let job_id = format!("job-{now}-{kind}");
-    insert_job(&state, &job_id, kind, &project_id, now).await?;
+    insert_job(&state, &job_id, kind, &project_id, now, &manifest).await?;
 
     let (cancellation, sender, cancel_notify) = state.jobs.register(job_id.clone());
     let db = state.db.clone();
@@ -126,17 +137,22 @@ async fn start_up_job(
     let spawn_job_id = job_id.clone();
 
     tokio::spawn(async move {
-        // Race the execution against a hard-cancel notifier: cancelling drops
-        // the in-flight action (e.g. an image pull) immediately instead of
-        // waiting for susun's cooperative between-action check.
+        // Race the execution against a hard-cancel notifier (cancelling drops
+        // the in-flight action, e.g. an image pull, immediately instead of
+        // waiting for susun's cooperative between-action check) and a
+        // generous timeout as a safety net against a truly hung job.
         let outcome = tokio::select! {
             biased;
-            () = cancel_notify.notified() => None,
-            result = susun_integration::execute_plan(engine, plan, events, cancellation) => Some(result),
+            () = cancel_notify.notified() => JobOutcome::Cancelled,
+            () = tokio::time::sleep(JOB_TIMEOUT) => JobOutcome::TimedOut,
+            result = susun_integration::execute_plan(engine, plan, events, cancellation) => JobOutcome::Finished(result),
         };
         match outcome {
-            Some(result) => finish_job(&db, &spawn_job_id, result).await,
-            None => mark_cancelled(&db, &spawn_job_id).await,
+            JobOutcome::Finished(result) => finish_job(&db, &spawn_job_id, result).await,
+            JobOutcome::Cancelled => {
+                mark_interrupted(&db, &spawn_job_id, "cancelled", "cancelled").await
+            }
+            JobOutcome::TimedOut => mark_interrupted(&db, &spawn_job_id, "failed", "timeout").await,
         }
         registry.unregister(&spawn_job_id);
     });
@@ -167,7 +183,7 @@ async fn start_down_job(
 
     let now = now_ms()?;
     let job_id = format!("job-{now}-{kind}");
-    insert_job(&state, &job_id, kind, &project_id, now).await?;
+    insert_job(&state, &job_id, kind, &project_id, now, &manifest).await?;
 
     let (cancellation, sender, cancel_notify) = state.jobs.register(job_id.clone());
     let db = state.db.clone();
@@ -178,12 +194,16 @@ async fn start_down_job(
     tokio::spawn(async move {
         let outcome = tokio::select! {
             biased;
-            () = cancel_notify.notified() => None,
-            result = susun_integration::execute_plan(engine, plan, events, cancellation) => Some(result),
+            () = cancel_notify.notified() => JobOutcome::Cancelled,
+            () = tokio::time::sleep(JOB_TIMEOUT) => JobOutcome::TimedOut,
+            result = susun_integration::execute_plan(engine, plan, events, cancellation) => JobOutcome::Finished(result),
         };
         match outcome {
-            Some(result) => finish_job(&db, &spawn_job_id, result).await,
-            None => mark_cancelled(&db, &spawn_job_id).await,
+            JobOutcome::Finished(result) => finish_job(&db, &spawn_job_id, result).await,
+            JobOutcome::Cancelled => {
+                mark_interrupted(&db, &spawn_job_id, "cancelled", "cancelled").await
+            }
+            JobOutcome::TimedOut => mark_interrupted(&db, &spawn_job_id, "failed", "timeout").await,
         }
         registry.unregister(&spawn_job_id);
     });
@@ -228,14 +248,33 @@ async fn insert_job(
     kind: &str,
     project_id: &str,
     now: i64,
+    manifest: &[susun_integration::JobActionManifest],
 ) -> Result<(), ApiError> {
     let request_json =
         serde_json::to_string(&serde_json::json!({ "kind": kind })).unwrap_or_default();
+    let manifest_json = serde_json::to_string(
+        &manifest
+            .iter()
+            .map(|step| JobActionResponse {
+                id: step.id.clone(),
+                action: step.action.clone(),
+                resource: step.resource.clone(),
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_default();
     let conn = state.db.connect()?;
     conn.execute(
-        "INSERT INTO jobs (id, kind, status, project_id, engine_id, request_json, created_at_ms, updated_at_ms)
-         VALUES (?1, ?2, 'running', ?3, 'engine-docker-local', ?4, ?5, ?5)",
-        params![job_id.to_owned(), kind.to_owned(), project_id.to_owned(), request_json, now],
+        "INSERT INTO jobs (id, kind, status, project_id, engine_id, request_json, manifest_json, created_at_ms, updated_at_ms)
+         VALUES (?1, ?2, 'running', ?3, 'engine-docker-local', ?4, ?5, ?6, ?6)",
+        params![
+            job_id.to_owned(),
+            kind.to_owned(),
+            project_id.to_owned(),
+            request_json,
+            manifest_json,
+            now
+        ],
     )
     .await?;
     Ok(())
@@ -263,23 +302,83 @@ fn running_job_response(
             .collect(),
         result: None,
         error: None,
+        error_code: None,
         created_at_ms: now,
         updated_at_ms: now,
     }
 }
 
-/// Marks a job cancelled after a hard-cancel dropped its execution.
-async fn mark_cancelled(db: &Database, job_id: &str) {
+/// Marks a job interrupted (hard-cancelled or timed out) — dropping the
+/// execution future mid-flight means susun never hands back an
+/// `ExecutionReport`, so this reconstructs an approximate one from the
+/// `job_events` already persisted for this job (susun's own
+/// `ActionFinished { status }` events carry real per-action outcomes, so
+/// this is accurate reconstruction, not a guess).
+async fn mark_interrupted(db: &Database, job_id: &str, status: &str, error_code: &str) {
     let now = now_ms().unwrap_or_default();
+    let result_json = synthesize_partial_result(db, job_id).await;
     let Ok(conn) = db.connect() else {
         return;
     };
     let _ = conn
         .execute(
-            "UPDATE jobs SET status = 'cancelled', updated_at_ms = ?1 WHERE id = ?2",
-            params![now, job_id.to_owned()],
+            "UPDATE jobs SET status = ?1, result_json = ?2, error_code = ?3, updated_at_ms = ?4 WHERE id = ?5",
+            params![status, result_json, error_code, now, job_id.to_owned()],
         )
         .await;
+}
+
+/// Reads back every event recorded for `job_id` and tallies `ActionFinished`
+/// statuses into a summary shaped like the real `ExecutionSummary` JSON, so
+/// the frontend's existing `result.summary` rendering works unchanged.
+async fn synthesize_partial_result(db: &Database, job_id: &str) -> Option<String> {
+    let conn = db.connect().ok()?;
+    let mut rows = conn
+        .query(
+            "SELECT payload_json FROM job_events WHERE job_id = ?1 ORDER BY sequence ASC",
+            params![job_id.to_owned()],
+        )
+        .await
+        .ok()?;
+
+    let (mut succeeded, mut failed, mut cancelled, mut skipped) = (0usize, 0usize, 0usize, 0usize);
+    while let Ok(Some(row)) = rows.next().await {
+        let payload_json: String = match row.get(0) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let Ok(event) = serde_json::from_str::<susun::RuntimeEvent>(&payload_json) else {
+            continue;
+        };
+        if let susun::RuntimeEvent::ActionFinished { status, .. } = event {
+            match status {
+                susun::ActionStatus::Succeeded => succeeded += 1,
+                susun::ActionStatus::Failed => failed += 1,
+                susun::ActionStatus::Cancelled => cancelled += 1,
+                susun::ActionStatus::SkippedDependencyFailed => skipped += 1,
+                _ => {}
+            }
+        }
+    }
+
+    let total = succeeded + failed + cancelled + skipped;
+    if total == 0 {
+        return None;
+    }
+
+    Some(
+        serde_json::json!({
+            "summary": {
+                "total_actions": total,
+                "succeeded": succeeded,
+                "failed": failed,
+                "skipped": skipped,
+                "cancelled": cancelled,
+            },
+            "partial": true,
+        })
+        .to_string(),
+    )
 }
 
 async fn finish_job(db: &Database, job_id: &str, result: Result<susun::ExecutionReport, String>) {
@@ -296,19 +395,28 @@ async fn finish_job(db: &Database, job_id: &str, result: Result<susun::Execution
             } else {
                 "succeeded"
             };
+            let first_failure = report
+                .actions
+                .values()
+                .find(|action| matches!(action.status, susun::ActionStatus::Failed))
+                .and_then(|action| action.error.clone());
+            let error_code = first_failure
+                .as_deref()
+                .map(crate::jobs::error_taxonomy::classify_error);
             let result_json = serde_json::to_string(&report).unwrap_or_default();
             let _ = conn
                 .execute(
-                    "UPDATE jobs SET status = ?1, result_json = ?2, updated_at_ms = ?3 WHERE id = ?4",
-                    params![status, result_json, now, job_id.to_owned()],
+                    "UPDATE jobs SET status = ?1, result_json = ?2, error = ?3, error_code = ?4, updated_at_ms = ?5 WHERE id = ?6",
+                    params![status, result_json, first_failure, error_code, now, job_id.to_owned()],
                 )
                 .await;
         }
         Err(error) => {
+            let error_code = crate::jobs::error_taxonomy::classify_error(&error);
             let _ = conn
                 .execute(
-                    "UPDATE jobs SET status = 'failed', error = ?1, updated_at_ms = ?2 WHERE id = ?3",
-                    params![error, now, job_id.to_owned()],
+                    "UPDATE jobs SET status = 'failed', error = ?1, error_code = ?2, updated_at_ms = ?3 WHERE id = ?4",
+                    params![error, error_code, now, job_id.to_owned()],
                 )
                 .await;
         }
@@ -334,7 +442,7 @@ pub async fn list_jobs(
     let conn = state.db.connect()?;
     let mut rows = conn
         .query(
-            "SELECT id, kind, status, project_id, result_json, error, created_at_ms, updated_at_ms
+            "SELECT id, kind, status, project_id, result_json, error, error_code, manifest_json, created_at_ms, updated_at_ms
              FROM jobs ORDER BY created_at_ms DESC",
             (),
         )
@@ -343,18 +451,65 @@ pub async fn list_jobs(
     let mut jobs = Vec::new();
     while let Some(row) = rows.next().await? {
         let result_json: Option<String> = row.get(4)?;
+        let manifest_json: Option<String> = row.get(7)?;
         jobs.push(JobResponse {
             id: row.get(0)?,
             kind: row.get(1)?,
             status: row.get(2)?,
             project_id: row.get(3)?,
-            actions: Vec::new(),
+            actions: manifest_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok())
+                .unwrap_or_default(),
             result: result_json
                 .as_deref()
                 .and_then(|json| serde_json::from_str(json).ok()),
             error: row.get(5)?,
-            created_at_ms: row.get(6)?,
-            updated_at_ms: row.get(7)?,
+            error_code: row.get(6)?,
+            created_at_ms: row.get(8)?,
+            updated_at_ms: row.get(9)?,
+        });
+    }
+
+    Ok(Json(JobListResponse { jobs }))
+}
+
+pub async fn list_project_jobs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<JobListResponse>, ApiError> {
+    authorize(&state, &headers)?;
+
+    let conn = state.db.connect()?;
+    let mut rows = conn
+        .query(
+            "SELECT id, kind, status, project_id, result_json, error, error_code, manifest_json, created_at_ms, updated_at_ms
+             FROM jobs WHERE project_id = ?1 ORDER BY created_at_ms DESC LIMIT 50",
+            params![project_id],
+        )
+        .await?;
+
+    let mut jobs = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let result_json: Option<String> = row.get(4)?;
+        let manifest_json: Option<String> = row.get(7)?;
+        jobs.push(JobResponse {
+            id: row.get(0)?,
+            kind: row.get(1)?,
+            status: row.get(2)?,
+            project_id: row.get(3)?,
+            actions: manifest_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok())
+                .unwrap_or_default(),
+            result: result_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok()),
+            error: row.get(5)?,
+            error_code: row.get(6)?,
+            created_at_ms: row.get(8)?,
+            updated_at_ms: row.get(9)?,
         });
     }
 
@@ -371,7 +526,7 @@ pub async fn read_job(
     let conn = state.db.connect()?;
     let mut rows = conn
         .query(
-            "SELECT id, kind, status, project_id, result_json, error, created_at_ms, updated_at_ms
+            "SELECT id, kind, status, project_id, result_json, error, error_code, manifest_json, created_at_ms, updated_at_ms
              FROM jobs WHERE id = ?1 LIMIT 1",
             params![job_id],
         )
@@ -381,18 +536,23 @@ pub async fn read_job(
     };
 
     let result_json: Option<String> = row.get(4)?;
+    let manifest_json: Option<String> = row.get(7)?;
     Ok(Json(JobResponse {
         id: row.get(0)?,
         kind: row.get(1)?,
         status: row.get(2)?,
         project_id: row.get(3)?,
-        actions: Vec::new(),
+        actions: manifest_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default(),
         result: result_json
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok()),
         error: row.get(5)?,
-        created_at_ms: row.get(6)?,
-        updated_at_ms: row.get(7)?,
+        error_code: row.get(6)?,
+        created_at_ms: row.get(8)?,
+        updated_at_ms: row.get(9)?,
     }))
 }
 
