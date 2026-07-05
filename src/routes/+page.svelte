@@ -6,12 +6,14 @@
   import ProjectsTable from "$lib/components/projects-table.svelte";
   import ProjectWorkspace from "$lib/components/project-workspace.svelte";
   import EngineStatusCard from "$lib/components/engine-status-card.svelte";
+  import JobsPage from "$lib/components/jobs-page.svelte";
   import ImportProjectDialog from "$lib/components/import-project-dialog.svelte";
   import { createDaemonState } from "$lib/daemon/daemon-state.svelte";
   import type { ImportProjectRequest, ImportProjectResponse } from "$lib/daemon/client";
 
   const daemonState = createDaemonState();
   let importDialogOpen = $state(false);
+  let activeView = $state<"projects" | "jobs">("projects");
   let selectedProjectId = $state<string | null>(null);
   const selectedProject = $derived(
     daemonState.projects.find((project) => project.id === selectedProjectId) ??
@@ -69,23 +71,32 @@
 <svelte:window onkeydown={handleShortcut} />
 
 <Sidebar.Provider>
-  <AppSidebar healthState={daemonState.healthState} settings={daemonState.settings} />
+  <AppSidebar
+    healthState={daemonState.healthState}
+    settings={daemonState.settings}
+    {activeView}
+    onNavigate={(view) => (activeView = view)}
+  />
   <Sidebar.Inset>
     <div class="flex flex-col gap-6 p-6">
       <TopBar
         healthState={daemonState.healthState}
         onImportClick={() => (importDialogOpen = true)}
       />
-      <HeroPanel healthState={daemonState.healthState} onRetry={daemonState.refresh} />
-      <EngineStatusCard />
-      <ProjectsTable
-        projects={daemonState.projects}
-        workspaceDetail={daemonState.workspaceDetail}
-        selectedId={selectedProject?.id ?? null}
-        onSelect={(project) => selectProject(project.id)}
-        onRemoved={handleProjectRemoved}
-      />
-      <ProjectWorkspace project={selectedProject} />
+      {#if activeView === "projects"}
+        <HeroPanel healthState={daemonState.healthState} onRetry={daemonState.refresh} />
+        <EngineStatusCard />
+        <ProjectsTable
+          projects={daemonState.projects}
+          workspaceDetail={daemonState.workspaceDetail}
+          selectedId={selectedProject?.id ?? null}
+          onSelect={(project) => selectProject(project.id)}
+          onRemoved={handleProjectRemoved}
+        />
+        <ProjectWorkspace project={selectedProject} />
+      {:else}
+        <JobsPage projects={daemonState.projects} />
+      {/if}
     </div>
   </Sidebar.Inset>
 </Sidebar.Provider>

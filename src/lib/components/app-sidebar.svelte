@@ -1,16 +1,18 @@
 <script lang="ts">
   import * as Sidebar from "$lib/components/ui/sidebar/index.js";
   import { Badge } from "$lib/components/ui/badge/index.js";
-  import { FileText, LayoutGrid, Server, Settings } from "@lucide/svelte";
+  import { FileText, LayoutGrid, ListChecks, Server, Settings } from "@lucide/svelte";
   import { displayPath } from "$lib/utils";
   import type { StudioSettings } from "$lib/daemon/client";
   import type { HealthState } from "$lib/daemon/daemon-state.svelte";
+
+  type View = "projects" | "jobs";
 
   type NavItem = {
     label: string;
     description: string;
     icon: typeof LayoutGrid;
-    active?: boolean;
+    view?: View;
     planned?: boolean;
   };
 
@@ -19,7 +21,13 @@
       label: "Projects",
       description: "Imported Compose workspaces",
       icon: LayoutGrid,
-      active: true,
+      view: "projects",
+    },
+    {
+      label: "Jobs",
+      description: "Every job across every project",
+      icon: ListChecks,
+      view: "jobs",
     },
     {
       label: "Reports",
@@ -44,7 +52,14 @@
   let {
     healthState,
     settings,
-  }: { healthState: HealthState; settings: StudioSettings | undefined } = $props();
+    activeView,
+    onNavigate,
+  }: {
+    healthState: HealthState;
+    settings: StudioSettings | undefined;
+    activeView: View;
+    onNavigate: (view: View) => void;
+  } = $props();
 </script>
 
 <Sidebar.Root collapsible="icon">
@@ -70,10 +85,13 @@
           {#each navItems as item (item.label)}
             <Sidebar.MenuItem>
               <Sidebar.MenuButton
-                isActive={item.active}
+                isActive={item.view !== undefined && item.view === activeView}
                 tooltipContent={item.description}
                 aria-disabled={item.planned}
                 class={item.planned ? "opacity-60" : undefined}
+                onclick={() => {
+                  if (item.view) onNavigate(item.view);
+                }}
               >
                 <item.icon />
                 <span>{item.label}</span>

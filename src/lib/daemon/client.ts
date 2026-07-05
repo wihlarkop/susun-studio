@@ -204,14 +204,36 @@ export type JobAction = {
   resource: string;
 };
 
+export type JobActionResult = {
+  action_id: string;
+  attempts: number;
+  error: string | null;
+  started_at: { secs_since_epoch: number; nanos_since_epoch: number } | null;
+  finished_at: { secs_since_epoch: number; nanos_since_epoch: number } | null;
+  status:
+    | "pending"
+    | "ready"
+    | "running"
+    | "succeeded"
+    | "failed"
+    | "skipped_dependency_failed"
+    | "cancelled";
+};
+
 export type StudioJob = {
   id: string;
   kind: "up" | "down" | "build" | "clean";
   status: JobStatus;
   project_id: string;
   actions: JobAction[];
-  result: { summary: JobExecutionSummary } | null;
+  result: {
+    summary: JobExecutionSummary;
+    partial?: boolean;
+    plan_id?: string;
+    actions?: Record<string, JobActionResult>;
+  } | null;
   error: string | null;
+  error_code: string | null;
   created_at_ms: number;
   updated_at_ms: number;
 };
@@ -444,6 +466,17 @@ export async function cancelJob(
 
 export async function listJobs(options: DaemonRequestOptions = {}): Promise<StudioJob[]> {
   const response = await readJson<JobListResponse>("/v1/jobs", options);
+  return response.jobs;
+}
+
+export async function listProjectJobs(
+  projectId: string,
+  options: DaemonRequestOptions = {},
+): Promise<StudioJob[]> {
+  const response = await readJson<JobListResponse>(
+    `/v1/projects/${encodeURIComponent(projectId)}/jobs`,
+    options,
+  );
   return response.jobs;
 }
 

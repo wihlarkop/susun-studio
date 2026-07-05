@@ -6,6 +6,7 @@
   import {
     ArrowDown,
     ArrowUp,
+    ChevronRight,
     Circle,
     CircleCheck,
     CircleMinus,
@@ -18,12 +19,14 @@
   } from "@lucide/svelte";
   import {
     cancelJob,
+    listProjectJobs,
     readJob,
     runAction,
     subscribeJobEvents,
     type StudioJob,
     type StudioProject,
   } from "$lib/daemon/client";
+  import { relativeTime } from "$lib/utils";
 
   type StepStatus = "pending" | "running" | "succeeded" | "failed" | "skipped" | "cancelled";
   type Step = {
@@ -45,12 +48,24 @@
   let cancelling = $state(false);
   let errorMessage = $state<string | null>(null);
   let cleanConfirmOpen = $state(false);
+  let pastJobs = $state<StudioJob[]>([]);
+  let pastJobsOpen = $state(false);
   let source: EventSource | null = null;
 
   const projectId = $derived(project?.id ?? null);
 
+  async function refreshPastJobs() {
+    if (!projectId) return;
+    try {
+      pastJobs = await listProjectJobs(projectId);
+    } catch {
+      // best-effort — the live job UI above already reflects current state
+    }
+  }
+
   $effect(() => {
     void projectId;
+    refreshPastJobs();
     return () => source?.close();
   });
 
@@ -131,6 +146,7 @@
                 cancelling = false;
                 finalize(updated.status);
                 onJobFinished?.();
+                void refreshPastJobs();
               });
               source?.close();
             }
@@ -144,6 +160,7 @@
             cancelling = false;
             finalize(updated.status);
             onJobFinished?.();
+            void refreshPastJobs();
           });
           source?.close();
         };
@@ -247,6 +264,33 @@
 
   {#if job?.error}
     <p class="text-sm text-destructive">{job.error}</p>
+  {/if}
+
+  {#if pastJobs.length > 0}
+    <button
+      type="button"
+      class="text-muted-foreground hover:text-foreground flex w-fit items-center gap-1 text-xs font-medium"
+      onclick={() => (pastJobsOpen = !pastJobsOpen)}
+    >
+      <ChevronRight class="size-3 transition-transform {pastJobsOpen ? 'rotate-90' : ''}" />
+      Past jobs ({pastJobs.length})
+    </button>
+    {#if pastJobsOpen}
+      <ul class="flex flex-col gap-1 text-sm">
+        {#each pastJobs as pastJob (pastJob.id)}
+          <li class="flex items-center gap-2 rounded-md border px-2 py-1">
+            <span class="font-medium">{pastJob.kind}</span>
+            <StatusBadge status={pastJob.status} />
+            <span class="text-muted-foreground ml-auto text-xs">
+              {relativeTime(pastJob.created_at_ms)}
+            </span>
+          </li>
+          {#if pastJob.error}
+            <li class="text-destructive px-2 text-xs">{pastJob.error}</li>
+          {/if}
+        {/each}
+      </ul>
+    {/if}
   {/if}
 </Card.Root>
 
