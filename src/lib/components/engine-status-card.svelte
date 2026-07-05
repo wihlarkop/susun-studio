@@ -2,7 +2,8 @@
   import * as Card from "$lib/components/ui/card/index.js";
   import { Badge } from "$lib/components/ui/badge/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
-  import { RefreshCw } from "@lucide/svelte";
+  import { RefreshCw, Trash2 } from "@lucide/svelte";
+  import PruneDialog from "./prune-dialog.svelte";
   import {
     listEngines,
     readEngineCapabilities,
@@ -14,6 +15,7 @@
   let engine = $state<StudioEngine | null>(null);
   let capabilities = $state<EngineCapabilities | null>(null);
   let checking = $state(false);
+  let pruneDialogOpen = $state(false);
 
   $effect(() => {
     const controller = new AbortController();
@@ -85,10 +87,16 @@
           </span>
         {/if}
       </div>
-      <Button size="sm" variant="outline" disabled={checking} onclick={() => recheck()}>
-        <RefreshCw />
-        Recheck
-      </Button>
+      <div class="flex items-center gap-2">
+        <Button size="sm" variant="outline" disabled={checking} onclick={() => recheck()}>
+          <RefreshCw />
+          Recheck
+        </Button>
+        <Button size="sm" variant="destructive" onclick={() => (pruneDialogOpen = true)}>
+          <Trash2 />
+          Prune…
+        </Button>
+      </div>
     </div>
 
     {#if engine.last_health?.error}
@@ -110,4 +118,5 @@
       </div>
     {/if}
   </Card.Root>
+  <PruneDialog engineId={engine.id} bind:open={pruneDialogOpen} />
 {/if}

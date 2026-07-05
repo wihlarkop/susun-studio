@@ -4,6 +4,7 @@ import {
   listProjects,
   readDaemonHealth,
   readSettings,
+  updateSettings as updateSettingsRequest,
   type DaemonHealth,
   type ImportProjectRequest,
   type ImportProjectResponse,
@@ -93,6 +94,19 @@ export function createDaemonState() {
     return response;
   }
 
+  // Best-effort persistence: the selection already applies locally the
+  // moment the caller sets it, so a failed write here (daemon restarting,
+  // network blip) just means it won't be restored next launch — not worth
+  // surfacing as an error.
+  async function setLastProjectId(projectId: string): Promise<void> {
+    const current = settings ?? { default_project_root: "", last_project_id: "" };
+    try {
+      settings = await updateSettingsRequest({ ...current, last_project_id: projectId });
+    } catch {
+      // ignore — see comment above
+    }
+  }
+
   return {
     get healthState() {
       return healthState;
@@ -108,5 +122,6 @@ export function createDaemonState() {
     },
     importProject,
     refresh: () => refresh(),
+    setLastProjectId,
   };
 }

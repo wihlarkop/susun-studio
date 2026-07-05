@@ -4,9 +4,7 @@
   import TopBar from "$lib/components/top-bar.svelte";
   import HeroPanel from "$lib/components/hero-panel.svelte";
   import ProjectsTable from "$lib/components/projects-table.svelte";
-  import ProjectDetail from "$lib/components/project-detail.svelte";
-  import PlanningPanel from "$lib/components/planning-panel.svelte";
-  import JobPanel from "$lib/components/job-panel.svelte";
+  import ProjectWorkspace from "$lib/components/project-workspace.svelte";
   import EngineStatusCard from "$lib/components/engine-status-card.svelte";
   import ImportProjectDialog from "$lib/components/import-project-dialog.svelte";
   import { createDaemonState } from "$lib/daemon/daemon-state.svelte";
@@ -21,10 +19,35 @@
       null,
   );
 
+  function selectProject(id: string) {
+    selectedProjectId = id;
+    void daemonState.setLastProjectId(id);
+  }
+
+  // Restore the last-viewed project once, the first time both settings and
+  // the project list have loaded — not on every subsequent refresh, so it
+  // never overrides a selection the user has since made.
+  let restoredSelection = false;
+  $effect(() => {
+    if (restoredSelection || !daemonState.settings || daemonState.projects.length === 0) return;
+    restoredSelection = true;
+    const lastId = daemonState.settings.last_project_id;
+    if (lastId && daemonState.projects.some((project) => project.id === lastId)) {
+      selectedProjectId = lastId;
+    }
+  });
+
+  function handleProjectRemoved(removedId: string) {
+    if (selectedProjectId === removedId) {
+      selectedProjectId = null;
+    }
+    void daemonState.refresh();
+  }
+
   async function handleImport(request: ImportProjectRequest): Promise<ImportProjectResponse> {
     const response = await daemonState.importProject(request);
     if (response.project) {
-      selectedProjectId = response.project.id;
+      selectProject(response.project.id);
     }
     return response;
   }
@@ -55,17 +78,14 @@
       />
       <HeroPanel healthState={daemonState.healthState} onRetry={daemonState.refresh} />
       <EngineStatusCard />
-      <div class="grid items-start gap-6 xl:grid-cols-[3fr_2fr]">
-        <ProjectsTable
-          projects={daemonState.projects}
-          workspaceDetail={daemonState.workspaceDetail}
-          selectedId={selectedProject?.id ?? null}
-          onSelect={(project) => (selectedProjectId = project.id)}
-        />
-        <ProjectDetail project={selectedProject} />
-      </div>
-      <PlanningPanel project={selectedProject} />
-      <JobPanel project={selectedProject} />
+      <ProjectsTable
+        projects={daemonState.projects}
+        workspaceDetail={daemonState.workspaceDetail}
+        selectedId={selectedProject?.id ?? null}
+        onSelect={(project) => selectProject(project.id)}
+        onRemoved={handleProjectRemoved}
+      />
+      <ProjectWorkspace project={selectedProject} />
     </div>
   </Sidebar.Inset>
 </Sidebar.Provider>

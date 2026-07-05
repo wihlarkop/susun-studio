@@ -104,6 +104,7 @@ export type StudioProject = {
 
 export type StudioSettings = {
   default_project_root: string;
+  last_project_id: string;
 };
 
 type ProjectListResponse = {
@@ -205,7 +206,7 @@ export type JobAction = {
 
 export type StudioJob = {
   id: string;
-  kind: "up" | "down" | "build";
+  kind: "up" | "down" | "build" | "clean";
   status: JobStatus;
   project_id: string;
   actions: JobAction[];
@@ -219,11 +220,68 @@ type JobListResponse = {
   jobs: StudioJob[];
 };
 
+export type SnapshotContainer = {
+  id: string;
+  name: string;
+  service: string | null;
+  replica: number | null;
+  state: string;
+  health: string | null;
+  image: string | null;
+};
+
+export type SnapshotResource = {
+  id: string;
+  name: string;
+};
+
+export type ProjectSnapshot = {
+  observed_at_ms: number;
+  containers: SnapshotContainer[];
+  networks: SnapshotResource[];
+  volumes: SnapshotResource[];
+};
+
+export type ServiceActionResult = {
+  service: string;
+  containers: { id: string; state: string }[];
+};
+
+export type PortBinding = {
+  private_port: number;
+  protocol: string;
+  host_ip: string | null;
+  host_port: string;
+};
+
+export type LogStreamLine = {
+  service: string;
+  source: string;
+  line: string;
+};
+
+export type EngineEventPayload = {
+  kind: string;
+  action: string;
+  resource_id?: string;
+  attributes: Record<string, string>;
+  time?: number;
+};
+
+export type ExecStreamEvent = {
+  kind: "output" | "end" | "error" | "created" | "exited" | "removed";
+  source?: string;
+  line?: string;
+  message?: string;
+  exit_code?: number;
+  container_id?: string;
+};
+
 type DaemonRequestOptions = {
   baseUrl?: string;
   token?: string;
   signal?: AbortSignal;
-  method?: "GET" | "POST" | "PUT";
+  method?: "GET" | "POST" | "PUT" | "DELETE";
   body?: unknown;
   auth?: boolean;
 };
@@ -270,6 +328,16 @@ export async function importProject(
       project_name: request.project_name ?? null,
       profiles: request.profiles ?? [],
     },
+  });
+}
+
+export async function deleteProject(
+  projectId: string,
+  options: DaemonRequestOptions = {},
+): Promise<{ deleted: boolean }> {
+  return readJson(`/v1/projects/${encodeURIComponent(projectId)}`, {
+    ...options,
+    method: "DELETE",
   });
 }
 
@@ -330,9 +398,32 @@ export async function readEngineCapabilities(
   return readJson(`/v1/engines/${encodeURIComponent(engineId)}/capabilities`, options);
 }
 
+export type PruneScope = "containers" | "networks" | "volumes" | "images";
+
+export type PruneReport = {
+  containers_removed: string[];
+  networks_removed: string[];
+  volumes_removed: string[];
+  images_removed: string[];
+  space_reclaimed_bytes: number;
+};
+
+export async function pruneEngine(
+  engineId: string,
+  scopes: PruneScope[],
+  allImages: boolean = false,
+  options: DaemonRequestOptions = {},
+): Promise<PruneReport> {
+  return readJson(`/v1/engines/${encodeURIComponent(engineId)}/prune`, {
+    ...options,
+    method: "POST",
+    body: { scopes, all_images: allImages },
+  });
+}
+
 export async function runAction(
   projectId: string,
-  action: "up" | "down" | "build",
+  action: "up" | "down" | "build" | "clean",
   options: DaemonRequestOptions = {},
 ): Promise<StudioJob> {
   return readJson(`/v1/projects/${encodeURIComponent(projectId)}/actions/${action}`, {
@@ -364,19 +455,111 @@ export async function readJob(
 }
 
 // Native EventSource cannot send an Authorization header, so we first make an
-// authenticated POST for a short-lived, single-use, job-scoped ticket and put
+// authenticated POST for a short-lived, single-use, scope-bound ticket and put
 // only that ticket in the stream URL. The long-lived token never hits a URL.
-export async function subscribeJobEvents(jobId: string): Promise<EventSource> {
-  const { ticket } = await readJson<{ ticket: string; expires_at_ms: number }>(
-    `/v1/jobs/${encodeURIComponent(jobId)}/events/ticket`,
-    { method: "POST" },
-  );
-  const url = new URL(
-    `/v1/jobs/${encodeURIComponent(jobId)}/events`,
-    normalizeBaseUrl(defaultDaemonBaseUrl),
-  );
+async function openTicketStream(
+  ticketPath: string,
+  streamPath: string = ticketPath,
+  body?: unknown,
+): Promise<EventSource> {
+  const { ticket } = await readJson<{ ticket: string; expires_at_ms: number }>(ticketPath, {
+    method: "POST",
+    body: body ?? {},
+  });
+  const url = new URL(streamPath, normalizeBaseUrl(defaultDaemonBaseUrl));
   url.searchParams.set("ticket", ticket);
   return new EventSource(url);
+}
+
+export async function subscribeJobEvents(jobId: string): Promise<EventSource> {
+  return openTicketStream(
+    `/v1/jobs/${encodeURIComponent(jobId)}/events/ticket`,
+    `/v1/jobs/${encodeURIComponent(jobId)}/events`,
+  );
+}
+
+export async function readProjectSnapshot(
+  projectId: string,
+  options: DaemonRequestOptions = {},
+): Promise<ProjectSnapshot> {
+  return readJson(`/v1/projects/${encodeURIComponent(projectId)}/snapshot`, options);
+}
+
+export async function serviceAction(
+  projectId: string,
+  service: string,
+  action: "start" | "stop" | "restart",
+  options: DaemonRequestOptions = {},
+): Promise<ServiceActionResult> {
+  return readJson(
+    `/v1/projects/${encodeURIComponent(projectId)}/services/${encodeURIComponent(service)}/${action}`,
+    { ...options, method: "POST" },
+  );
+}
+
+export async function waitService(
+  projectId: string,
+  service: string,
+  options: DaemonRequestOptions = {},
+): Promise<{ exit_code: number }> {
+  return readJson(
+    `/v1/projects/${encodeURIComponent(projectId)}/services/${encodeURIComponent(service)}/wait`,
+    { ...options, method: "POST" },
+  );
+}
+
+export async function readServicePorts(
+  projectId: string,
+  service: string,
+  options: DaemonRequestOptions = {},
+): Promise<{ bindings: PortBinding[] }> {
+  return readJson(
+    `/v1/projects/${encodeURIComponent(projectId)}/services/${encodeURIComponent(service)}/ports`,
+    options,
+  );
+}
+
+export async function copyService(
+  projectId: string,
+  service: string,
+  body: { direction: "to_container" | "from_container"; host_path: string; container_path: string },
+  options: DaemonRequestOptions = {},
+): Promise<{ copied: boolean }> {
+  return readJson(
+    `/v1/projects/${encodeURIComponent(projectId)}/services/${encodeURIComponent(service)}/cp`,
+    { ...options, method: "POST", body },
+  );
+}
+
+export async function openLogStream(
+  projectId: string,
+  opts: { service?: string; tail?: number } = {},
+): Promise<EventSource> {
+  const path = `/v1/projects/${encodeURIComponent(projectId)}/streams/logs`;
+  return openTicketStream(path, path, opts);
+}
+
+export async function openEventStream(projectId: string): Promise<EventSource> {
+  const path = `/v1/projects/${encodeURIComponent(projectId)}/streams/events`;
+  return openTicketStream(path, path);
+}
+
+export async function openExecStream(
+  projectId: string,
+  service: string,
+  body: { command: string[]; user?: string; working_dir?: string },
+): Promise<EventSource> {
+  const path = `/v1/projects/${encodeURIComponent(projectId)}/services/${encodeURIComponent(service)}/streams/exec`;
+  return openTicketStream(path, path, body);
+}
+
+export async function openRunStream(
+  projectId: string,
+  service: string,
+  body: { command?: string[] } = {},
+): Promise<EventSource> {
+  const path = `/v1/projects/${encodeURIComponent(projectId)}/services/${encodeURIComponent(service)}/streams/run`;
+  return openTicketStream(path, path, body);
 }
 
 export async function readSettings(options: DaemonRequestOptions = {}): Promise<StudioSettings> {

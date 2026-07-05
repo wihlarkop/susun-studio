@@ -3,6 +3,9 @@
   import * as Card from "$lib/components/ui/card/index.js";
   import * as Tooltip from "$lib/components/ui/tooltip/index.js";
   import { Badge } from "$lib/components/ui/badge/index.js";
+  import { Button } from "$lib/components/ui/button/index.js";
+  import { Trash2 } from "@lucide/svelte";
+  import RemoveProjectDialog from "./remove-project-dialog.svelte";
   import { cn, displayPath, formatTimestamp, relativeTime } from "$lib/utils";
   import type { StudioProject } from "$lib/daemon/client";
 
@@ -11,12 +14,23 @@
     workspaceDetail,
     selectedId,
     onSelect,
+    onRemoved,
   }: {
     projects: StudioProject[];
     workspaceDetail: string;
     selectedId: string | null;
     onSelect: (project: StudioProject) => void;
+    onRemoved: (projectId: string) => void;
   } = $props();
+
+  let removeTarget = $state<StudioProject | null>(null);
+  let removeDialogOpen = $state(false);
+
+  function openRemove(event: MouseEvent, project: StudioProject) {
+    event.stopPropagation();
+    removeTarget = project;
+    removeDialogOpen = true;
+  }
 
   const workspaceSummary = $derived.by(() => {
     if (projects.length === 0) {
@@ -59,6 +73,7 @@
           <Table.Head>Path</Table.Head>
           <Table.Head class="text-right">Services</Table.Head>
           <Table.Head>Status</Table.Head>
+          <Table.Head class="w-10"></Table.Head>
         </Table.Row>
       </Table.Header>
       <Table.Body>
@@ -106,12 +121,23 @@
                     <Badge variant="default">Clean</Badge>
                   {/if}
                 </Table.Cell>
+                <Table.Cell>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    class="size-7"
+                    aria-label={`Remove ${project.name} from Studio`}
+                    onclick={(event) => openRemove(event, project)}
+                  >
+                    <Trash2 class="size-3.5" />
+                  </Button>
+                </Table.Cell>
               </Table.Row>
             {/each}
           </Tooltip.Provider>
         {:else}
           <Table.Row>
-            <Table.Cell colspan={4} class="h-24 text-center text-muted-foreground">
+            <Table.Cell colspan={5} class="h-24 text-center text-muted-foreground">
               No projects yet. Use <span class="font-medium">Import Project</span> to add a
               Compose workspace.
             </Table.Cell>
@@ -121,3 +147,14 @@
     </Table.Root>
   </Card.Root>
 </div>
+
+{#if removeTarget}
+  <RemoveProjectDialog
+    project={removeTarget}
+    bind:open={removeDialogOpen}
+    onRemoved={() => {
+      if (removeTarget) onRemoved(removeTarget.id);
+      removeTarget = null;
+    }}
+  />
+{/if}

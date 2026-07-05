@@ -1,7 +1,8 @@
 <script lang="ts">
   import * as Card from "$lib/components/ui/card/index.js";
-  import { Badge } from "$lib/components/ui/badge/index.js";
+  import * as Dialog from "$lib/components/ui/dialog/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
+  import StatusBadge from "./status-badge.svelte";
   import {
     ArrowDown,
     ArrowUp,
@@ -12,6 +13,7 @@
     CircleX,
     Hammer,
     LoaderCircle,
+    Trash2,
     X,
   } from "@lucide/svelte";
   import {
@@ -32,13 +34,17 @@
     progress: number;
   };
 
-  let { project }: { project: StudioProject | null } = $props();
+  let {
+    project,
+    onJobFinished,
+  }: { project: StudioProject | null; onJobFinished?: () => void } = $props();
 
   let job = $state<StudioJob | null>(null);
   let steps = $state<Step[]>([]);
   let starting = $state(false);
   let cancelling = $state(false);
   let errorMessage = $state<string | null>(null);
+  let cleanConfirmOpen = $state(false);
   let source: EventSource | null = null;
 
   const projectId = $derived(project?.id ?? null);
@@ -60,13 +66,6 @@
     skipped: { icon: CircleMinus, class: "text-muted-foreground" },
   } as const;
 
-  function statusVariant(status: string): "default" | "destructive" | "secondary" | "outline" {
-    if (status === "succeeded") return "default";
-    if (status === "failed") return "destructive";
-    if (status === "cancelled") return "outline";
-    return "secondary";
-  }
-
   function setStep(id: string, patch: Partial<Step>) {
     steps = steps.map((step) => (step.id === id ? { ...step, ...patch } : step));
   }
@@ -86,7 +85,7 @@
     );
   }
 
-  async function run(action: "up" | "down" | "build") {
+  async function run(action: "up" | "down" | "build" | "clean") {
     if (!projectId) {
       return;
     }
@@ -131,6 +130,7 @@
                 job = updated;
                 cancelling = false;
                 finalize(updated.status);
+                onJobFinished?.();
               });
               source?.close();
             }
@@ -143,6 +143,7 @@
             job = updated;
             cancelling = false;
             finalize(updated.status);
+            onJobFinished?.();
           });
           source?.close();
         };
@@ -165,7 +166,7 @@
     <div class="flex items-center gap-2">
       <h3 class="text-lg font-semibold">Runtime Actions</h3>
       {#if job}
-        <Badge variant={statusVariant(job.status)}>{job.status}</Badge>
+        <StatusBadge status={job.status} />
       {/if}
     </div>
     <div class="flex items-center gap-2">
@@ -190,6 +191,15 @@
       >
         <ArrowDown />
         Down
+      </Button>
+      <Button
+        size="sm"
+        variant="destructive"
+        disabled={!project || starting}
+        onclick={() => (cleanConfirmOpen = true)}
+      >
+        <Trash2 />
+        Clean
       </Button>
       {#if job?.status === "running"}
         <Button size="sm" variant="destructive" disabled={cancelling} onclick={cancel}>
@@ -239,3 +249,30 @@
     <p class="text-sm text-destructive">{job.error}</p>
   {/if}
 </Card.Root>
+
+<Dialog.Root bind:open={cleanConfirmOpen}>
+  <Dialog.Content class="sm:max-w-md">
+    <Dialog.Header>
+      <Dialog.Title>Clean this project?</Dialog.Title>
+      <Dialog.Description>
+        Stops and removes all containers, networks, and <b>named volumes</b> for this project.
+        Volume data (e.g. database contents) will be permanently deleted. This cannot be undone.
+      </Dialog.Description>
+    </Dialog.Header>
+    <Dialog.Footer>
+      <Button type="button" variant="outline" onclick={() => (cleanConfirmOpen = false)}>
+        Cancel
+      </Button>
+      <Button
+        type="button"
+        variant="destructive"
+        onclick={() => {
+          cleanConfirmOpen = false;
+          run("clean");
+        }}
+      >
+        Clean
+      </Button>
+    </Dialog.Footer>
+  </Dialog.Content>
+</Dialog.Root>
