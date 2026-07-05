@@ -5,7 +5,7 @@ use std::{
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
@@ -266,4 +266,22 @@ fn canonicalize_paths(paths: &[String]) -> Result<Vec<PathBuf>, ApiError> {
 fn canonicalize_path(path: &str) -> Result<PathBuf, ApiError> {
     std::fs::canonicalize(path)
         .map_err(|source| ApiError::InvalidImport(format!("`{path}`: {source}")))
+}
+
+pub async fn delete_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &headers)?;
+
+    let conn = state.db.connect()?;
+    let affected = conn
+        .execute("DELETE FROM projects WHERE id = ?1", params![project_id])
+        .await?;
+    if affected == 0 {
+        return Err(ApiError::ProjectNotFound);
+    }
+
+    Ok(Json(serde_json::json!({ "deleted": true })))
 }

@@ -1,5 +1,4 @@
 use std::{
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicI64, Ordering},
@@ -17,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use turso::{Database, params};
 
-use crate::{auth::authorize, error::ApiError, state::AppState, susun_integration};
+use crate::{
+    auth::authorize, error::ApiError, project_source::load_project_source, state::AppState,
+    susun_integration,
+};
 
 #[derive(Debug, Serialize)]
 pub struct JobActionResponse {
@@ -73,7 +75,21 @@ pub async fn action_down(
     Path(project_id): Path<String>,
 ) -> Result<Json<JobResponse>, ApiError> {
     authorize(&state, &headers)?;
-    start_down_job(state, project_id).await
+    start_down_job(state, project_id, "down", susun::DownPlanOptions::default()).await
+}
+
+pub async fn action_clean(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<JobResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    let options = susun::DownPlanOptions {
+        remove_volumes: true,
+        remove_orphans: true,
+        ..susun::DownPlanOptions::default()
+    };
+    start_down_job(state, project_id, "clean", options).await
 }
 
 async fn start_up_job(
@@ -131,6 +147,8 @@ async fn start_up_job(
 async fn start_down_job(
     state: AppState,
     project_id: String,
+    kind: &'static str,
+    options: susun::DownPlanOptions,
 ) -> Result<Json<JobResponse>, ApiError> {
     let source = load_project_source(&state, &project_id).await?;
     let engine =
@@ -141,15 +159,15 @@ async fn start_down_job(
         source.env_file.as_ref(),
         source.project_name.as_deref(),
         &source.profiles,
-        susun::DownPlanOptions::default(),
+        options,
         &engine,
     )
     .await
     .map_err(ApiError::PlanningFailed)?;
 
     let now = now_ms()?;
-    let job_id = format!("job-{now}-down");
-    insert_job(&state, &job_id, "down", &project_id, now).await?;
+    let job_id = format!("job-{now}-{kind}");
+    insert_job(&state, &job_id, kind, &project_id, now).await?;
 
     let (cancellation, sender, cancel_notify) = state.jobs.register(job_id.clone());
     let db = state.db.clone();
@@ -170,7 +188,7 @@ async fn start_down_job(
         registry.unregister(&spawn_job_id);
     });
 
-    Ok(Json(running_job_response(job_id, "down", project_id, now, manifest)))
+    Ok(Json(running_job_response(job_id, kind, project_id, now, manifest)))
 }
 
 /// Builds the EventSink that fans each runtime event to SSE subscribers and
@@ -201,64 +219,6 @@ fn make_event_sink(
                     .await;
             }
         })
-    })
-}
-
-struct ProjectSource {
-    files: Vec<PathBuf>,
-    env_file: Option<PathBuf>,
-    project_name: Option<String>,
-    profiles: Vec<String>,
-}
-
-async fn load_project_source(state: &AppState, project_id: &str) -> Result<ProjectSource, ApiError> {
-    let conn = state.db.connect()?;
-
-    // Read in a scope so the cursor closes before any later write.
-    let (compose_files_json, env_file, project_name, profiles_json): (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) = {
-        let mut rows = conn
-            .query(
-                "SELECT compose_files, env_file, project_name_override, profiles
-                 FROM projects WHERE id = ?1 LIMIT 1",
-                params![project_id.to_owned()],
-            )
-            .await?;
-        let Some(row) = rows.next().await? else {
-            return Err(ApiError::ProjectNotFound);
-        };
-        (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)
-    };
-
-    let Some(compose_files_json) = compose_files_json else {
-        return Err(ApiError::PlanningFailed(
-            "project has no source metadata; import it first".to_owned(),
-        ));
-    };
-
-    let stored_files: Vec<String> = serde_json::from_str(&compose_files_json).unwrap_or_default();
-    let files = stored_files
-        .iter()
-        .map(|path| resolve_path(path))
-        .collect::<Result<Vec<PathBuf>, ApiError>>()?;
-    let env_file = match env_file.as_deref() {
-        Some(path) => Some(resolve_path(path)?),
-        None => None,
-    };
-    let profiles: Vec<String> = profiles_json
-        .as_deref()
-        .and_then(|json| serde_json::from_str(json).ok())
-        .unwrap_or_default();
-
-    Ok(ProjectSource {
-        files,
-        env_file,
-        project_name,
-        profiles,
     })
 }
 
@@ -451,7 +411,7 @@ pub async fn create_stream_ticket(
     Path(job_id): Path<String>,
 ) -> Result<Json<StreamTicketResponse>, ApiError> {
     authorize(&state, &headers)?;
-    let (ticket, expires_at_ms) = state.stream_tickets.issue(job_id);
+    let (ticket, expires_at_ms) = state.stream_tickets.issue(format!("job:{job_id}"));
     Ok(Json(StreamTicketResponse {
         ticket,
         expires_at_ms,
@@ -474,7 +434,11 @@ pub async fn job_events(
     let Some(ticket) = query.ticket.as_deref() else {
         return Err(ApiError::Unauthorized);
     };
-    if !state.stream_tickets.consume(ticket, &job_id) {
+    if state
+        .stream_tickets
+        .consume(ticket, &format!("job:{job_id}"))
+        .is_none()
+    {
         return Err(ApiError::Unauthorized);
     }
 
@@ -490,11 +454,6 @@ pub async fn job_events(
     });
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
-}
-
-fn resolve_path(path: &str) -> Result<PathBuf, ApiError> {
-    std::fs::canonicalize(path)
-        .map_err(|source| ApiError::PlanningFailed(format!("`{path}`: {source}")))
 }
 
 fn now_ms() -> Result<i64, ApiError> {

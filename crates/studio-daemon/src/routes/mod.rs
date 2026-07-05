@@ -1,8 +1,10 @@
 mod engines;
 mod health;
 mod jobs;
+mod observe;
 mod plans;
 mod projects;
+mod service_actions;
 mod settings;
 
 use axum::{
@@ -11,6 +13,7 @@ use axum::{
         HeaderValue, Method,
         header::{AUTHORIZATION, CONTENT_TYPE},
     },
+    routing::delete,
     routing::get,
     routing::post,
 };
@@ -26,6 +29,7 @@ pub fn app(state: AppState) -> Router {
             get(projects::list_projects).post(projects::create_project),
         )
         .route("/v1/projects/import", post(projects::import_project))
+        .route("/v1/projects/{id}", delete(projects::delete_project))
         .route("/v1/projects/{id}/plans/up", post(plans::create_up_plan))
         .route(
             "/v1/projects/{id}/plans/down",
@@ -39,8 +43,10 @@ pub fn app(state: AppState) -> Router {
             "/v1/engines/{id}/capabilities",
             get(engines::engine_capabilities),
         )
+        .route("/v1/engines/{id}/prune", post(engines::prune_engine))
         .route("/v1/projects/{id}/actions/up", post(jobs::action_up))
         .route("/v1/projects/{id}/actions/down", post(jobs::action_down))
+        .route("/v1/projects/{id}/actions/clean", post(jobs::action_clean))
         .route("/v1/projects/{id}/actions/build", post(jobs::action_build))
         .route("/v1/jobs", get(jobs::list_jobs))
         .route("/v1/jobs/{id}", get(jobs::read_job))
@@ -50,6 +56,47 @@ pub fn app(state: AppState) -> Router {
             post(jobs::create_stream_ticket),
         )
         .route("/v1/jobs/{id}/events", get(jobs::job_events))
+        .route("/v1/projects/{id}/snapshot", get(observe::project_snapshot))
+        .route(
+            "/v1/projects/{id}/streams/logs",
+            post(observe::create_log_stream_ticket).get(observe::stream_logs),
+        )
+        .route(
+            "/v1/projects/{id}/streams/events",
+            post(observe::create_event_stream_ticket).get(observe::stream_events),
+        )
+        .route(
+            "/v1/projects/{id}/services/{service}/start",
+            post(service_actions::start_service),
+        )
+        .route(
+            "/v1/projects/{id}/services/{service}/stop",
+            post(service_actions::stop_service),
+        )
+        .route(
+            "/v1/projects/{id}/services/{service}/restart",
+            post(service_actions::restart_service),
+        )
+        .route(
+            "/v1/projects/{id}/services/{service}/wait",
+            post(service_actions::wait_service),
+        )
+        .route(
+            "/v1/projects/{id}/services/{service}/ports",
+            get(service_actions::service_ports),
+        )
+        .route(
+            "/v1/projects/{id}/services/{service}/streams/exec",
+            post(service_actions::create_exec_ticket).get(service_actions::stream_exec),
+        )
+        .route(
+            "/v1/projects/{id}/services/{service}/streams/run",
+            post(service_actions::create_run_ticket).get(service_actions::stream_run),
+        )
+        .route(
+            "/v1/projects/{id}/services/{service}/cp",
+            post(service_actions::copy_service),
+        )
         .route(
             "/v1/settings",
             get(settings::get_settings).put(settings::update_settings),
@@ -68,6 +115,6 @@ fn local_cors_layer() -> CorsLayer {
             HeaderValue::from_static("tauri://localhost"),
             HeaderValue::from_static("http://tauri.localhost"),
         ]))
-        .allow_methods([Method::GET, Method::POST, Method::PUT])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers([AUTHORIZATION, CONTENT_TYPE])
 }

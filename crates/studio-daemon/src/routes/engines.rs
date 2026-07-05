@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use turso::params;
 
 use crate::{auth::authorize, error::ApiError, state::AppState, susun_integration};
@@ -140,6 +140,44 @@ pub async fn engine_capabilities(
         supports_build: capabilities.supports_build,
         supports_mount_types: capabilities.supports_mount_types,
         max_container_name_length: capabilities.max_container_name_length,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PruneRequest {
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub all_images: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PruneResponse {
+    pub containers_removed: Vec<String>,
+    pub networks_removed: Vec<String>,
+    pub volumes_removed: Vec<String>,
+    pub images_removed: Vec<String>,
+    pub space_reclaimed_bytes: u64,
+}
+
+pub async fn prune_engine(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(_engine_id): Path<String>,
+    Json(request): Json<PruneRequest>,
+) -> Result<Json<PruneResponse>, ApiError> {
+    authorize(&state, &headers)?;
+
+    let engine = susun_integration::connect_docker_engine().map_err(ApiError::EngineUnavailable)?;
+    let report = susun_integration::system_prune(&engine, &request.scopes, request.all_images)
+        .await
+        .map_err(ApiError::EngineUnavailable)?;
+
+    Ok(Json(PruneResponse {
+        containers_removed: report.containers_removed,
+        networks_removed: report.networks_removed,
+        volumes_removed: report.volumes_removed,
+        images_removed: report.images_removed,
+        space_reclaimed_bytes: report.space_reclaimed_bytes,
     }))
 }
 

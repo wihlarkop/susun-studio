@@ -373,6 +373,203 @@ pub fn job_action_manifest(plan: &ExecutionPlan) -> Vec<JobActionManifest> {
         .collect()
 }
 
+/// Analyzed project handles needed by runtime operations.
+pub struct RuntimeContext {
+    pub identity: susun::ProjectIdentity,
+    pub project: susun::Project,
+}
+
+pub fn runtime_context(
+    files: &[PathBuf],
+    env_file: Option<&PathBuf>,
+    project_name: Option<&str>,
+    profiles: &[String],
+) -> Result<RuntimeContext, String> {
+    let sdk_project = build_workspace(files, env_file, project_name, profiles)
+        .analyze()
+        .map_err(|error| error.to_string())?;
+    let identity = sdk_project
+        .identity()
+        .cloned()
+        .ok_or_else(|| "project has no derivable identity".to_owned())?;
+    let project = sdk_project
+        .project()
+        .cloned()
+        .ok_or_else(|| "project failed to analyze".to_owned())?;
+    Ok(RuntimeContext { identity, project })
+}
+
+pub struct SnapshotContainerRow {
+    pub id: String,
+    pub name: String,
+    pub service: Option<String>,
+    pub replica: Option<u32>,
+    pub state: String,
+    pub health: Option<String>,
+    pub image: Option<String>,
+}
+
+pub struct SnapshotResourceRow {
+    pub id: String,
+    pub name: String,
+}
+
+pub struct SnapshotRow {
+    pub observed_at_ms: i64,
+    pub containers: Vec<SnapshotContainerRow>,
+    pub networks: Vec<SnapshotResourceRow>,
+    pub volumes: Vec<SnapshotResourceRow>,
+}
+
+/// Project-scoped live engine state, flattened for the UI.
+pub async fn project_snapshot(
+    engine: &BollardEngine,
+    identity: &susun::ProjectIdentity,
+) -> Result<SnapshotRow, String> {
+    let snapshot = engine.snapshot(identity).await.map_err(|e| e.to_string())?;
+    let observed_at_ms = snapshot
+        .observed_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or_default())
+        .unwrap_or_default();
+
+    let containers = snapshot
+        .containers
+        .values()
+        .map(|container| SnapshotContainerRow {
+            id: container.id.as_str().to_owned(),
+            name: container.name.as_str().to_owned(),
+            service: container
+                .service_identity
+                .as_ref()
+                .map(|s| s.service.to_string()),
+            replica: container
+                .service_identity
+                .as_ref()
+                .map(|s| s.replica.as_u32()),
+            state: enum_label(container.state),
+            health: container.health.map(enum_label),
+            image: match &container.image {
+                susun::ObservedImageRef::Id(id) => Some(id.as_str().to_owned()),
+                susun::ObservedImageRef::Reference(image) => Some(image.to_string()),
+                susun::ObservedImageRef::Unknown => None,
+            },
+        })
+        .collect();
+
+    let networks = snapshot
+        .networks
+        .values()
+        .map(|network| SnapshotResourceRow {
+            id: network.id.as_str().to_owned(),
+            name: network.name.as_str().to_owned(),
+        })
+        .collect();
+    let volumes = snapshot
+        .volumes
+        .values()
+        .map(|volume| SnapshotResourceRow {
+            id: volume.id.as_str().to_owned(),
+            name: volume.name.as_str().to_owned(),
+        })
+        .collect();
+
+    Ok(SnapshotRow {
+        observed_at_ms,
+        containers,
+        networks,
+        volumes,
+    })
+}
+
+/// Containers currently belonging to one service, with their state labels.
+pub async fn service_containers(
+    engine: &BollardEngine,
+    identity: &susun::ProjectIdentity,
+    service: &str,
+) -> Result<Vec<(susun::ContainerRef, String)>, String> {
+    let snapshot = engine.snapshot(identity).await.map_err(|e| e.to_string())?;
+    Ok(snapshot
+        .containers
+        .values()
+        .filter(|container| {
+            container
+                .service_identity
+                .as_ref()
+                .is_some_and(|s| s.service.to_string() == service)
+        })
+        .map(|container| {
+            (
+                susun::ContainerRef {
+                    id: container.id.clone(),
+                },
+                enum_label(container.state),
+            )
+        })
+        .collect())
+}
+
+/// Builds a one-off "compose run"-style container request for a service:
+/// service env/entrypoint/volumes/networks, optional command override, NO
+/// published ports (compose-run default), NO config/secret mounts (v1 gap,
+/// surfaced in the UI).
+pub fn build_run_request(
+    context: &RuntimeContext,
+    service: &str,
+    command: Option<Vec<String>>,
+) -> Result<susun::CreateContainerRequest, String> {
+    let (service_name, definition) = context
+        .project
+        .services
+        .iter()
+        .find(|(name, _)| name.to_string() == service)
+        .ok_or_else(|| format!("service `{service}` not found"))?;
+    let image = definition.image.clone().ok_or_else(|| {
+        "service has no image (build-only services cannot run one-offs)".to_owned()
+    })?;
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let name = susun::ResourceName::new(format!(
+        "{}-{}-run-{}",
+        context.identity.name,
+        service,
+        &suffix[..8]
+    ))
+    .map_err(|e| e.to_string())?;
+
+    Ok(susun::CreateContainerRequest {
+        project: context.identity.clone(),
+        service: susun::ServiceInstanceId::new(
+            context.identity.working_set.clone(),
+            service_name.clone(),
+            susun::ReplicaIndex::FIRST,
+        ),
+        name,
+        image: Some(image),
+        command: command
+            .map(susun::Command::Exec)
+            .or_else(|| definition.command.clone()),
+        entrypoint: definition.entrypoint.clone(),
+        environment: definition.environment.clone(),
+        container_labels: definition.labels.clone(),
+        ports: Vec::new(),
+        volumes: definition.volumes.clone(),
+        configs: Vec::new(),
+        secrets: Vec::new(),
+        networks: definition
+            .networks
+            .iter()
+            .map(|(name, attachment)| {
+                let name = susun::ResourceName::new(name.to_string()).map_err(|e| e.to_string())?;
+                Ok::<_, String>((name, attachment.clone()))
+            })
+            .collect::<Result<indexmap::IndexMap<_, _>, String>>()?,
+        healthcheck: None,
+        restart: None,
+        labels: indexmap::IndexMap::new(),
+    })
+}
+
 /// Maps a stable action kind to a short human verb phrase for the UI.
 fn friendly_action(kind: &str) -> &'static str {
     match kind {
@@ -398,4 +595,61 @@ fn friendly_action(kind: &str) -> &'static str {
         "no_op" => "No change",
         _ => "Action",
     }
+}
+
+/// Studio-owned view of a system-wide prune result.
+pub struct PruneReportRow {
+    pub containers_removed: Vec<String>,
+    pub networks_removed: Vec<String>,
+    pub volumes_removed: Vec<String>,
+    pub images_removed: Vec<String>,
+    pub space_reclaimed_bytes: u64,
+}
+
+/// Runs a system-wide prune. Unknown scope strings are silently ignored —
+/// the route validates the request shape; this only interprets it.
+pub async fn system_prune(
+    engine: &BollardEngine,
+    scopes: &[String],
+    all_images: bool,
+) -> Result<PruneReportRow, String> {
+    let scopes = scopes
+        .iter()
+        .filter_map(|scope| match scope.as_str() {
+            "containers" => Some(susun::PruneScope::Containers),
+            "networks" => Some(susun::PruneScope::Networks),
+            "volumes" => Some(susun::PruneScope::Volumes),
+            "images" => Some(susun::PruneScope::Images),
+            _ => None,
+        })
+        .collect();
+
+    let report = engine
+        .prune(susun::PruneRequest { scopes, all_images })
+        .await
+        .map_err(|error| error.to_string())?;
+
+    Ok(PruneReportRow {
+        containers_removed: report
+            .containers_removed
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        networks_removed: report
+            .networks_removed
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        volumes_removed: report
+            .volumes_removed
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        images_removed: report
+            .images_removed
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        space_reclaimed_bytes: report.space_reclaimed_bytes,
+    })
 }

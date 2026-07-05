@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod error;
 mod jobs;
+mod project_source;
 mod routes;
 mod state;
 mod susun_integration;

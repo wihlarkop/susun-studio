@@ -55,11 +55,17 @@ pub enum ApiError {
     #[error("job not found")]
     JobNotFound,
 
+    #[error("service not found in project")]
+    ServiceNotFound,
+
     #[error("planning failed: {0}")]
     PlanningFailed(String),
 
     #[error("engine unavailable: {0}")]
     EngineUnavailable(String),
+
+    #[error("action unavailable: {0}")]
+    ActionUnavailable(String),
 
     #[error("database error: {0}")]
     Database(#[from] turso::Error),
@@ -89,9 +95,14 @@ impl IntoResponse for ApiError {
             Self::MissingName | Self::MissingPath | Self::MissingComposeFiles => {
                 StatusCode::BAD_REQUEST
             }
-            Self::ProjectNotFound | Self::PlanNotFound | Self::JobNotFound => StatusCode::NOT_FOUND,
+            Self::ProjectNotFound
+            | Self::PlanNotFound
+            | Self::JobNotFound
+            | Self::ServiceNotFound => StatusCode::NOT_FOUND,
             Self::EngineUnavailable(_) => StatusCode::BAD_GATEWAY,
-            Self::InvalidImport(_) | Self::PlanningFailed(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::InvalidImport(_) | Self::PlanningFailed(_) | Self::ActionUnavailable(_) => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
             Self::Database(_) | Self::Json(_) | Self::Clock => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
