@@ -94,7 +94,7 @@
         </Button>
         <Button size="sm" variant="destructive" onclick={() => (pruneDialogOpen = true)}>
           <Trash2 />
-          Prune…
+          Prune
         </Button>
       </div>
     </div>

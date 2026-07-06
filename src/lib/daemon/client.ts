@@ -511,6 +511,91 @@ export async function subscribeJobEvents(jobId: string): Promise<EventSource> {
   );
 }
 
+export type WatchAction = "rebuild" | "restart" | "sync" | "sync_restart";
+
+export type SyncSpec = {
+  service: string;
+  host_path: string;
+  container_path: string;
+};
+
+export type StudioWatchSession = {
+  id: string;
+  project_id: string;
+  status: "running" | "stopped" | "failed";
+  action: WatchAction;
+  services: string[];
+  sync: SyncSpec[];
+  watch_paths: string[];
+  debounce_ms: number;
+  track_restart_as_job: boolean;
+  last_action_status: string | null;
+  last_action_error: string | null;
+  error: string | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+};
+
+type WatchListResponse = {
+  sessions: StudioWatchSession[];
+};
+
+export type StartWatchRequest = {
+  action: WatchAction;
+  services?: string[];
+  sync?: SyncSpec[];
+  watch_paths?: string[];
+  debounce_ms?: number;
+  track_restart_as_job?: boolean;
+};
+
+export async function startWatch(
+  projectId: string,
+  request: StartWatchRequest,
+  options: DaemonRequestOptions = {},
+): Promise<StudioWatchSession> {
+  return readJson(`/v1/projects/${encodeURIComponent(projectId)}/watch`, {
+    ...options,
+    method: "POST",
+    body: request,
+  });
+}
+
+export async function listProjectWatchSessions(
+  projectId: string,
+  options: DaemonRequestOptions = {},
+): Promise<StudioWatchSession[]> {
+  const response = await readJson<WatchListResponse>(
+    `/v1/projects/${encodeURIComponent(projectId)}/watch`,
+    options,
+  );
+  return response.sessions;
+}
+
+export async function readWatchSession(
+  watchId: string,
+  options: DaemonRequestOptions = {},
+): Promise<StudioWatchSession> {
+  return readJson(`/v1/watch/${encodeURIComponent(watchId)}`, options);
+}
+
+export async function stopWatchSession(
+  watchId: string,
+  options: DaemonRequestOptions = {},
+): Promise<{ stopped: boolean }> {
+  return readJson(`/v1/watch/${encodeURIComponent(watchId)}/stop`, {
+    ...options,
+    method: "POST",
+  });
+}
+
+export async function subscribeWatchEvents(watchId: string): Promise<EventSource> {
+  return openTicketStream(
+    `/v1/watch/${encodeURIComponent(watchId)}/events/ticket`,
+    `/v1/watch/${encodeURIComponent(watchId)}/events`,
+  );
+}
+
 export async function readProjectSnapshot(
   projectId: string,
   options: DaemonRequestOptions = {},

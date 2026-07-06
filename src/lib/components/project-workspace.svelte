@@ -4,6 +4,7 @@
   import ProjectDetail from "./project-detail.svelte";
   import PlanningPanel from "./planning-panel.svelte";
   import JobPanel from "./job-panel.svelte";
+  import WatchPanel from "./watch-panel.svelte";
   import ServicesPanel from "./services-panel.svelte";
   import LogsViewer from "./logs-viewer.svelte";
   import EventsViewer from "./events-viewer.svelte";
@@ -39,6 +40,7 @@
       {#if showLogs}
         <LogsViewer {project} autoStartToken={logsAutoStartToken} />
       {/if}
+      <WatchPanel {project} />
       <ServicesPanel {project} />
     </Tabs.Content>
     <Tabs.Content value="events" class="pt-4">
