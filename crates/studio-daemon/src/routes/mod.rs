@@ -6,6 +6,7 @@ mod plans;
 mod projects;
 mod service_actions;
 mod settings;
+mod watch;
 
 use axum::{
     Router,
@@ -50,6 +51,18 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/projects/{id}/actions/build", post(jobs::action_build))
         .route("/v1/jobs", get(jobs::list_jobs))
         .route("/v1/projects/{id}/jobs", get(jobs::list_project_jobs))
+        .route(
+            "/v1/projects/{id}/watch",
+            post(watch::start_watch).get(watch::list_project_watch_sessions),
+        )
+        .route("/v1/watch", get(watch::list_watch_sessions))
+        .route("/v1/watch/{id}", get(watch::read_watch_session))
+        .route("/v1/watch/{id}/stop", post(watch::stop_watch_session))
+        .route(
+            "/v1/watch/{id}/events/ticket",
+            post(watch::create_watch_stream_ticket),
+        )
+        .route("/v1/watch/{id}/events", get(watch::watch_session_events))
         .route("/v1/jobs/{id}", get(jobs::read_job))
         .route("/v1/jobs/{id}/cancel", post(jobs::cancel_job))
         .route(

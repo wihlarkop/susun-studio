@@ -7,6 +7,7 @@ mod project_source;
 mod routes;
 mod state;
 mod susun_integration;
+mod watch;
 
 use std::sync::Arc;
 
@@ -39,12 +40,20 @@ async fn run() -> Result<(), DaemonError> {
         Ok(_) => {}
         Err(error) => eprintln!("job retention sweep failed (continuing anyway): {error}"),
     }
+    match watch::maintenance::reconcile_interrupted_watch_sessions(&db).await {
+        Ok(fixed) if fixed > 0 => {
+            println!("reconciled {fixed} interrupted watch session(s) from a prior run")
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("watch reconciliation failed (continuing anyway): {error}"),
+    }
 
     let state = AppState {
         db: Arc::new(db),
         auth_token: Arc::from(config::auth_token()),
         jobs: Arc::new(jobs::registry::JobRegistry::new()),
         stream_tickets: Arc::new(jobs::tickets::StreamTickets::new()),
+        watch: Arc::new(watch::registry::WatchRegistry::new()),
     };
 
     let listener = TcpListener::bind(bind_addr)

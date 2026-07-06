@@ -653,3 +653,11 @@ pub async fn system_prune(
         space_reclaimed_bytes: report.space_reclaimed_bytes,
     })
 }
+
+/// Reads a project's `.dockerignore` if present, otherwise no ignore rules.
+pub fn resolve_dockerignore(root: &std::path::Path) -> susun::Dockerignore {
+    match std::fs::read_to_string(root.join(".dockerignore")) {
+        Ok(contents) => susun::Dockerignore::parse(&contents),
+        Err(_) => susun::Dockerignore::default(),
+    }
+}

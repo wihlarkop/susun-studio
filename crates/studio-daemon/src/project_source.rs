@@ -9,6 +9,7 @@ pub struct ProjectSource {
     pub env_file: Option<PathBuf>,
     pub project_name: Option<String>,
     pub profiles: Vec<String>,
+    pub root: PathBuf,
 }
 
 pub async fn load_project_source(
@@ -18,7 +19,8 @@ pub async fn load_project_source(
     let conn = state.db.connect()?;
 
     // Read in a scope so the cursor closes before any later write.
-    let (compose_files_json, env_file, project_name, profiles_json): (
+    let (path, compose_files_json, env_file, project_name, profiles_json): (
+        String,
         Option<String>,
         Option<String>,
         Option<String>,
@@ -26,7 +28,7 @@ pub async fn load_project_source(
     ) = {
         let mut rows = conn
             .query(
-                "SELECT compose_files, env_file, project_name_override, profiles
+                "SELECT path, compose_files, env_file, project_name_override, profiles
                  FROM projects WHERE id = ?1 LIMIT 1",
                 params![project_id.to_owned()],
             )
@@ -34,7 +36,13 @@ pub async fn load_project_source(
         let Some(row) = rows.next().await? else {
             return Err(ApiError::ProjectNotFound);
         };
-        (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)
+        (
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        )
     };
 
     let Some(compose_files_json) = compose_files_json else {
@@ -43,6 +51,7 @@ pub async fn load_project_source(
         ));
     };
 
+    let root = resolve_path(&path)?;
     let stored_files: Vec<String> = serde_json::from_str(&compose_files_json).unwrap_or_default();
     let files = stored_files
         .iter()
@@ -62,6 +71,7 @@ pub async fn load_project_source(
         env_file,
         project_name,
         profiles,
+        root,
     })
 }
 

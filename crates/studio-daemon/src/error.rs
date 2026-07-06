@@ -58,6 +58,9 @@ pub enum ApiError {
     #[error("service not found in project")]
     ServiceNotFound,
 
+    #[error("watch session not found")]
+    WatchNotFound,
+
     #[error("planning failed: {0}")]
     PlanningFailed(String),
 
@@ -98,7 +101,8 @@ impl IntoResponse for ApiError {
             Self::ProjectNotFound
             | Self::PlanNotFound
             | Self::JobNotFound
-            | Self::ServiceNotFound => StatusCode::NOT_FOUND,
+            | Self::ServiceNotFound
+            | Self::WatchNotFound => StatusCode::NOT_FOUND,
             Self::EngineUnavailable(_) => StatusCode::BAD_GATEWAY,
             Self::InvalidImport(_) | Self::PlanningFailed(_) | Self::ActionUnavailable(_) => {
                 StatusCode::UNPROCESSABLE_ENTITY

@@ -103,7 +103,7 @@ pub async fn action_clean(
     start_down_job(state, project_id, "clean", options).await
 }
 
-async fn start_up_job(
+pub(crate) async fn start_up_job(
     state: AppState,
     project_id: String,
     kind: &'static str,

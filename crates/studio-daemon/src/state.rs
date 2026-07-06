@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use turso::Database;
 
-use crate::jobs::{registry::JobRegistry, tickets::StreamTickets};
+use crate::{
+    jobs::{registry::JobRegistry, tickets::StreamTickets},
+    watch::registry::WatchRegistry,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -10,4 +13,5 @@ pub struct AppState {
     pub auth_token: Arc<str>,
     pub jobs: Arc<JobRegistry>,
     pub stream_tickets: Arc<StreamTickets>,
+    pub watch: Arc<WatchRegistry>,
 }

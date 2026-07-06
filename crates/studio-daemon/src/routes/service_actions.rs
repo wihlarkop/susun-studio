@@ -136,14 +136,14 @@ pub async fn stop_service(
     }))
 }
 
-pub async fn restart_service(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((project_id, service)): Path<(String, String)>,
-) -> Result<Json<ServiceActionResponse>, ApiError> {
-    authorize(&state, &headers)?;
-    let (context, engine) = engine_context(&state, &project_id).await?;
-    for (container, container_state) in require_containers(&engine, &context, &service).await? {
+/// Stops (if running) and starts every container for `service`. Shared by
+/// the HTTP restart handler and watch-triggered restarts.
+pub(crate) async fn restart_service_containers(
+    engine: &susun::BollardEngine,
+    context: &RuntimeContext,
+    service: &str,
+) -> Result<(), ApiError> {
+    for (container, container_state) in require_containers(engine, context, service).await? {
         if container_state == "running" {
             engine
                 .stop_container(susun::StopContainerRequest {
@@ -158,6 +158,17 @@ pub async fn restart_service(
             .await
             .map_err(|e| ApiError::ActionUnavailable(e.to_string()))?;
     }
+    Ok(())
+}
+
+pub async fn restart_service(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project_id, service)): Path<(String, String)>,
+) -> Result<Json<ServiceActionResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    let (context, engine) = engine_context(&state, &project_id).await?;
+    restart_service_containers(&engine, &context, &service).await?;
     Ok(Json(ServiceActionResponse {
         containers: state_after(&engine, &context, &service).await?,
         service,
@@ -491,6 +502,34 @@ fn run_lifecycle_stream(
 
 const MAX_COPY_BYTES: usize = 64 * 1024 * 1024;
 
+/// Builds a single-file tar archive suitable for `copy_to_container`. Shared
+/// by the HTTP copy handler and watch-triggered sync.
+pub(crate) fn build_single_file_archive(host_path: &std::path::Path) -> Result<Vec<u8>, ApiError> {
+    let file_name = host_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ApiError::ActionUnavailable("host_path must be a file".to_owned()))?
+        .to_owned();
+    let bytes = std::fs::read(host_path)
+        .map_err(|e| ApiError::ActionUnavailable(format!("read {}: {e}", host_path.display())))?;
+    if bytes.len() > MAX_COPY_BYTES {
+        return Err(ApiError::ActionUnavailable(
+            "file exceeds 64 MiB copy limit".to_owned(),
+        ));
+    }
+    let mut archive = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(bytes.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, &file_name, bytes.as_slice())
+        .map_err(|e| ApiError::ActionUnavailable(e.to_string()))?;
+    archive
+        .into_inner()
+        .map_err(|e| ApiError::ActionUnavailable(e.to_string()))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CopyRequest {
     pub direction: String,
@@ -515,32 +554,7 @@ pub async fn copy_service(
     match request.direction.as_str() {
         "to_container" => {
             let host_path = std::path::PathBuf::from(&request.host_path);
-            let file_name = host_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| ApiError::ActionUnavailable("host_path must be a file".to_owned()))?
-                .to_owned();
-            let bytes = std::fs::read(&host_path).map_err(|e| {
-                ApiError::ActionUnavailable(format!("read {}: {e}", request.host_path))
-            })?;
-            if bytes.len() > MAX_COPY_BYTES {
-                return Err(ApiError::ActionUnavailable(
-                    "file exceeds 64 MiB copy limit".to_owned(),
-                ));
-            }
-
-            let mut archive = tar::Builder::new(Vec::new());
-            let mut header = tar::Header::new_gnu();
-            header.set_size(bytes.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            archive
-                .append_data(&mut header, &file_name, bytes.as_slice())
-                .map_err(|e| ApiError::ActionUnavailable(e.to_string()))?;
-            let archive = archive
-                .into_inner()
-                .map_err(|e| ApiError::ActionUnavailable(e.to_string()))?;
-
+            let archive = build_single_file_archive(&host_path)?;
             engine
                 .copy_to_container(susun::CopyToContainerRequest {
                     container,

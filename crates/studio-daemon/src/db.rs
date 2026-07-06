@@ -43,6 +43,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "job_manifest",
         sql: include_str!("../migrations/0008_job_manifest.sql"),
     },
+    Migration {
+        version: 9,
+        name: "watch",
+        sql: include_str!("../migrations/0009_watch.sql"),
+    },
 ];
 
 #[derive(Debug, thiserror::Error)]
