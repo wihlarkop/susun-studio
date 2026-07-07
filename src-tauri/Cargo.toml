@@ -27,3 +27,5 @@ uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 tokio = { version = "1", features = ["time"] }
 tar = "0.4"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"

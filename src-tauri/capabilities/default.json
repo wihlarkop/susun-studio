@@ -8,6 +8,8 @@
     "dialog:default",
     "opener:default",
     "log:default",
+    "updater:default",
+    "process:allow-restart",
     {
       "identifier": "shell:allow-execute",
       "allow": [{ "name": "binaries/susun-studio-daemon", "sidecar": true }]

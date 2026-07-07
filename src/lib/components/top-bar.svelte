@@ -4,9 +4,10 @@
   import { Badge } from "$lib/components/ui/badge/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
   import { Separator } from "$lib/components/ui/separator/index.js";
-  import { LifeBuoy, Moon, Plus, Sun } from "@lucide/svelte";
+  import { Download, LifeBuoy, Moon, Plus, RefreshCw, Sun } from "@lucide/svelte";
   import { toggleMode } from "mode-watcher";
   import { invoke, isTauri } from "@tauri-apps/api/core";
+  import { checkForUpdate, type UpdateCheckResult } from "$lib/tauri/updater";
   import type { HealthState } from "$lib/daemon/daemon-state.svelte";
 
   let {
@@ -22,6 +23,31 @@
     } catch (error) {
       console.error("failed to export diagnostics bundle", error);
     }
+  }
+
+  type UpdateUiState = "idle" | "checking" | "none" | "available" | "installing";
+
+  let updateState = $state<UpdateUiState>("idle");
+  let pendingUpdate = $state<UpdateCheckResult | null>(null);
+
+  async function handleCheckForUpdate() {
+    updateState = "checking";
+    const result = await checkForUpdate();
+    if (!result.available) {
+      updateState = "none";
+      pendingUpdate = null;
+      return;
+    }
+    updateState = "available";
+    pendingUpdate = result;
+  }
+
+  async function handleInstallUpdate() {
+    if (!pendingUpdate?.available) {
+      return;
+    }
+    updateState = "installing";
+    await pendingUpdate.install();
   }
 </script>
 
@@ -41,6 +67,28 @@
   </div>
   <div class="flex items-center gap-2">
     {#if isTauri()}
+      {#if updateState === "available"}
+        <Button
+          variant="default"
+          size="sm"
+          aria-label={`Install update ${pendingUpdate?.available ? pendingUpdate.version : ""}`}
+          onclick={handleInstallUpdate}
+        >
+          <Download />
+          Install update
+        </Button>
+      {:else}
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label="Check for updates"
+          title={updateState === "checking" ? "Checking for updates…" : "Check for updates"}
+          disabled={updateState === "checking" || updateState === "installing"}
+          onclick={handleCheckForUpdate}
+        >
+          <RefreshCw />
+        </Button>
+      {/if}
       <Button
         variant="ghost"
         size="icon"
