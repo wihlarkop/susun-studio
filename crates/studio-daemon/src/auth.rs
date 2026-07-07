@@ -19,11 +19,7 @@ pub fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> 
 /// Compares two secrets in constant time to avoid leaking length-independent
 /// timing information about the expected value.
 pub fn verify_secret(candidate: &str, expected: &str) -> Result<(), ApiError> {
-    if candidate
-        .as_bytes()
-        .ct_eq(expected.as_bytes())
-        .into()
-    {
+    if candidate.as_bytes().ct_eq(expected.as_bytes()).into() {
         Ok(())
     } else {
         Err(ApiError::Unauthorized)

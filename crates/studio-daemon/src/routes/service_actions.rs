@@ -9,6 +9,7 @@ use axum::{
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use susun::ContainerEngine;
+use susun_engine_bollard::BollardEngine;
 use tokio_stream::Stream;
 
 use crate::{
@@ -36,7 +37,7 @@ pub struct ServiceActionResponse {
 pub(crate) async fn engine_context(
     state: &AppState,
     project_id: &str,
-) -> Result<(RuntimeContext, susun::BollardEngine), ApiError> {
+) -> Result<(RuntimeContext, BollardEngine), ApiError> {
     let source = load_project_source(state, project_id).await?;
     let engine = susun_integration::connect_docker_engine().map_err(ApiError::EngineUnavailable)?;
     let context = susun_integration::runtime_context(
@@ -50,7 +51,7 @@ pub(crate) async fn engine_context(
 }
 
 pub(crate) async fn require_containers(
-    engine: &susun::BollardEngine,
+    engine: &BollardEngine,
     context: &RuntimeContext,
     service: &str,
 ) -> Result<Vec<(susun::ContainerRef, String)>, ApiError> {
@@ -74,7 +75,7 @@ pub(crate) async fn require_containers(
 }
 
 async fn state_after(
-    engine: &susun::BollardEngine,
+    engine: &BollardEngine,
     context: &RuntimeContext,
     service: &str,
 ) -> Result<Vec<ServiceContainerState>, ApiError> {
@@ -139,7 +140,7 @@ pub async fn stop_service(
 /// Stops (if running) and starts every container for `service`. Shared by
 /// the HTTP restart handler and watch-triggered restarts.
 pub(crate) async fn restart_service_containers(
-    engine: &susun::BollardEngine,
+    engine: &BollardEngine,
     context: &RuntimeContext,
     service: &str,
 ) -> Result<(), ApiError> {
@@ -397,7 +398,7 @@ pub async fn stream_run(
 /// start, follow logs, wait for exit, then always remove the container (compose
 /// `run --rm` semantics — the one-off never outlives this stream).
 fn run_lifecycle_stream(
-    engine: susun::BollardEngine,
+    engine: BollardEngine,
     create: susun::CreateContainerRequest,
 ) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);

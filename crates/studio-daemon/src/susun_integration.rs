@@ -1,10 +1,11 @@
 use std::{path::PathBuf, sync::Arc, time::SystemTime};
 
 use susun::{
-    BollardEngine, CancellationToken, ContainerEngine, DownPlanOptions, EngineCapabilities,
-    EngineSnapshot, EventSink, ExecutionPlan, ExecutionReport, PlanOutcome, ProjectSummary, Runtime,
-    SdkProject, SusunWorkspace, UpPlanOptions, render_diagnostics_json, render_plan_json,
+    CancellationToken, ContainerEngine, DownPlanOptions, EngineCapabilities,
+    EngineSnapshot, EventSink, ExecutionPlan, ExecutionReport, PlanOutcome, ProjectSummary,
+    Runtime, SdkProject, SusunWorkspace, UpPlanOptions, render_diagnostics_json, render_plan_json,
 };
+use susun_engine_bollard::BollardEngine;
 
 use crate::error::ApiError;
 
@@ -166,10 +167,8 @@ pub fn plan_action_rows(plan: &ExecutionPlan) -> Vec<PlanActionRow> {
 
 fn plan_row(sdk_project: &SdkProject, outcome: PlanOutcome) -> Result<PlanRow, ApiError> {
     let Some(plan) = outcome.plan else {
-        let diagnostics_json = render_diagnostics_json(
-            &outcome.diagnostics,
-            &sdk_project.analysis().source_map,
-        );
+        let diagnostics_json =
+            render_diagnostics_json(&outcome.diagnostics, &sdk_project.analysis().source_map);
         let blocked = serde_json::from_str(&diagnostics_json)
             .unwrap_or_else(|_| serde_json::json!({ "diagnostics": [] }));
 
@@ -187,7 +186,10 @@ fn plan_row(sdk_project: &SdkProject, outcome: PlanOutcome) -> Result<PlanRow, A
 
     let plan_json =
         render_plan_json(&plan).map_err(|error| ApiError::PlanningFailed(error.to_string()))?;
-    let schema_version = format!("{}.{}", plan.schema_version.major, plan.schema_version.minor);
+    let schema_version = format!(
+        "{}.{}",
+        plan.schema_version.major, plan.schema_version.minor
+    );
 
     Ok(PlanRow {
         plan_json,
@@ -249,8 +251,10 @@ pub async fn engine_health(engine: &BollardEngine) -> EngineHealthRow {
 
 /// Reads and flattens the engine's capabilities.
 pub async fn engine_capabilities(engine: &BollardEngine) -> Result<EngineCapabilitiesRow, String> {
-    let capabilities: EngineCapabilities =
-        engine.capabilities().await.map_err(|error| error.to_string())?;
+    let capabilities: EngineCapabilities = engine
+        .capabilities()
+        .await
+        .map_err(|error| error.to_string())?;
 
     Ok(EngineCapabilitiesRow {
         api_version: capabilities
@@ -304,7 +308,10 @@ pub async fn plan_up_for_execution(
         .cloned()
         .ok_or_else(|| "project has no derivable identity".to_owned())?;
 
-    let snapshot = engine.snapshot(&identity).await.map_err(|e| e.to_string())?;
+    let snapshot = engine
+        .snapshot(&identity)
+        .await
+        .map_err(|e| e.to_string())?;
     let capabilities = engine.capabilities().await.map_err(|e| e.to_string())?;
     let outcome = sdk_project
         .plan_up(capabilities, snapshot, options)
@@ -334,7 +341,10 @@ pub async fn plan_down_for_execution(
         .cloned()
         .ok_or_else(|| "project has no derivable identity".to_owned())?;
 
-    let snapshot = engine.snapshot(&identity).await.map_err(|e| e.to_string())?;
+    let snapshot = engine
+        .snapshot(&identity)
+        .await
+        .map_err(|e| e.to_string())?;
     let capabilities = engine.capabilities().await.map_err(|e| e.to_string())?;
     let outcome = sdk_project
         .plan_down(capabilities, snapshot, options)

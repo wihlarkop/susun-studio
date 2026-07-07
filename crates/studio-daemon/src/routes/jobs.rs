@@ -157,7 +157,9 @@ pub(crate) async fn start_up_job(
         registry.unregister(&spawn_job_id);
     });
 
-    Ok(Json(running_job_response(job_id, kind, project_id, now, manifest)))
+    Ok(Json(running_job_response(
+        job_id, kind, project_id, now, manifest,
+    )))
 }
 
 async fn start_down_job(
@@ -208,7 +210,9 @@ async fn start_down_job(
         registry.unregister(&spawn_job_id);
     });
 
-    Ok(Json(running_job_response(job_id, kind, project_id, now, manifest)))
+    Ok(Json(running_job_response(
+        job_id, kind, project_id, now, manifest,
+    )))
 }
 
 /// Builds the EventSink that fans each runtime event to SSE subscribers and

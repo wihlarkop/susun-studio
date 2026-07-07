@@ -27,7 +27,11 @@ impl JobRegistry {
     pub fn register(
         &self,
         job_id: String,
-    ) -> (CancellationToken, broadcast::Sender<RuntimeEvent>, Arc<Notify>) {
+    ) -> (
+        CancellationToken,
+        broadcast::Sender<RuntimeEvent>,
+        Arc<Notify>,
+    ) {
         let cancellation = CancellationToken::new();
         let (sender, _receiver) = broadcast::channel(256);
         let cancel_notify = Arc::new(Notify::new());
@@ -58,7 +62,9 @@ impl JobRegistry {
 
     /// Subscribes to a running job's live event stream.
     pub fn subscribe(&self, job_id: &str) -> Option<broadcast::Receiver<RuntimeEvent>> {
-        self.jobs.get(job_id).map(|handle| handle.sender.subscribe())
+        self.jobs
+            .get(job_id)
+            .map(|handle| handle.sender.subscribe())
     }
 
     /// Removes a finished job from the registry.

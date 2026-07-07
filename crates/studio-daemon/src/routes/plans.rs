@@ -105,7 +105,12 @@ async fn create_plan(
         let env_file: Option<String> = row.get(1)?;
         let project_name_override: Option<String> = row.get(2)?;
         let profiles_json: Option<String> = row.get(3)?;
-        (compose_files_json, env_file, project_name_override, profiles_json)
+        (
+            compose_files_json,
+            env_file,
+            project_name_override,
+            profiles_json,
+        )
     };
 
     let Some(compose_files_json) = compose_files_json else {
@@ -114,8 +119,7 @@ async fn create_plan(
         ));
     };
 
-    let stored_files: Vec<String> =
-        serde_json::from_str(&compose_files_json).unwrap_or_default();
+    let stored_files: Vec<String> = serde_json::from_str(&compose_files_json).unwrap_or_default();
     let files = stored_files
         .iter()
         .map(|path| resolve_path(path))

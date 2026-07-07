@@ -125,8 +125,7 @@ pub async fn engine_capabilities(
 ) -> Result<Json<EngineCapabilitiesResponse>, ApiError> {
     authorize(&state, &headers)?;
 
-    let engine =
-        susun_integration::connect_docker_engine().map_err(ApiError::EngineUnavailable)?;
+    let engine = susun_integration::connect_docker_engine().map_err(ApiError::EngineUnavailable)?;
     let capabilities = susun_integration::engine_capabilities(&engine)
         .await
         .map_err(ApiError::EngineUnavailable)?;
