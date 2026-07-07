@@ -1,0 +1,170 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  daemon-smoke-test:
+    name: Daemon smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Checkout susun (sibling path dependency)
+        uses: actions/checkout@v6
+        with:
+          repository: wihlarkop/susun
+          path: susun-src
+
+      - name: Copy susun into place as a sibling directory
+        run: cp -r "$GITHUB_WORKSPACE/susun-src" "$GITHUB_WORKSPACE/../susun"
+        shell: bash
+
+      - name: Build daemon
+        run: cargo build --release -p susun-studio-daemon
+
+      - name: Start daemon and probe health
+        shell: bash
+        run: |
+          SUSUN_STUDIO_DAEMON_TOKEN=smoke-test-token ./target/release/susun-studio-daemon &
+          daemon_pid=$!
+          ok=0
+          for _ in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:7377/v1/health; then
+              ok=1
+              break
+            fi
+            sleep 0.5
+          done
+          kill "$daemon_pid" || true
+          if [ "$ok" -ne 1 ]; then
+            echo "daemon failed to become healthy"
+            exit 1
+          fi
+
+  release:
+    name: Build and release
+    needs: daemon-smoke-test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+          - platform: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+          - platform: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Tauri Linux dependencies
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            wget
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: latest
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Checkout susun (sibling path dependency)
+        uses: actions/checkout@v6
+        with:
+          repository: wihlarkop/susun
+          path: susun-src
+
+      - name: Copy susun into place as a sibling directory
+        run: cp -r "$GITHUB_WORKSPACE/susun-src" "$GITHUB_WORKSPACE/../susun"
+        shell: bash
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build and release Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Susun Studio ${{ github.ref_name }}"
+          releaseBody: |
+            Unsigned development build — OS code signing is not wired up yet
+            (updater artifact signing, which is a separate mechanism, is
+            already in effect). See
+            docs/superpowers/specs/2026-07-07-packaging-signing-plan.md for
+            the OS-signing plan.
+
+            Windows may show a SmartScreen warning; macOS may refuse to open
+            the app until you right-click → Open, or run
+            `xattr -d com.apple.quarantine`.
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
+          args: --target ${{ matrix.target }}
+
+  verify-latest-json:
+    name: Verify updater manifest covers all platforms
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download latest.json from the draft release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p /tmp/release-check
+          gh release download "${{ github.ref_name }}" --pattern latest.json --dir /tmp/release-check --repo "${{ github.repository }}"
+
+      - name: Validate platform coverage
+        run: |
+          required_platforms=(
+            "windows-x86_64"
+            "linux-x86_64"
+            "darwin-aarch64"
+            "darwin-x86_64"
+          )
+          missing=0
+          for platform in "${required_platforms[@]}"; do
+            if ! jq -e --arg platform "$platform" '.platforms[$platform]' /tmp/release-check/latest.json > /dev/null; then
+              echo "latest.json is missing platform: $platform"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "latest.json is incomplete — do not publish this draft release as-is."
+            exit 1
+          fi
+          echo "latest.json covers all 4 platforms"
