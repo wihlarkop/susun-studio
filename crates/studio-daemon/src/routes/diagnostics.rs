@@ -93,7 +93,9 @@ pub async fn diagnostics(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "<unknown>".to_owned());
-    let db_size_bytes = std::fs::metadata(&state.db_path).ok().map(|meta| meta.len());
+    let db_size_bytes = std::fs::metadata(&state.db_path)
+        .ok()
+        .map(|meta| meta.len());
 
     Ok(Json(DiagnosticsReport {
         daemon_version: env!("CARGO_PKG_VERSION"),

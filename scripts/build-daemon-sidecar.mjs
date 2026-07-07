@@ -27,11 +27,10 @@ const sidecarName = isWindows
   : `susun-studio-daemon-${target}`;
 
 console.log(`building susun-studio-daemon for ${target}`);
-execFileSync(
-  "cargo",
-  ["build", "--release", "-p", "susun-studio-daemon", "--target", target],
-  { cwd: repoRoot, stdio: "inherit" },
-);
+execFileSync("cargo", ["build", "--release", "-p", "susun-studio-daemon", "--target", target], {
+  cwd: repoRoot,
+  stdio: "inherit",
+});
 
 const sourcePath = join(repoRoot, "target", target, "release", binaryName);
 const destDir = join(repoRoot, "src-tauri", "binaries");
