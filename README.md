@@ -98,6 +98,32 @@ Run the Tauri app during development:
 bun run tauri dev
 ```
 
+## Packaging & Releases (Phase 10)
+
+The app now spawns and supervises `susun-studio-daemon` itself as a bundled Tauri sidecar (with a fresh per-launch auth token and a freshly reserved loopback port) instead of requiring `bun run daemon` to be started by hand — that manual dev workflow still works too and is auto-detected in debug builds.
+
+Two things are still placeholders and must be filled in with real values before a packaged build will run or the updater will work:
+
+1. **Sidecar binary.** `tauri.conf.json`'s `bundle.externalBin` requires `src-tauri/binaries/susun-studio-daemon-<target-triple>[.exe]` to actually exist — Tauri's build script fails without it. Build it first:
+
+   ```powershell
+   bun run build:sidecar
+   ```
+
+   Run this before `bun run tauri dev` or `bun run tauri build` (it's also wired into `beforeBuildCommand`, so a full `tauri build` does it automatically — but `cargo check`/`clippy`/`build` on `src-tauri` directly will fail until you've run it at least once).
+
+2. **Updater signing keypair.** `src-tauri/tauri.conf.json`'s `plugins.updater.pubkey` is currently the literal placeholder string `REPLACE_WITH_PUBKEY_FROM_bun_run_tauri_signer_generate` — `src-tauri` will not compile until this is a real key. Generate one (one-time, not committed):
+
+   ```powershell
+   bun run tauri signer generate -w "$HOME/.tauri/susun-studio-updater.key"
+   ```
+
+   Paste the printed public key into `tauri.conf.json`'s `plugins.updater.pubkey`. Save the private key file and its password somewhere secure — they become the `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` GitHub Actions secrets needed by `.github/workflows/release.yml` (tag-triggered, builds Windows/macOS x2/Linux via `tauri-action`, publishes a draft GitHub Release with an unsigned installer plus a signed `latest.json` updater manifest). This key signs _update artifacts_, not the app binary itself — OS code signing (Windows/macOS/Linux) is separately deferred; see the "signing plan" note below.
+
+Two more top-bar features shipped alongside packaging: **Check for updates** (two-step — shows an "Install update" state and waits for a second click before downloading/installing/relaunching, never auto-installs) and **Export diagnostics** (saves a redacted `.tar` with app/daemon log tails, DB filename-only + size, recent failed-job errors truncated to 200 chars, and engine reachability).
+
+Full design notes (signing plan, per-release checklist) live in gitignored `docs/` — re-derive them from `docs/superpowers/specs/2026-07-07-packaging-signing-plan.md` and `docs/superpowers/plans/studio/release-checklist.md` on a machine that still has that working tree, or from the implementation plan at `docs/superpowers/plans/2026-07-07-phase-10-packaging-and-updates.md`.
+
 ## Checks
 
 Frontend:
