@@ -4,8 +4,9 @@
   import { Badge } from "$lib/components/ui/badge/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
   import { Separator } from "$lib/components/ui/separator/index.js";
-  import { Moon, Plus, Sun } from "@lucide/svelte";
+  import { LifeBuoy, Moon, Plus, Sun } from "@lucide/svelte";
   import { toggleMode } from "mode-watcher";
+  import { invoke, isTauri } from "@tauri-apps/api/core";
   import type { HealthState } from "$lib/daemon/daemon-state.svelte";
 
   let {
@@ -14,6 +15,14 @@
   }: { healthState: HealthState; onImportClick: () => void } = $props();
 
   const connected = $derived(healthState.kind === "connected");
+
+  async function exportDiagnostics() {
+    try {
+      await invoke("export_diagnostics_bundle");
+    } catch (error) {
+      console.error("failed to export diagnostics bundle", error);
+    }
+  }
 </script>
 
 <header class="flex items-center justify-between gap-4">
@@ -31,6 +40,17 @@
     </Tooltip.Provider>
   </div>
   <div class="flex items-center gap-2">
+    {#if isTauri()}
+      <Button
+        variant="ghost"
+        size="icon"
+        aria-label="Export diagnostics bundle"
+        title="Export diagnostics bundle"
+        onclick={exportDiagnostics}
+      >
+        <LifeBuoy />
+      </Button>
+    {/if}
     <Button variant="ghost" size="icon" aria-label="Toggle theme" onclick={toggleMode}>
       <Sun class="dark:hidden" />
       <Moon class="hidden dark:block" />

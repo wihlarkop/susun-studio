@@ -1,3 +1,4 @@
+mod diagnostics;
 mod engines;
 mod health;
 mod jobs;
@@ -25,6 +26,7 @@ use crate::state::AppState;
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/v1/health", get(health::health))
+        .route("/v1/diagnostics", get(diagnostics::diagnostics))
         .route(
             "/v1/projects",
             get(projects::list_projects).post(projects::create_project),

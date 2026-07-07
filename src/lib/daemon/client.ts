@@ -690,6 +690,38 @@ export async function openRunStream(
   return openTicketStream(path, path, body);
 }
 
+export type DiagnosticsJobError = {
+  id: string;
+  kind: string;
+  error: string | null;
+  error_code: string | null;
+  created_at_ms: number;
+};
+
+export type DiagnosticsEngineStatus = {
+  id: string;
+  display_name: string;
+  reachable: boolean;
+};
+
+export type DiagnosticsReport = {
+  daemon_version: string;
+  api_version: string;
+  os: string;
+  arch: string;
+  db_file_name: string;
+  db_size_bytes: number | null;
+  project_count: number;
+  recent_job_errors: DiagnosticsJobError[];
+  engines: DiagnosticsEngineStatus[];
+};
+
+export async function readDiagnostics(
+  options: DaemonRequestOptions = {},
+): Promise<DiagnosticsReport> {
+  return readJson("/v1/diagnostics", options);
+}
+
 export async function readSettings(options: DaemonRequestOptions = {}): Promise<StudioSettings> {
   return readJson("/v1/settings", options);
 }

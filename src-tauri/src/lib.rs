@@ -1,4 +1,5 @@
 mod daemon;
+mod diagnostics;
 
 use daemon::DaemonSupervisor;
 use tauri::Manager;
@@ -19,7 +20,10 @@ pub fn run() {
                 .build(),
         )
         .manage(DaemonSupervisor::default())
-        .invoke_handler(tauri::generate_handler![resolve_daemon_connection])
+        .invoke_handler(tauri::generate_handler![
+            resolve_daemon_connection,
+            export_diagnostics_bundle
+        ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 window.app_handle().state::<DaemonSupervisor>().shutdown();
@@ -36,6 +40,13 @@ async fn resolve_daemon_connection(
     app: tauri::AppHandle,
 ) -> Result<daemon::DaemonConnection, String> {
     daemon::resolve_connection(&app)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn export_diagnostics_bundle(app: tauri::AppHandle) -> Result<(), String> {
+    diagnostics::export_bundle(&app)
         .await
         .map_err(|error| error.to_string())
 }

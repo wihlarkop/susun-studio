@@ -50,6 +50,7 @@ async fn run() -> Result<(), DaemonError> {
 
     let state = AppState {
         db: Arc::new(db),
+        db_path: db_path.clone(),
         auth_token: Arc::from(config::auth_token()),
         jobs: Arc::new(jobs::registry::JobRegistry::new()),
         stream_tickets: Arc::new(jobs::tickets::StreamTickets::new()),
