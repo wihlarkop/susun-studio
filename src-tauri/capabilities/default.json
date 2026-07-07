@@ -3,5 +3,14 @@
   "identifier": "default",
   "description": "Capability for the main window",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default", "opener:default"]
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "opener:default",
+    "log:default",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [{ "name": "binaries/susun-studio-daemon", "sidecar": true }]
+    }
+  ]
 }

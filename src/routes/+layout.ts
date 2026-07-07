@@ -3,3 +3,8 @@
 // See: https://svelte.dev/docs/kit/single-page-apps
 // See: https://v2.tauri.app/start/frontend/sveltekit/ for more info
 export const ssr = false;
+
+export async function load(): Promise<void> {
+  const { initDaemonConnection } = await import("$lib/tauri/daemon-connection");
+  await initDaemonConnection();
+}

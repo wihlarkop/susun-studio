@@ -1,5 +1,5 @@
 import {
-  defaultDaemonBaseUrl,
+  getDaemonBaseUrl,
   importProject as importProjectRequest,
   listProjects,
   readDaemonHealth,
@@ -23,7 +23,7 @@ export function createDaemonState() {
   let healthState = $state<HealthState>({
     kind: "checking",
     label: "Checking",
-    detail: `Reading ${defaultDaemonBaseUrl}/v1/health`,
+    detail: `Reading ${getDaemonBaseUrl()}/v1/health`,
   });
   let projects = $state<StudioProject[]>([]);
   let settings = $state<StudioSettings | undefined>(undefined);
@@ -39,7 +39,7 @@ export function createDaemonState() {
 
   async function refresh(signal?: AbortSignal) {
     try {
-      const health = await readDaemonHealth(defaultDaemonBaseUrl, signal);
+      const health = await readDaemonHealth(getDaemonBaseUrl(), signal);
       const [projectList, daemonSettings] = await Promise.all([
         listProjects({ signal }),
         readSettings({ signal }),

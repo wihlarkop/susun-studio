@@ -308,14 +308,24 @@ type DaemonRequestOptions = {
   auth?: boolean;
 };
 
-export const defaultDaemonBaseUrl =
-  import.meta.env.PUBLIC_SUSUN_STUDIO_DAEMON_URL ?? "http://127.0.0.1:7377";
+let daemonBaseUrl = import.meta.env.PUBLIC_SUSUN_STUDIO_DAEMON_URL ?? "http://127.0.0.1:7377";
+let daemonToken = import.meta.env.PUBLIC_SUSUN_STUDIO_DAEMON_TOKEN ?? "susun-studio-dev-token";
 
-export const defaultDaemonToken =
-  import.meta.env.PUBLIC_SUSUN_STUDIO_DAEMON_TOKEN ?? "susun-studio-dev-token";
+export function setDaemonConnection(connection: { baseUrl: string; token: string }): void {
+  daemonBaseUrl = connection.baseUrl;
+  daemonToken = connection.token;
+}
+
+export function getDaemonBaseUrl(): string {
+  return daemonBaseUrl;
+}
+
+export function getDaemonToken(): string {
+  return daemonToken;
+}
 
 export async function readDaemonHealth(
-  baseUrl: string = defaultDaemonBaseUrl,
+  baseUrl: string = daemonBaseUrl,
   signal?: AbortSignal,
 ): Promise<DaemonHealth> {
   return readJson("/v1/health", { baseUrl, signal, auth: false });
@@ -696,11 +706,11 @@ export async function updateSettings(
 }
 
 async function readJson<T>(path: string, options: DaemonRequestOptions = {}): Promise<T> {
-  const baseUrl = options.baseUrl ?? defaultDaemonBaseUrl;
+  const baseUrl = options.baseUrl ?? daemonBaseUrl;
   const headers = new Headers({ accept: "application/json" });
 
   if (options.auth ?? true) {
-    headers.set("authorization", `Bearer ${options.token ?? defaultDaemonToken}`);
+    headers.set("authorization", `Bearer ${options.token ?? daemonToken}`);
   }
 
   if (options.body !== undefined) {
