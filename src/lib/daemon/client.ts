@@ -509,7 +509,7 @@ async function openTicketStream(
     method: "POST",
     body: body ?? {},
   });
-  const url = new URL(streamPath, normalizeBaseUrl(defaultDaemonBaseUrl));
+  const url = new URL(streamPath, normalizeBaseUrl(daemonBaseUrl));
   url.searchParams.set("ticket", ticket);
   return new EventSource(url);
 }

@@ -3,7 +3,7 @@
   import { Button } from "$lib/components/ui/button/index.js";
   import { Skeleton } from "$lib/components/ui/skeleton/index.js";
   import { RefreshCw } from "@lucide/svelte";
-  import { defaultDaemonBaseUrl } from "$lib/daemon/client";
+  import { getDaemonBaseUrl } from "$lib/daemon/client";
   import type { HealthState } from "$lib/daemon/daemon-state.svelte";
 
   let { healthState, onRetry }: { healthState: HealthState; onRetry: () => void } = $props();
@@ -27,7 +27,7 @@
       <p class="max-w-xl text-sm text-muted-foreground">
         The desktop app is only the client; projects, settings, and analysis live behind the
         local daemon API at
-        <code class="rounded bg-muted px-1 py-0.5 font-mono text-xs">{defaultDaemonBaseUrl}</code>.
+        <code class="rounded bg-muted px-1 py-0.5 font-mono text-xs">{getDaemonBaseUrl()}</code>.
         Run
         <code class="rounded bg-muted px-1 py-0.5 font-mono text-xs">bun run daemon</code>
         from the repository root. This page rechecks automatically every few seconds.
