@@ -95,12 +95,12 @@ impl DaemonSupervisor {
 pub async fn resolve_connection(
     app: &AppHandle,
 ) -> Result<DaemonConnection, DaemonSupervisorError> {
-    if cfg!(debug_assertions) {
-        if let Some(connection) = detect_external_dev_daemon().await {
-            app.state::<DaemonSupervisor>()
-                .set_connection(connection.clone());
-            return Ok(connection);
-        }
+    if cfg!(debug_assertions)
+        && let Some(connection) = detect_external_dev_daemon().await
+    {
+        app.state::<DaemonSupervisor>()
+            .set_connection(connection.clone());
+        return Ok(connection);
     }
 
     let connection = spawn_and_wait(app).await?;
