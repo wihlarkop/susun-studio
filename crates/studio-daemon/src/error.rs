@@ -21,6 +21,11 @@ pub enum DaemonError {
     )]
     NonLoopbackBindAddr { name: &'static str, value: String },
 
+    #[error(
+        "{env_var} is required in a release build (no dev-token fallback outside debug builds)"
+    )]
+    MissingAuthToken { env_var: &'static str },
+
     #[error("database startup failed: {0}")]
     Database(#[from] db::DbError),
 

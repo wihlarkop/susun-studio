@@ -26,8 +26,14 @@ pub fn bind_addr() -> Result<SocketAddr, DaemonError> {
     Ok(addr)
 }
 
-pub fn auth_token() -> String {
-    std::env::var(AUTH_TOKEN_ENV).unwrap_or_else(|_| DEFAULT_AUTH_TOKEN.to_owned())
+pub fn auth_token() -> Result<String, DaemonError> {
+    match std::env::var(AUTH_TOKEN_ENV) {
+        Ok(value) => Ok(value),
+        Err(_) if cfg!(debug_assertions) => Ok(DEFAULT_AUTH_TOKEN.to_owned()),
+        Err(_) => Err(DaemonError::MissingAuthToken {
+            env_var: AUTH_TOKEN_ENV,
+        }),
+    }
 }
 
 pub fn db_path() -> PathBuf {
