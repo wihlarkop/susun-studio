@@ -38,7 +38,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "REPLACE_WITH_PUBKEY_FROM_bun_run_tauri_signer_generate",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdEQjFGRkU0QjgzNDBENDMKUldSRERUUzQ1UCt4ZlMvaDh4M2d0Y3FMM3lEOUc5U3Bta2crd3FwUjBQWEppVW1RMHBWRVVnQVcK",
       "endpoints": [
         "https://github.com/wihlarkop/susun-studio/releases/latest/download/latest.json"
       ]
