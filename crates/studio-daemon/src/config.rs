@@ -10,13 +10,20 @@ const DB_PATH_ENV: &str = "SUSUN_STUDIO_DB_PATH";
 
 pub fn bind_addr() -> Result<SocketAddr, DaemonError> {
     let value = std::env::var(BIND_ADDR_ENV).unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_owned());
-    value
+    let addr: SocketAddr = value
         .parse()
         .map_err(|source| DaemonError::InvalidBindAddr {
             name: BIND_ADDR_ENV,
-            value,
+            value: value.clone(),
             source,
-        })
+        })?;
+    if !addr.ip().is_loopback() {
+        return Err(DaemonError::NonLoopbackBindAddr {
+            name: BIND_ADDR_ENV,
+            value,
+        });
+    }
+    Ok(addr)
 }
 
 pub fn auth_token() -> String {

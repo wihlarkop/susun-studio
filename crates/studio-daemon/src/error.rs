@@ -16,6 +16,11 @@ pub enum DaemonError {
         source: std::net::AddrParseError,
     },
 
+    #[error(
+        "{name} must be a loopback address (127.0.0.1 or ::1), got `{value}` — Susun Studio's daemon is loopback-only by design"
+    )]
+    NonLoopbackBindAddr { name: &'static str, value: String },
+
     #[error("database startup failed: {0}")]
     Database(#[from] db::DbError),
 
