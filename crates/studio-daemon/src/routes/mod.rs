@@ -122,15 +122,20 @@ pub fn app(state: AppState) -> Router {
 }
 
 fn local_cors_layer() -> CorsLayer {
-    CorsLayer::new()
-        .allow_origin(AllowOrigin::list([
+    let mut origins = vec![
+        HeaderValue::from_static("tauri://localhost"),
+        HeaderValue::from_static("http://tauri.localhost"),
+    ];
+    if cfg!(debug_assertions) {
+        origins.extend([
             HeaderValue::from_static("http://localhost:1420"),
             HeaderValue::from_static("http://127.0.0.1:1420"),
             HeaderValue::from_static("http://localhost:5173"),
             HeaderValue::from_static("http://127.0.0.1:5173"),
-            HeaderValue::from_static("tauri://localhost"),
-            HeaderValue::from_static("http://tauri.localhost"),
-        ]))
+        ]);
+    }
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers([AUTHORIZATION, CONTENT_TYPE])
 }
