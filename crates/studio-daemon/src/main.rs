@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod error;
 mod jobs;
+mod plans_maintenance;
 mod project_source;
 mod routes;
 mod state;
@@ -46,6 +47,13 @@ async fn run() -> Result<(), DaemonError> {
         }
         Ok(_) => {}
         Err(error) => eprintln!("watch reconciliation failed (continuing anyway): {error}"),
+    }
+    match plans_maintenance::redact_stored_plans(&db).await {
+        Ok(rewritten) if rewritten > 0 => {
+            println!("re-redacted {rewritten} stored plan(s) under the current secret-marker rules")
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("plan redaction sweep failed (continuing anyway): {error}"),
     }
 
     let state = AppState {
