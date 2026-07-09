@@ -21,8 +21,11 @@ vite.config.ts.timestamp-*
 !.env.example
 *.local
 
-# Documentation (kept locally, not tracked)
-docs/
+# Documentation
+docs/*
+!docs/public/
+!docs/public/**
+docs/superpowers/
 
 # Local brainstorming/mockup sessions
 .superpowers/

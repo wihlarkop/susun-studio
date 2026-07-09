@@ -99,6 +99,15 @@ Run the Tauri app during development:
 bun run tauri dev
 ```
 
+## Public Docs
+
+Public beta docs live in [`docs/public/`](docs/public/):
+
+- [Beta compatibility matrix](docs/public/beta-compatibility.md)
+- [Beta troubleshooting guide](docs/public/beta-troubleshooting.md)
+
+Private planning and roadmap docs stay under `docs/superpowers/` and are not tracked.
+
 ## Packaging & Releases (Phase 10)
 
 The app now spawns and supervises `susun-studio-daemon` itself as a bundled Tauri sidecar (with a fresh per-launch auth token and a freshly reserved loopback port) instead of requiring `bun run daemon` to be started by hand — that manual dev workflow still works too and is auto-detected in debug builds.
