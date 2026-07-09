@@ -58,6 +58,9 @@ jobs:
       - name: Link susun as a sibling directory
         run: ln -s "$GITHUB_WORKSPACE/susun-src" "$GITHUB_WORKSPACE/../susun"
 
+      - name: Build daemon sidecar
+        run: bun run build:sidecar
+
       - name: Check Rust formatting
         run: cargo fmt --all --check
 
