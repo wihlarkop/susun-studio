@@ -17,8 +17,8 @@ use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use turso::{Database, params};
 
 use crate::{
-    auth::authorize, error::ApiError, project_source::load_project_source, state::AppState,
-    susun_integration,
+    auth::authorize, error::ApiError, logging, project_source::load_project_source,
+    state::AppState, susun_integration,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -129,6 +129,15 @@ pub(crate) async fn start_up_job(
     let now = now_ms()?;
     let job_id = format!("job-{now}-{kind}");
     insert_job(&state, &job_id, kind, &project_id, now, &manifest).await?;
+    logging::info(
+        "job_started",
+        &[
+            ("job_id", job_id.clone()),
+            ("kind", kind.to_owned()),
+            ("project_id", project_id.clone()),
+            ("action_count", manifest.len().to_string()),
+        ],
+    );
 
     let (cancellation, sender, cancel_notify) = state.jobs.register(job_id.clone());
     let db = state.db.clone();
@@ -186,6 +195,15 @@ async fn start_down_job(
     let now = now_ms()?;
     let job_id = format!("job-{now}-{kind}");
     insert_job(&state, &job_id, kind, &project_id, now, &manifest).await?;
+    logging::info(
+        "job_started",
+        &[
+            ("job_id", job_id.clone()),
+            ("kind", kind.to_owned()),
+            ("project_id", project_id.clone()),
+            ("action_count", manifest.len().to_string()),
+        ],
+    );
 
     let (cancellation, sender, cancel_notify) = state.jobs.register(job_id.clone());
     let db = state.db.clone();
@@ -330,6 +348,14 @@ async fn mark_interrupted(db: &Database, job_id: &str, status: &str, error_code:
             params![status, result_json, error_code, now, job_id.to_owned()],
         )
         .await;
+    logging::warn(
+        "job_interrupted",
+        &[
+            ("job_id", job_id.to_owned()),
+            ("status", status.to_owned()),
+            ("error_code", error_code.to_owned()),
+        ],
+    );
 }
 
 /// Reads back every event recorded for `job_id` and tallies `ActionFinished`
@@ -414,15 +440,35 @@ async fn finish_job(db: &Database, job_id: &str, result: Result<susun::Execution
                     params![status, result_json, first_failure, error_code, now, job_id.to_owned()],
                 )
                 .await;
+            logging::info(
+                "job_finished",
+                &[
+                    ("job_id", job_id.to_owned()),
+                    ("status", status.to_owned()),
+                    ("total_actions", report.summary.total_actions.to_string()),
+                    ("succeeded", report.summary.succeeded.to_string()),
+                    ("failed", report.summary.failed.to_string()),
+                    ("cancelled", report.summary.cancelled.to_string()),
+                    ("error_code", error_code.unwrap_or("").to_owned()),
+                ],
+            );
         }
         Err(error) => {
             let error_code = crate::jobs::error_taxonomy::classify_error(&error);
             let _ = conn
                 .execute(
                     "UPDATE jobs SET status = 'failed', error = ?1, error_code = ?2, updated_at_ms = ?3 WHERE id = ?4",
-                    params![error, error_code, now, job_id.to_owned()],
+                    params![error.clone(), error_code, now, job_id.to_owned()],
                 )
                 .await;
+            logging::error(
+                "job_failed",
+                &[
+                    ("job_id", job_id.to_owned()),
+                    ("error_code", error_code.to_owned()),
+                    ("error", error),
+                ],
+            );
         }
     }
 }
@@ -434,6 +480,10 @@ pub async fn cancel_job(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize(&state, &headers)?;
     let cancelled = state.jobs.cancel(&job_id);
+    logging::warn(
+        "job_cancel_requested",
+        &[("job_id", job_id), ("cancelled", cancelled.to_string())],
+    );
     Ok(Json(serde_json::json!({ "cancelled": cancelled })))
 }
 

@@ -11,18 +11,20 @@ mod watch;
 
 use axum::{
     Router,
+    body::Body,
     http::{
-        HeaderValue, Method,
+        HeaderValue, Method, Request, StatusCode,
         header::{AUTHORIZATION, CONTENT_TYPE},
     },
     middleware,
+    response::Response,
     routing::delete,
     routing::get,
     routing::post,
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use crate::{auth, state::AppState};
+use crate::{auth, logging, state::AppState};
 
 pub fn app(state: AppState) -> Router {
     let protected_routes = Router::new()
@@ -139,7 +141,31 @@ pub fn app(state: AppState) -> Router {
         )
         .merge(protected_routes)
         .with_state(state)
+        .layer(middleware::from_fn(log_request))
         .layer(local_cors_layer())
+}
+
+async fn log_request(request: Request<Body>, next: middleware::Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    let status = response.status();
+    let elapsed_ms = started.elapsed().as_millis();
+    let fields = [
+        ("method", method.to_string()),
+        ("path", path),
+        ("status", status.as_u16().to_string()),
+        ("elapsed_ms", elapsed_ms.to_string()),
+    ];
+    if status.is_server_error() {
+        logging::error("http_request", &fields);
+    } else if status.is_client_error() && status != StatusCode::NOT_FOUND {
+        logging::warn("http_request", &fields);
+    } else {
+        logging::info("http_request", &fields);
+    }
+    response
 }
 
 fn local_cors_layer() -> CorsLayer {

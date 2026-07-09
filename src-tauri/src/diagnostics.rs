@@ -1,3 +1,4 @@
+use log::{info, warn};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
 
@@ -20,6 +21,7 @@ pub enum DiagnosticsExportError {
 }
 
 pub async fn export_bundle(app: &AppHandle) -> Result<(), DiagnosticsExportError> {
+    info!("event=diagnostics_export_started");
     let connection = app
         .state::<DaemonSupervisor>()
         .connection()
@@ -37,6 +39,7 @@ pub async fn export_bundle(app: &AppHandle) -> Result<(), DiagnosticsExportError
         .set_file_name("susun-studio-diagnostics.tar")
         .blocking_save_file()
     else {
+        info!("event=diagnostics_export_cancelled");
         return Err(DiagnosticsExportError::Cancelled);
     };
     let target_path = target
@@ -50,10 +53,26 @@ pub async fn export_bundle(app: &AppHandle) -> Result<(), DiagnosticsExportError
     let bytes = archive.into_inner()?;
 
     std::fs::write(&target_path, bytes)?;
+    let target_file = target_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<unknown>".to_owned());
+    info!(
+        "event=diagnostics_export_finished target_file={} bytes={}",
+        target_file,
+        std::fs::metadata(&target_path)
+            .ok()
+            .map(|meta| meta.len())
+            .unwrap_or_default()
+    );
     Ok(())
 }
 
 async fn fetch_diagnostics_json(connection: &DaemonConnection) -> Result<Vec<u8>, reqwest::Error> {
+    info!(
+        "event=diagnostics_fetch_started base_url={}",
+        connection.base_url
+    );
     // `error_for_status()` matters here: without it, a 401/500 JSON error
     // body from the daemon would get silently bundled as if it were the
     // real diagnostics report.
@@ -65,11 +84,17 @@ async fn fetch_diagnostics_json(connection: &DaemonConnection) -> Result<Vec<u8>
         .error_for_status()?
         .bytes()
         .await?;
+    info!("event=diagnostics_fetch_finished bytes={}", bytes.len());
     Ok(bytes.to_vec())
 }
 
 fn read_tail(path: &std::path::Path, max_lines: usize) -> String {
     let Ok(content) = std::fs::read_to_string(path) else {
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "<unknown>".to_owned());
+        warn!("event=diagnostics_log_tail_missing file={file_name}");
         return String::new();
     };
     let lines: Vec<&str> = content.lines().collect();

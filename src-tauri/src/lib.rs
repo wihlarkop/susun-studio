@@ -2,10 +2,12 @@ mod daemon;
 mod diagnostics;
 
 use daemon::DaemonSupervisor;
+use log::{error, info};
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    info!("event=studio_starting");
     if let Err(error) = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -33,6 +35,7 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
     {
+        error!("event=studio_run_failed error={error}");
         eprintln!("failed to run Susun Studio: {error}");
     }
 }
@@ -41,14 +44,17 @@ pub fn run() {
 async fn resolve_daemon_connection(
     app: tauri::AppHandle,
 ) -> Result<daemon::DaemonConnection, String> {
-    daemon::resolve_connection(&app)
-        .await
-        .map_err(|error| error.to_string())
+    info!("event=resolve_daemon_connection_command_started");
+    daemon::resolve_connection(&app).await.map_err(|error| {
+        error!("event=resolve_daemon_connection_command_failed error={error}");
+        error.to_string()
+    })
 }
 
 #[tauri::command]
 async fn export_diagnostics_bundle(app: tauri::AppHandle) -> Result<(), String> {
-    diagnostics::export_bundle(&app)
-        .await
-        .map_err(|error| error.to_string())
+    diagnostics::export_bundle(&app).await.map_err(|error| {
+        error!("event=export_diagnostics_bundle_command_failed error={error}");
+        error.to_string()
+    })
 }

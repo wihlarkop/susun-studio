@@ -11,7 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use turso::params;
 
-use crate::{auth::authorize, error::ApiError, state::AppState, susun_integration};
+use crate::{auth::authorize, error::ApiError, logging, state::AppState, susun_integration};
 
 #[derive(Debug, Serialize)]
 pub struct PlanActionResponse {
@@ -86,6 +86,13 @@ async fn create_plan(
     operation: PlanOperation,
 ) -> Result<(StatusCode, Json<PlanResponse>), ApiError> {
     let conn = state.db.connect()?;
+    logging::info(
+        "plan_create_started",
+        &[
+            ("project_id", project_id.to_owned()),
+            ("operation", operation.as_str().to_owned()),
+        ],
+    );
 
     // Read the project source in a scope so the query cursor is fully closed
     // before the INSERT below. turso silently discards a write issued while a
@@ -182,6 +189,26 @@ async fn create_plan(
         ],
     )
     .await?;
+
+    logging::info(
+        "plan_create_finished",
+        &[
+            ("plan_id", plan_id.clone()),
+            ("project_id", project_id.to_owned()),
+            ("operation", operation.as_str().to_owned()),
+            ("total_actions", summary.total_actions.to_string()),
+            ("safe_actions", summary.safe_actions.to_string()),
+            ("caution_actions", summary.caution_actions.to_string()),
+            (
+                "destructive_actions",
+                summary.destructive_actions.to_string(),
+            ),
+            (
+                "blocked",
+                plan_row.blocked_diagnostics.is_some().to_string(),
+            ),
+        ],
+    );
 
     let actions = plan_row
         .actions

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use susun::ProjectSummary;
 use turso::params;
 
-use crate::{auth::authorize, error::ApiError, state::AppState, susun_integration};
+use crate::{auth::authorize, error::ApiError, logging, state::AppState, susun_integration};
 
 #[derive(Debug, Serialize)]
 pub struct ProjectListResponse {
@@ -119,6 +119,14 @@ pub async fn create_project(
     )
     .await?;
 
+    logging::info(
+        "project_created",
+        &[
+            ("project_id", project.id.clone()),
+            ("name", project.name.clone()),
+        ],
+    );
+
     Ok((StatusCode::CREATED, Json(project)))
 }
 
@@ -154,8 +162,21 @@ pub async fn import_project(
     authorize(&state, &headers)?;
 
     if request.files.is_empty() {
+        logging::warn(
+            "project_import_rejected",
+            &[("reason", "missing_compose_files".to_owned())],
+        );
         return Err(ApiError::MissingComposeFiles);
     }
+
+    logging::info(
+        "project_import_started",
+        &[
+            ("file_count", request.files.len().to_string()),
+            ("has_env_file", request.env_file.is_some().to_string()),
+            ("profile_count", request.profiles.len().to_string()),
+        ],
+    );
 
     let files = canonicalize_paths(&request.files)?;
     let env_file = match &request.env_file {
@@ -171,6 +192,10 @@ pub async fn import_project(
     )?;
 
     let Some(source_id) = analyzed.source_id.clone() else {
+        logging::warn(
+            "project_import_blocked",
+            &[("has_errors", analyzed.has_errors.to_string())],
+        );
         return Ok((
             StatusCode::OK,
             Json(ImportProjectResponse {
@@ -228,6 +253,25 @@ pub async fn import_project(
     )
     .await?;
 
+    logging::info(
+        "project_import_finished",
+        &[
+            ("project_id", source_id.clone()),
+            ("name", display_name.clone()),
+            ("has_errors", analyzed.has_errors.to_string()),
+            (
+                "diagnostic_count",
+                analyzed
+                    .diagnostics
+                    .get("diagnostics")
+                    .and_then(|value| value.as_array())
+                    .map(|items| items.len())
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+        ],
+    );
+
     let mut created_rows = conn
         .query(
             "SELECT created_at_ms FROM projects WHERE id = ?1 LIMIT 1",
@@ -277,11 +321,16 @@ pub async fn delete_project(
 
     let conn = state.db.connect()?;
     let affected = conn
-        .execute("DELETE FROM projects WHERE id = ?1", params![project_id])
+        .execute(
+            "DELETE FROM projects WHERE id = ?1",
+            params![project_id.clone()],
+        )
         .await?;
     if affected == 0 {
         return Err(ApiError::ProjectNotFound);
     }
+
+    logging::info("project_deleted", &[("project_id", project_id)]);
 
     Ok(Json(serde_json::json!({ "deleted": true })))
 }

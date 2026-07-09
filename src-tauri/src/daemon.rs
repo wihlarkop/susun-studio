@@ -1,5 +1,6 @@
 use std::{io::Write, net::TcpListener, path::PathBuf, sync::Mutex, time::Duration};
 
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_shell::{ShellExt, process::CommandEvent};
@@ -87,7 +88,10 @@ impl DaemonSupervisor {
             .unwrap_or_else(|error| error.into_inner())
             .take()
         {
-            let _ = child.kill();
+            info!("event=daemon_sidecar_shutdown_requested");
+            if let Err(error) = child.kill() {
+                warn!("event=daemon_sidecar_shutdown_failed error={error}");
+            }
         }
     }
 }
@@ -95,17 +99,26 @@ impl DaemonSupervisor {
 pub async fn resolve_connection(
     app: &AppHandle,
 ) -> Result<DaemonConnection, DaemonSupervisorError> {
+    info!("event=daemon_connection_resolve_started");
     if cfg!(debug_assertions)
         && let Some(connection) = detect_external_dev_daemon().await
     {
         app.state::<DaemonSupervisor>()
             .set_connection(connection.clone());
+        info!(
+            "event=daemon_connection_resolved mode=external_dev base_url={}",
+            connection.base_url
+        );
         return Ok(connection);
     }
 
     let connection = spawn_and_wait(app).await?;
     app.state::<DaemonSupervisor>()
         .set_connection(connection.clone());
+    info!(
+        "event=daemon_connection_resolved mode=sidecar base_url={}",
+        connection.base_url
+    );
     Ok(connection)
 }
 
@@ -113,7 +126,9 @@ pub async fn resolve_connection(
 /// `bun run daemon` dev workflow, which always binds the daemon's fixed
 /// default address (`crates/studio-daemon/src/config.rs`'s `DEFAULT_BIND_ADDR`).
 async fn detect_external_dev_daemon() -> Option<DaemonConnection> {
+    info!("event=daemon_external_probe_started base_url={DEV_DAEMON_BASE_URL}");
     if !probe_health(DEV_DAEMON_BASE_URL).await {
+        info!("event=daemon_external_probe_unavailable base_url={DEV_DAEMON_BASE_URL}");
         return None;
     }
 
@@ -129,6 +144,7 @@ async fn spawn_and_wait(app: &AppHandle) -> Result<DaemonConnection, DaemonSuper
     let token = uuid::Uuid::new_v4().to_string();
     let port = reserve_free_port()?;
     let base_url = format!("http://127.0.0.1:{port}");
+    info!("event=daemon_sidecar_spawn_started base_url={base_url}");
 
     let mut log_file = std::fs::File::create(daemon_log_path(app)?)?;
 
@@ -145,20 +161,31 @@ async fn spawn_and_wait(app: &AppHandle) -> Result<DaemonConnection, DaemonSuper
         while let Some(event) = events.recv().await {
             let line = match event {
                 CommandEvent::Stdout(bytes) | CommandEvent::Stderr(bytes) => bytes,
+                CommandEvent::Terminated(payload) => {
+                    info!(
+                        "event=daemon_sidecar_terminated code={:?} signal={:?}",
+                        payload.code, payload.signal
+                    );
+                    continue;
+                }
                 _ => continue,
             };
-            let _ = log_file.write_all(&line);
+            if let Err(error) = log_file.write_all(&line) {
+                warn!("event=daemon_log_write_failed error={error}");
+            }
         }
     });
 
     let deadline = std::time::Instant::now() + HEALTH_CHECK_TIMEOUT;
     while std::time::Instant::now() < deadline {
         if probe_health(&base_url).await {
+            info!("event=daemon_sidecar_healthy base_url={base_url}");
             return Ok(DaemonConnection { base_url, token });
         }
         tokio::time::sleep(HEALTH_CHECK_INTERVAL).await;
     }
 
+    error!("event=daemon_sidecar_health_timeout base_url={base_url}");
     Err(DaemonSupervisorError::HealthTimeout(HEALTH_CHECK_TIMEOUT))
 }
 
@@ -171,6 +198,7 @@ fn reserve_free_port() -> Result<u16, std::io::Error> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     drop(listener);
+    info!("event=daemon_sidecar_port_reserved port={port}");
     Ok(port)
 }
 

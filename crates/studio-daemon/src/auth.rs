@@ -7,14 +7,19 @@ use axum::{
 };
 use subtle::ConstantTimeEq;
 
-use crate::{error::ApiError, state::AppState};
+use crate::{error::ApiError, logging, state::AppState};
 
 pub fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     let Some(value) = headers.get("authorization") else {
+        logging::warn(
+            "auth_failed",
+            &[("reason", "missing_authorization".to_owned())],
+        );
         return Err(ApiError::Unauthorized);
     };
 
     let Ok(value) = value.to_str() else {
+        logging::warn("auth_failed", &[("reason", "invalid_header".to_owned())]);
         return Err(ApiError::Unauthorized);
     };
 

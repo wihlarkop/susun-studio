@@ -1,7 +1,7 @@
 use axum::{Json, extract::State, http::HeaderMap};
 use serde::Serialize;
 
-use crate::{auth::authorize, error::ApiError, state::AppState};
+use crate::{auth::authorize, error::ApiError, logging, state::AppState};
 
 const MAX_ERROR_MESSAGE_CHARS: usize = 200;
 const REDACTED: &str = "<redacted>";
@@ -42,6 +42,7 @@ pub async fn diagnostics(
     headers: HeaderMap,
 ) -> Result<Json<DiagnosticsReport>, ApiError> {
     authorize(&state, &headers)?;
+    logging::info("diagnostics_requested", &[]);
 
     let conn = state.db.connect()?;
 
@@ -98,7 +99,7 @@ pub async fn diagnostics(
         .ok()
         .map(|meta| meta.len());
 
-    Ok(Json(DiagnosticsReport {
+    let report = DiagnosticsReport {
         daemon_version: env!("CARGO_PKG_VERSION"),
         api_version: "1",
         os: std::env::consts::OS,
@@ -108,7 +109,19 @@ pub async fn diagnostics(
         project_count,
         recent_job_errors,
         engines,
-    }))
+    };
+    logging::info(
+        "diagnostics_finished",
+        &[
+            ("project_count", report.project_count.to_string()),
+            (
+                "recent_job_error_count",
+                report.recent_job_errors.len().to_string(),
+            ),
+            ("engine_count", report.engines.len().to_string()),
+        ],
+    );
+    Ok(Json(report))
 }
 
 fn redact_and_truncate_error(text: &str) -> String {

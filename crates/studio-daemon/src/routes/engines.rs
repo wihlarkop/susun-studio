@@ -8,7 +8,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use turso::params;
 
-use crate::{auth::authorize, error::ApiError, state::AppState, susun_integration};
+use crate::{auth::authorize, error::ApiError, logging, state::AppState, susun_integration};
 
 #[derive(Debug, Serialize)]
 pub struct EngineResponse {
@@ -89,6 +89,7 @@ pub async fn engine_health(
     Path(engine_id): Path<String>,
 ) -> Result<Json<EngineHealthResponse>, ApiError> {
     authorize(&state, &headers)?;
+    logging::info("engine_health_started", &[("engine_id", engine_id.clone())]);
 
     // Connect and check Docker (no DB cursor open here).
     let health = match susun_integration::connect_docker_engine() {
@@ -111,9 +112,32 @@ pub async fn engine_health(
     let conn = state.db.connect()?;
     conn.execute(
         "UPDATE engines SET last_health_json = ?1, last_health_at_ms = ?2 WHERE id = ?3",
-        params![health_json, now, engine_id],
+        params![health_json, now, engine_id.clone()],
     )
     .await?;
+
+    if response.reachable {
+        logging::info(
+            "engine_health_finished",
+            &[
+                ("engine_id", engine_id),
+                ("reachable", response.reachable.to_string()),
+                (
+                    "api_version",
+                    response.api_version.clone().unwrap_or_default(),
+                ),
+            ],
+        );
+    } else {
+        logging::warn(
+            "engine_health_finished",
+            &[
+                ("engine_id", engine_id),
+                ("reachable", response.reachable.to_string()),
+                ("error", response.error.clone().unwrap_or_default()),
+            ],
+        );
+    }
 
     Ok(Json(response))
 }
@@ -165,19 +189,50 @@ pub async fn prune_engine(
     Json(request): Json<PruneRequest>,
 ) -> Result<Json<PruneResponse>, ApiError> {
     authorize(&state, &headers)?;
+    logging::warn(
+        "engine_prune_started",
+        &[
+            ("scope_count", request.scopes.len().to_string()),
+            ("all_images", request.all_images.to_string()),
+        ],
+    );
 
     let engine = susun_integration::connect_docker_engine().map_err(ApiError::EngineUnavailable)?;
     let report = susun_integration::system_prune(&engine, &request.scopes, request.all_images)
         .await
         .map_err(ApiError::EngineUnavailable)?;
 
-    Ok(Json(PruneResponse {
+    let response = PruneResponse {
         containers_removed: report.containers_removed,
         networks_removed: report.networks_removed,
         volumes_removed: report.volumes_removed,
         images_removed: report.images_removed,
         space_reclaimed_bytes: report.space_reclaimed_bytes,
-    }))
+    };
+    logging::warn(
+        "engine_prune_finished",
+        &[
+            (
+                "containers_removed",
+                response.containers_removed.len().to_string(),
+            ),
+            (
+                "networks_removed",
+                response.networks_removed.len().to_string(),
+            ),
+            (
+                "volumes_removed",
+                response.volumes_removed.len().to_string(),
+            ),
+            ("images_removed", response.images_removed.len().to_string()),
+            (
+                "space_reclaimed_bytes",
+                response.space_reclaimed_bytes.to_string(),
+            ),
+        ],
+    );
+
+    Ok(Json(response))
 }
 
 fn now_ms() -> Result<i64, ApiError> {

@@ -5,7 +5,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::db;
+use crate::{db, logging};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -103,6 +103,7 @@ struct ErrorResponse {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let error = self.to_string();
         let status = match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::MissingName | Self::MissingPath | Self::MissingComposeFiles => {
@@ -119,13 +120,16 @@ impl IntoResponse for ApiError {
             }
             Self::Database(_) | Self::Json(_) | Self::Clock => StatusCode::INTERNAL_SERVER_ERROR,
         };
+        let fields = [
+            ("status", status.as_u16().to_string()),
+            ("error", error.clone()),
+        ];
+        if status.is_server_error() {
+            logging::error("api_error", &fields);
+        } else {
+            logging::warn("api_error", &fields);
+        }
 
-        (
-            status,
-            Json(ErrorResponse {
-                error: self.to_string(),
-            }),
-        )
-            .into_response()
+        (status, Json(ErrorResponse { error })).into_response()
     }
 }
