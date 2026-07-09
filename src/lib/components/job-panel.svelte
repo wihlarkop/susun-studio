@@ -51,22 +51,48 @@
   let pastJobs = $state<StudioJob[]>([]);
   let pastJobsOpen = $state(false);
   let source: EventSource | null = null;
+  let activePoll: ReturnType<typeof setInterval> | null = null;
 
   const projectId = $derived(project?.id ?? null);
 
-  async function refreshPastJobs() {
-    if (!projectId) return;
+  async function refreshPastJobs(options: { attachRunning?: boolean } = {}) {
+    if (!projectId) return [];
     try {
-      pastJobs = await listProjectJobs(projectId);
+      const nextJobs = await listProjectJobs(projectId);
+      pastJobs = nextJobs;
+      if (options.attachRunning && !job) {
+        const running = nextJobs.find((candidate) => candidate.status === "running");
+        if (running) {
+          hydrateJob(running);
+          attach(running.id);
+        }
+      }
+      return nextJobs;
     } catch {
       // best-effort — the live job UI above already reflects current state
+      return [];
     }
   }
 
   $effect(() => {
-    void projectId;
-    refreshPastJobs();
-    return () => source?.close();
+    const currentProjectId = projectId;
+    source?.close();
+    source = null;
+    stopActivePolling();
+    job = null;
+    steps = [];
+    cancelling = false;
+    errorMessage = null;
+    if (currentProjectId) {
+      void refreshPastJobs({ attachRunning: true });
+    } else {
+      pastJobs = [];
+    }
+    return () => {
+      source?.close();
+      source = null;
+      stopActivePolling();
+    };
   });
 
   const TERMINAL: StepStatus[] = ["succeeded", "failed", "skipped", "cancelled"];
@@ -100,6 +126,69 @@
     );
   }
 
+  function statusFromActionResult(status: string | undefined): StepStatus {
+    if (status === "pending" || status === "ready") return "pending";
+    if (status === "running") return "running";
+    if (status === "skipped_dependency_failed") return "skipped";
+    return mapFinish(status);
+  }
+
+  function buildSteps(nextJob: StudioJob): Step[] {
+    return nextJob.actions.map((action) => {
+      const actionResult = nextJob.result?.actions?.[action.id];
+      return {
+        ...action,
+        status: actionResult
+          ? statusFromActionResult(actionResult.status)
+          : nextJob.status === "running"
+            ? "pending"
+            : nextJob.status === "cancelled"
+              ? "cancelled"
+              : nextJob.status === "failed"
+                ? "skipped"
+                : nextJob.status === "succeeded"
+                  ? "succeeded"
+                  : "pending",
+        progress: actionResult?.attempts ?? 0,
+      };
+    });
+  }
+
+  function hydrateJob(nextJob: StudioJob) {
+    job = nextJob;
+    steps = buildSteps(nextJob);
+    if (nextJob.status !== "running") {
+      cancelling = false;
+      finalize(nextJob.status);
+    }
+  }
+
+  function stopActivePolling() {
+    if (activePoll) {
+      clearInterval(activePoll);
+      activePoll = null;
+    }
+  }
+
+  function pollActiveJob(jobId: string) {
+    stopActivePolling();
+    activePoll = setInterval(() => {
+      readJob(jobId)
+        .then((updated) => {
+          hydrateJob(updated);
+          if (updated.status !== "running") {
+            stopActivePolling();
+            onJobFinished?.();
+            void refreshPastJobs();
+          }
+        })
+        .catch(() => {
+          // The daemon may be restarting. Keep the last known state and let
+          // the next poll rehydrate the persisted job once the API returns.
+        });
+    }, 3000);
+  }
+
   async function run(action: "up" | "down" | "build" | "clean") {
     if (!projectId) {
       return;
@@ -110,8 +199,7 @@
     steps = [];
     try {
       const started = await runAction(projectId, action);
-      job = started;
-      steps = started.actions.map((a) => ({ ...a, status: "pending", progress: 0 }));
+      hydrateJob(started);
       attach(started.id);
     } catch (error) {
       errorMessage = error instanceof Error ? error.message : "Failed to start action";
@@ -122,6 +210,7 @@
 
   function attach(jobId: string) {
     source?.close();
+    pollActiveJob(jobId);
     subscribeJobEvents(jobId)
       .then((eventSource) => {
         source = eventSource;
@@ -141,13 +230,17 @@
               setStep(id, { progress: (current?.progress ?? 0) + 1 });
             }
             if (event.type === "plan_finished") {
-              readJob(jobId).then((updated) => {
-                job = updated;
-                cancelling = false;
-                finalize(updated.status);
-                onJobFinished?.();
-                void refreshPastJobs();
-              });
+              readJob(jobId)
+                .then((updated) => {
+                  hydrateJob(updated);
+                  stopActivePolling();
+                  onJobFinished?.();
+                  void refreshPastJobs();
+                })
+                .catch(() => {
+                  // Keep polling; the daemon may have restarted before the
+                  // final persisted row was readable again.
+                });
               source?.close();
             }
           } catch {
@@ -155,18 +248,26 @@
           }
         };
         source.onerror = () => {
-          readJob(jobId).then((updated) => {
-            job = updated;
-            cancelling = false;
-            finalize(updated.status);
-            onJobFinished?.();
-            void refreshPastJobs();
-          });
+          readJob(jobId)
+            .then((updated) => {
+              hydrateJob(updated);
+              if (updated.status !== "running") {
+                stopActivePolling();
+                onJobFinished?.();
+                void refreshPastJobs();
+              }
+            })
+            .catch(() => {
+              // Keep polling; reconnect recovery is handled by pollActiveJob.
+            });
           source?.close();
         };
       })
       .catch((error) => {
-        errorMessage = error instanceof Error ? error.message : "Failed to open event stream";
+        errorMessage =
+          error instanceof Error
+            ? `${error.message}; polling persisted job state.`
+            : "Failed to open event stream; polling persisted job state.";
       });
   }
 

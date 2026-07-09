@@ -3,6 +3,8 @@ use tauri_plugin_dialog::DialogExt;
 
 use crate::daemon::{DaemonConnection, DaemonSupervisor};
 
+const REDACTED: &str = "<redacted>";
+
 #[derive(Debug, thiserror::Error)]
 pub enum DiagnosticsExportError {
     #[error("daemon connection is not available yet")]
@@ -26,8 +28,8 @@ pub async fn export_bundle(app: &AppHandle) -> Result<(), DiagnosticsExportError
     let report_bytes = fetch_diagnostics_json(&connection).await?;
 
     let log_dir = app.path().app_log_dir()?;
-    let app_log = read_tail(&log_dir.join("susun-studio.log"), 200);
-    let daemon_log = read_tail(&log_dir.join("daemon.log"), 200);
+    let app_log = redact_sensitive_text(&read_tail(&log_dir.join("susun-studio.log"), 200));
+    let daemon_log = redact_sensitive_text(&read_tail(&log_dir.join("daemon.log"), 200));
 
     let Some(target) = app
         .dialog()
@@ -75,6 +77,65 @@ fn read_tail(path: &std::path::Path, max_lines: usize) -> String {
     lines[start..].join("\n")
 }
 
+fn redact_sensitive_text(text: &str) -> String {
+    text.split_inclusive(char::is_whitespace)
+        .map(redact_token_segment)
+        .collect::<String>()
+}
+
+fn redact_token_segment(segment: &str) -> String {
+    let token = segment.trim_end_matches(char::is_whitespace);
+    let whitespace = &segment[token.len()..];
+    format!("{}{}", redact_token(token), whitespace)
+}
+
+fn redact_token(token: &str) -> String {
+    let key = token
+        .split_once('=')
+        .or_else(|| token.split_once(':'))
+        .map(|(key, _)| key)
+        .unwrap_or(token);
+
+    if contains_sensitive_marker(key) {
+        if let Some((key, _)) = token.split_once('=') {
+            return format!("{key}={REDACTED}");
+        }
+        if let Some((key, _)) = token.split_once(':') {
+            return format!("{key}:{REDACTED}");
+        }
+        return REDACTED.to_owned();
+    }
+
+    token.to_owned()
+}
+
+fn contains_sensitive_marker(input: &str) -> bool {
+    let lower = input.to_ascii_lowercase();
+    const SUBSTRING_MARKERS: &[&str] = &[
+        "authorization",
+        "credential",
+        "passwd",
+        "password",
+        "private_key",
+        "secret",
+        "token",
+        "connection_string",
+        "conn_str",
+        "database_url",
+        "db_url",
+    ];
+    const TOKEN_MARKERS: &[&str] = &[
+        "auth", "bearer", "cert", "cookie", "dsn", "jwt", "key", "session",
+    ];
+
+    SUBSTRING_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || lower
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|token| TOKEN_MARKERS.contains(&token))
+}
+
 fn append_bytes(
     archive: &mut tar::Builder<Vec<u8>>,
     name: &str,
@@ -85,4 +146,22 @@ fn append_bytes(
     header.set_mode(0o644);
     header.set_cksum();
     archive.append_data(&mut header, name, contents)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{REDACTED, redact_sensitive_text};
+
+    #[test]
+    fn redacts_sensitive_log_tokens() {
+        let redacted = redact_sensitive_text(
+            "request failed Authorization=Bearer-123 DATABASE_URL:postgres://user:pass@host PORT=7377",
+        );
+
+        assert!(redacted.contains(&format!("Authorization={REDACTED}")));
+        assert!(redacted.contains(&format!("DATABASE_URL:{REDACTED}")));
+        assert!(redacted.contains("PORT=7377"));
+        assert!(!redacted.contains("Bearer-123"));
+        assert!(!redacted.contains("postgres://user:pass@host"));
+    }
 }
