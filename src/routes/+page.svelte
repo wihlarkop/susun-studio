@@ -8,6 +8,7 @@
   import EngineStatusCard from "$lib/components/engine-status-card.svelte";
   import JobsPage from "$lib/components/jobs-page.svelte";
   import ImportProjectDialog from "$lib/components/import-project-dialog.svelte";
+  import BetaOnboardingPanel from "$lib/components/beta-onboarding-panel.svelte";
   import { createDaemonState } from "$lib/daemon/daemon-state.svelte";
   import type { ImportProjectRequest, ImportProjectResponse } from "$lib/daemon/client";
 
@@ -85,6 +86,12 @@
       />
       {#if activeView === "projects"}
         <HeroPanel healthState={daemonState.healthState} onRetry={daemonState.refresh} />
+        <BetaOnboardingPanel
+          healthState={daemonState.healthState}
+          projectCount={daemonState.projects.length}
+          onImportClick={() => (importDialogOpen = true)}
+          onRetry={daemonState.refresh}
+        />
         <EngineStatusCard />
         <ProjectsTable
           projects={daemonState.projects}
