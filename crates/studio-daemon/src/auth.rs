@@ -1,4 +1,10 @@
-use axum::http::HeaderMap;
+use axum::{
+    body::Body,
+    extract::State,
+    http::{HeaderMap, Request},
+    middleware::Next,
+    response::Response,
+};
 use subtle::ConstantTimeEq;
 
 use crate::{error::ApiError, state::AppState};
@@ -24,4 +30,14 @@ pub fn verify_secret(candidate: &str, expected: &str) -> Result<(), ApiError> {
     } else {
         Err(ApiError::Unauthorized)
     }
+}
+
+pub async fn require_auth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, ApiError> {
+    authorize(&state, &headers)?;
+    Ok(next.run(request).await)
 }

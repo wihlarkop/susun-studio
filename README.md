@@ -18,7 +18,7 @@ The product is designed as a daemon-first platform spine that can grow into a Do
 
 ## Current Status
 
-Phases 1-6 are complete: Foundation, Susun Project Import, Planning Workspace, Engine Connections, Runtime Actions, and Project Operations UX (service lifecycle, logs/events streaming, exec/run/cp).
+Phases 1-11 are complete: Foundation through Security Hardening. Phase 12 (Public Beta) is next.
 
 The Tauri/SvelteKit client is scaffolded and talks to a separate `susun-studio-daemon` Rust crate over a local, token-authenticated HTTP API. The daemon embeds SQL migrations that run automatically at startup and persists local state in a Turso database.
 
@@ -32,14 +32,15 @@ Current API surface:
 - `GET /v1/projects` / `POST /v1/projects`
 - `POST /v1/projects/import`
 - `POST /v1/projects/{id}/plans/{up,down}`, `GET /v1/projects/{id}/plans`, `GET /v1/plans/{id}`
-- `GET /v1/engines`, `GET /v1/engines/{id}/health`, `GET /v1/engines/{id}/capabilities`
-- `POST /v1/projects/{id}/actions/{up,down,build}`, `GET /v1/jobs`, `GET /v1/jobs/{id}`, `POST /v1/jobs/{id}/cancel`, `GET /v1/jobs/{id}/events` (ticketed SSE)
+- `GET /v1/engines`, `GET /v1/engines/{id}/health`, `GET /v1/engines/{id}/capabilities`, `POST /v1/engines/{id}/prune`
+- `POST /v1/projects/{id}/actions/{up,down,build,clean}`, `GET /v1/jobs`, `GET /v1/projects/{id}/jobs`, `GET /v1/jobs/{id}`, `POST /v1/jobs/{id}/cancel`, `GET /v1/jobs/{id}/events` (ticketed SSE)
+- `POST /v1/projects/{id}/watch`, `GET /v1/projects/{id}/watch`, `GET /v1/watch`, `GET /v1/watch/{id}`, `POST /v1/watch/{id}/stop`, `GET /v1/watch/{id}/events` (ticketed SSE)
 - `GET /v1/projects/{id}/snapshot`, `GET /v1/projects/{id}/streams/{logs,events}` (ticketed SSE)
 - `POST /v1/projects/{id}/services/{service}/{start,stop,restart,wait,cp}`, `GET /v1/projects/{id}/services/{service}/ports`
 - `GET /v1/projects/{id}/services/{service}/streams/{exec,run}` (ticketed SSE)
 - `GET /v1/settings` / `PUT /v1/settings`
 
-All routes other than `/v1/health` require the bearer token configured via `SUSUN_STUDIO_DAEMON_TOKEN`. The daemon only accepts requests from local dev origins (`localhost`/`127.0.0.1` on ports 1420/5173, plus `tauri://localhost`). SSE streams authenticate via short-lived, single-use, scope-bound tickets (issued by an authenticated POST) rather than a token in the URL.
+All routes other than `/v1/health` and ticketed stream `GET`s require the bearer token configured via `SUSUN_STUDIO_DAEMON_TOKEN`; protected routes are covered by both route-level middleware and existing handler checks. The daemon only binds loopback addresses. Packaged builds allow the Tauri origins (`tauri://localhost` / `http://tauri.localhost`); debug builds also allow local dev origins (`localhost`/`127.0.0.1` on ports 1420/5173). SSE streams authenticate via short-lived, single-use, scope-bound tickets (issued by an authenticated POST) rather than a token in the URL.
 
 **Known v1 limitations:** `exec` is non-interactive only (interactive TTY exec needs a bidirectional transport, deferred); `run` starts a disposable one-off container with the service's env/volumes/networks but no published ports and no config/secret mounts; image build is unsupported by the underlying `BollardEngine`.
 
@@ -102,7 +103,7 @@ bun run tauri dev
 
 The app now spawns and supervises `susun-studio-daemon` itself as a bundled Tauri sidecar (with a fresh per-launch auth token and a freshly reserved loopback port) instead of requiring `bun run daemon` to be started by hand — that manual dev workflow still works too and is auto-detected in debug builds.
 
-Two things are still placeholders and must be filled in with real values before a packaged build will run or the updater will work:
+Packaging has two important moving parts:
 
 1. **Sidecar binary.** `tauri.conf.json`'s `bundle.externalBin` requires `src-tauri/binaries/susun-studio-daemon-<target-triple>[.exe]` to actually exist — Tauri's build script fails without it. Build it first:
 
@@ -112,13 +113,13 @@ Two things are still placeholders and must be filled in with real values before 
 
    Run this before `bun run tauri dev` or `bun run tauri build` (it's also wired into `beforeBuildCommand`, so a full `tauri build` does it automatically — but `cargo check`/`clippy`/`build` on `src-tauri` directly will fail until you've run it at least once).
 
-2. **Updater signing keypair.** `src-tauri/tauri.conf.json`'s `plugins.updater.pubkey` is currently the literal placeholder string `REPLACE_WITH_PUBKEY_FROM_bun_run_tauri_signer_generate` — `src-tauri` will not compile until this is a real key. Generate one (one-time, not committed):
+2. **Updater signing keypair.** `src-tauri/tauri.conf.json`'s `plugins.updater.pubkey` is filled with the generated public key. The private key file and password must remain outside the repository and are used as GitHub Actions secrets. To rotate the keypair, generate a new one:
 
    ```powershell
    bun run tauri signer generate -w "$HOME/.tauri/susun-studio-updater.key"
    ```
 
-   Paste the printed public key into `tauri.conf.json`'s `plugins.updater.pubkey`. Save the private key file and its password somewhere secure — they become the `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` GitHub Actions secrets needed by `.github/workflows/release.yml` (tag-triggered, builds Windows/macOS x2/Linux via `tauri-action`, publishes a draft GitHub Release with an unsigned installer plus a signed `latest.json` updater manifest). This key signs _update artifacts_, not the app binary itself — OS code signing (Windows/macOS/Linux) is separately deferred; see the "signing plan" note below.
+   Paste the printed public key into `tauri.conf.json`'s `plugins.updater.pubkey`. Save the private key file and its password somewhere secure; they become the `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` GitHub Actions secrets needed by `.github/workflows/release.yml` (tag-triggered, builds Windows/macOS x2/Linux via `tauri-action`, publishes a draft GitHub Release with an unsigned installer plus a signed `latest.json` updater manifest). This key signs _update artifacts_, not the app binary itself; OS code signing (Windows/macOS/Linux) is separately deferred; see the "signing plan" note below.
 
 Two more top-bar features shipped alongside packaging: **Check for updates** (two-step — shows an "Install update" state and waits for a second click before downloading/installing/relaunching, never auto-installs) and **Export diagnostics** (saves a redacted `.tar` with app/daemon log tails, DB filename-only + size, recent failed-job errors truncated to 200 chars, and engine reachability).
 

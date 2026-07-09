@@ -15,17 +15,17 @@ use axum::{
         HeaderValue, Method,
         header::{AUTHORIZATION, CONTENT_TYPE},
     },
+    middleware,
     routing::delete,
     routing::get,
     routing::post,
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use crate::state::AppState;
+use crate::{auth, state::AppState};
 
 pub fn app(state: AppState) -> Router {
-    Router::new()
-        .route("/v1/health", get(health::health))
+    let protected_routes = Router::new()
         .route("/v1/diagnostics", get(diagnostics::diagnostics))
         .route(
             "/v1/projects",
@@ -64,22 +64,20 @@ pub fn app(state: AppState) -> Router {
             "/v1/watch/{id}/events/ticket",
             post(watch::create_watch_stream_ticket),
         )
-        .route("/v1/watch/{id}/events", get(watch::watch_session_events))
         .route("/v1/jobs/{id}", get(jobs::read_job))
         .route("/v1/jobs/{id}/cancel", post(jobs::cancel_job))
         .route(
             "/v1/jobs/{id}/events/ticket",
             post(jobs::create_stream_ticket),
         )
-        .route("/v1/jobs/{id}/events", get(jobs::job_events))
         .route("/v1/projects/{id}/snapshot", get(observe::project_snapshot))
         .route(
             "/v1/projects/{id}/streams/logs",
-            post(observe::create_log_stream_ticket).get(observe::stream_logs),
+            post(observe::create_log_stream_ticket),
         )
         .route(
             "/v1/projects/{id}/streams/events",
-            post(observe::create_event_stream_ticket).get(observe::stream_events),
+            post(observe::create_event_stream_ticket),
         )
         .route(
             "/v1/projects/{id}/services/{service}/start",
@@ -103,11 +101,11 @@ pub fn app(state: AppState) -> Router {
         )
         .route(
             "/v1/projects/{id}/services/{service}/streams/exec",
-            post(service_actions::create_exec_ticket).get(service_actions::stream_exec),
+            post(service_actions::create_exec_ticket),
         )
         .route(
             "/v1/projects/{id}/services/{service}/streams/run",
-            post(service_actions::create_run_ticket).get(service_actions::stream_run),
+            post(service_actions::create_run_ticket),
         )
         .route(
             "/v1/projects/{id}/services/{service}/cp",
@@ -117,6 +115,29 @@ pub fn app(state: AppState) -> Router {
             "/v1/settings",
             get(settings::get_settings).put(settings::update_settings),
         )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
+
+    Router::new()
+        .route("/v1/health", get(health::health))
+        .route("/v1/watch/{id}/events", get(watch::watch_session_events))
+        .route("/v1/jobs/{id}/events", get(jobs::job_events))
+        .route("/v1/projects/{id}/streams/logs", get(observe::stream_logs))
+        .route(
+            "/v1/projects/{id}/streams/events",
+            get(observe::stream_events),
+        )
+        .route(
+            "/v1/projects/{id}/services/{service}/streams/exec",
+            get(service_actions::stream_exec),
+        )
+        .route(
+            "/v1/projects/{id}/services/{service}/streams/run",
+            get(service_actions::stream_run),
+        )
+        .merge(protected_routes)
         .with_state(state)
         .layer(local_cors_layer())
 }

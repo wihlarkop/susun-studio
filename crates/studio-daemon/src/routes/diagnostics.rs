@@ -4,6 +4,7 @@ use serde::Serialize;
 use crate::{auth::authorize, error::ApiError, state::AppState};
 
 const MAX_ERROR_MESSAGE_CHARS: usize = 200;
+const REDACTED: &str = "<redacted>";
 
 #[derive(Debug, Serialize)]
 pub struct DiagnosticsJobError {
@@ -64,7 +65,7 @@ pub async fn diagnostics(
         recent_job_errors.push(DiagnosticsJobError {
             id: row.get(0)?,
             kind: row.get(1)?,
-            error: error.map(|text| truncate_error(&text)),
+            error: error.map(|text| redact_and_truncate_error(&text)),
             error_code: row.get(3)?,
             created_at_ms: row.get(4)?,
         });
@@ -110,10 +111,83 @@ pub async fn diagnostics(
     }))
 }
 
-fn truncate_error(text: &str) -> String {
-    if text.chars().count() <= MAX_ERROR_MESSAGE_CHARS {
-        return text.to_owned();
+fn redact_and_truncate_error(text: &str) -> String {
+    let redacted = redact_sensitive_error_text(text);
+    if redacted.chars().count() <= MAX_ERROR_MESSAGE_CHARS {
+        return redacted;
     }
-    let truncated: String = text.chars().take(MAX_ERROR_MESSAGE_CHARS).collect();
+    let truncated: String = redacted.chars().take(MAX_ERROR_MESSAGE_CHARS).collect();
     format!("{truncated}… (truncated)")
+}
+
+fn redact_sensitive_error_text(text: &str) -> String {
+    text.split_whitespace()
+        .map(redact_error_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_error_token(token: &str) -> String {
+    let key = token
+        .split_once('=')
+        .or_else(|| token.split_once(':'))
+        .map(|(key, _)| key)
+        .unwrap_or(token);
+
+    if contains_sensitive_marker(key) {
+        if let Some((key, _)) = token.split_once('=') {
+            return format!("{key}={REDACTED}");
+        }
+        if let Some((key, _)) = token.split_once(':') {
+            return format!("{key}:{REDACTED}");
+        }
+        return REDACTED.to_owned();
+    }
+
+    token.to_owned()
+}
+
+fn contains_sensitive_marker(input: &str) -> bool {
+    let lower = input.to_ascii_lowercase();
+    const SUBSTRING_MARKERS: &[&str] = &[
+        "authorization",
+        "credential",
+        "passwd",
+        "password",
+        "private_key",
+        "secret",
+        "token",
+        "connection_string",
+        "conn_str",
+        "database_url",
+        "db_url",
+    ];
+    const TOKEN_MARKERS: &[&str] = &[
+        "auth", "bearer", "cert", "cookie", "dsn", "jwt", "key", "session",
+    ];
+
+    SUBSTRING_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || lower
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|token| TOKEN_MARKERS.contains(&token))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{REDACTED, redact_and_truncate_error};
+
+    #[test]
+    fn diagnostics_error_redaction_masks_sensitive_key_values() {
+        let redacted = redact_and_truncate_error(
+            "engine failed with API_KEY=super-secret DATABASE_URL:postgres://user:pass@host PORT=8080",
+        );
+
+        assert!(redacted.contains(&format!("API_KEY={REDACTED}")));
+        assert!(redacted.contains(&format!("DATABASE_URL:{REDACTED}")));
+        assert!(redacted.contains("PORT=8080"));
+        assert!(!redacted.contains("super-secret"));
+        assert!(!redacted.contains("postgres://user:pass@host"));
+    }
 }
