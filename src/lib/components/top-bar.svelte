@@ -92,8 +92,8 @@
       <Button
         variant="ghost"
         size="icon"
-        aria-label="Export diagnostics bundle"
-        title="Export diagnostics bundle"
+        aria-label="Export diagnostics bundle (sensitive values redacted)"
+        title="Export diagnostics bundle (sensitive values redacted)"
         onclick={exportDiagnostics}
       >
         <LifeBuoy />
