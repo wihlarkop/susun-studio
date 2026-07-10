@@ -46,7 +46,7 @@ pub async fn project_snapshot(
 ) -> Result<Json<SnapshotResponse>, ApiError> {
     authorize(&state, &headers)?;
     let source = load_project_source(&state, &project_id).await?;
-    let engine = susun_integration::connect_engine(&state.db)
+    let engine = susun_integration::connect_engine(&state.db, Some(&project_id))
         .await
         .map_err(ApiError::EngineUnavailable)?;
     let context = susun_integration::runtime_context(
@@ -152,7 +152,7 @@ pub async fn stream_logs(
         });
 
     let source = load_project_source(&state, &project_id).await?;
-    let engine = susun_integration::connect_engine(&state.db)
+    let engine = susun_integration::connect_engine(&state.db, Some(&project_id))
         .await
         .map_err(ApiError::EngineUnavailable)?;
     let context = susun_integration::runtime_context(
@@ -239,7 +239,7 @@ pub async fn stream_events(
     consume_ticket(&state, &query, &format!("events:{project_id}"))?;
 
     let source = load_project_source(&state, &project_id).await?;
-    let engine = susun_integration::connect_engine(&state.db)
+    let engine = susun_integration::connect_engine(&state.db, Some(&project_id))
         .await
         .map_err(ApiError::EngineUnavailable)?;
     let context = susun_integration::runtime_context(

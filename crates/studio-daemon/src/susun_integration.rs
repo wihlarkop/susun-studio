@@ -225,10 +225,14 @@ pub struct EngineCapabilitiesRow {
     pub max_container_name_length: Option<usize>,
 }
 
-/// Constructs a Docker-compatible client handle from Studio's selected runtime
-/// profile when available, otherwise Bollard's platform local default.
-pub async fn connect_engine(db: &Database) -> Result<BollardEngine, String> {
-    let endpoint = runtime::selected_engine_endpoint(db)
+/// Constructs a Docker-compatible client handle. Resolution order: the
+/// project's bound runtime profile (when connectable), then Studio's
+/// globally selected profile, then Bollard's platform local default.
+pub async fn connect_engine(
+    db: &Database,
+    project_id: Option<&str>,
+) -> Result<BollardEngine, String> {
+    let endpoint = runtime::engine_endpoint_for(db, project_id)
         .await
         .map_err(|error| error.to_string())?
         .unwrap_or(EngineEndpoint::Local);

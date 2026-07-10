@@ -111,7 +111,7 @@ pub(crate) async fn start_up_job(
 ) -> Result<Json<JobResponse>, ApiError> {
     let source = load_project_source(&state, &project_id).await?;
     let engine = Arc::new(
-        susun_integration::connect_engine(&state.db)
+        susun_integration::connect_engine(&state.db, Some(&project_id))
             .await
             .map_err(ApiError::EngineUnavailable)?,
     );
@@ -182,7 +182,7 @@ async fn start_down_job(
 ) -> Result<Json<JobResponse>, ApiError> {
     let source = load_project_source(&state, &project_id).await?;
     let engine = Arc::new(
-        susun_integration::connect_engine(&state.db)
+        susun_integration::connect_engine(&state.db, Some(&project_id))
             .await
             .map_err(ApiError::EngineUnavailable)?,
     );
