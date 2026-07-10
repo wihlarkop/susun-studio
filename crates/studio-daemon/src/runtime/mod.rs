@@ -95,13 +95,19 @@ pub async fn status(db: &Database) -> Result<RuntimeStatus, turso::Error> {
 
 pub async fn select_profile(db: &Database, profile_id: &str) -> Result<bool, turso::Error> {
     let conn = db.connect()?;
-    let mut rows = conn
-        .query(
-            "SELECT id FROM runtime_profiles WHERE id = ?1 LIMIT 1",
-            params![profile_id.to_owned()],
-        )
-        .await?;
-    if rows.next().await?.is_none() {
+    // Fully materialize the existence check before writing on the same
+    // connection — turso silently drops a write issued while an earlier
+    // read cursor is still open (see project memory on this quirk).
+    let exists = {
+        let mut rows = conn
+            .query(
+                "SELECT id FROM runtime_profiles WHERE id = ?1 LIMIT 1",
+                params![profile_id.to_owned()],
+            )
+            .await?;
+        rows.next().await?.is_some()
+    };
+    if !exists {
         return Ok(false);
     }
 

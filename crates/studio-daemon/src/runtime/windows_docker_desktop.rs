@@ -8,8 +8,13 @@ use super::{
     },
 };
 
-const DOCKER_DESKTOP_EXE: &str = r"C:\Program Files\Docker\Docker\Docker Desktop.exe";
+const DOCKER_DESKTOP_EXE: &str = r"C:\Program Files\Docker\Docker\frontend\Docker Desktop.exe";
 const DOCKER_ENGINE_PIPE: &str = r"\\.\pipe\docker_engine";
+/// Killing only the `Docker Desktop` (frontend) process leaves
+/// `com.docker.backend.exe`/`com.docker.build.exe` running — the backend then
+/// relaunches the frontend on its own, which looks like "Stop did nothing."
+/// Match every process under the install directory instead.
+const DOCKER_STOP_SCRIPT: &str = r"Get-Process | Where-Object { $_.Path -like 'C:\Program Files\Docker\*' } | Stop-Process -Force -ErrorAction SilentlyContinue";
 
 pub struct WindowsDockerDesktopProvider;
 
@@ -195,11 +200,11 @@ impl RuntimeProvider for WindowsDockerDesktopProvider {
                     "-WindowStyle".to_owned(),
                     "Hidden".to_owned(),
                     "-Command".to_owned(),
-                    "Stop-Process -Name 'Docker Desktop' -Force -ErrorAction SilentlyContinue"
-                        .to_owned(),
+                    DOCKER_STOP_SCRIPT.to_owned(),
                 ],
                 timeout_secs: 30,
-                success_message: "Docker Desktop stop requested.".to_owned(),
+                success_message: "Docker Desktop stop requested (engine and UI processes)."
+                    .to_owned(),
                 elevate_if_needed: false,
             }),
             "restart" => Some(RuntimeCommand {
@@ -210,7 +215,7 @@ impl RuntimeProvider for WindowsDockerDesktopProvider {
                     "Hidden".to_owned(),
                     "-Command".to_owned(),
                     format!(
-                        "Stop-Process -Name 'Docker Desktop' -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2; Start-Process -FilePath '{DOCKER_DESKTOP_EXE}'"
+                        "{DOCKER_STOP_SCRIPT}; Start-Sleep -Seconds 2; Start-Process -FilePath '{DOCKER_DESKTOP_EXE}'"
                     ),
                 ],
                 timeout_secs: 30,
