@@ -52,7 +52,9 @@ async fn resolve_daemon_connection(
 }
 
 #[tauri::command]
-async fn export_diagnostics_bundle(app: tauri::AppHandle) -> Result<(), String> {
+async fn export_diagnostics_bundle(
+    app: tauri::AppHandle,
+) -> Result<diagnostics::DiagnosticsExportOutcome, String> {
     diagnostics::export_bundle(&app).await.map_err(|error| {
         error!("event=export_diagnostics_bundle_command_failed error={error}");
         error.to_string()

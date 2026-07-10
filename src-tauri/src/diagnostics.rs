@@ -1,4 +1,5 @@
 use log::{info, warn};
+use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
 
@@ -16,11 +17,18 @@ pub enum DiagnosticsExportError {
     PathResolution(#[from] tauri::Error),
     #[error("failed to build diagnostics bundle: {0}")]
     Io(#[from] std::io::Error),
-    #[error("export was cancelled")]
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticsExportOutcome {
+    Exported,
     Cancelled,
 }
 
-pub async fn export_bundle(app: &AppHandle) -> Result<(), DiagnosticsExportError> {
+pub async fn export_bundle(
+    app: &AppHandle,
+) -> Result<DiagnosticsExportOutcome, DiagnosticsExportError> {
     info!("event=diagnostics_export_started");
     let connection = app
         .state::<DaemonSupervisor>()
@@ -40,11 +48,12 @@ pub async fn export_bundle(app: &AppHandle) -> Result<(), DiagnosticsExportError
         .blocking_save_file()
     else {
         info!("event=diagnostics_export_cancelled");
-        return Err(DiagnosticsExportError::Cancelled);
+        return Ok(DiagnosticsExportOutcome::Cancelled);
     };
-    let target_path = target
-        .into_path()
-        .map_err(|_| DiagnosticsExportError::Cancelled)?;
+    let Ok(target_path) = target.into_path() else {
+        info!("event=diagnostics_export_cancelled");
+        return Ok(DiagnosticsExportOutcome::Cancelled);
+    };
 
     let mut archive = tar::Builder::new(Vec::new());
     append_bytes(&mut archive, "diagnostics.json", &report_bytes)?;
@@ -65,7 +74,7 @@ pub async fn export_bundle(app: &AppHandle) -> Result<(), DiagnosticsExportError
             .map(|meta| meta.len())
             .unwrap_or_default()
     );
-    Ok(())
+    Ok(DiagnosticsExportOutcome::Exported)
 }
 
 async fn fetch_diagnostics_json(connection: &DaemonConnection) -> Result<Vec<u8>, reqwest::Error> {
