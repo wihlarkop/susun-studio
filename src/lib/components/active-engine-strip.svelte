@@ -94,11 +94,11 @@
         </span>
       {/if}
     </div>
-    <div class="flex items-center gap-2">
+    <div class="flex min-w-0 flex-wrap items-center justify-end gap-2">
       {#if profiles.length > 0}
-        <div class="relative">
+        <div class="relative min-w-72 max-w-full flex-1 sm:flex-none">
           <select
-            class="h-8 appearance-none rounded-md border bg-background bg-none pr-8 pl-3 text-sm"
+            class="h-9 w-full appearance-none rounded-md border bg-background bg-none pr-9 pl-3 text-sm leading-5"
             disabled={switching || !connected}
             value={selected?.id ?? ""}
             onchange={switchProfile}

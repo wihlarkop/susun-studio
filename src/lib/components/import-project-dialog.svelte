@@ -3,17 +3,23 @@
   import { Button } from "$lib/components/ui/button/index.js";
   import { Input } from "$lib/components/ui/input/index.js";
   import { Badge } from "$lib/components/ui/badge/index.js";
-  import { FolderOpen, X } from "@lucide/svelte";
+  import { ChevronDown, FolderOpen, X } from "@lucide/svelte";
   import { displayPath } from "$lib/utils";
-  import type { ImportProjectRequest, ImportProjectResponse } from "$lib/daemon/client";
+  import type {
+    ImportProjectRequest,
+    ImportProjectResponse,
+    RuntimeProfile,
+  } from "$lib/daemon/client";
 
   let {
     open = $bindable(false),
     connected,
+    runtimeProfiles,
     onImport,
   }: {
     open?: boolean;
     connected: boolean;
+    runtimeProfiles: RuntimeProfile[];
     onImport: (request: ImportProjectRequest) => Promise<ImportProjectResponse>;
   } = $props();
 
@@ -24,6 +30,7 @@
   let envFileInput = $state("");
   let projectNameInput = $state("");
   let profilesInput = $state("");
+  let engineProfileId = $state("");
   let submitting = $state(false);
   let errorMessage = $state<string | null>(null);
   let lastResult = $state<ImportProjectResponse | null>(null);
@@ -34,6 +41,7 @@
     envFileInput = "";
     projectNameInput = "";
     profilesInput = "";
+    engineProfileId = "";
     errorMessage = null;
     lastResult = null;
   }
@@ -100,6 +108,7 @@
         env_file: envFileInput.trim() || null,
         project_name: projectNameInput.trim() || null,
         profiles,
+        runtime_profile_id: engineProfileId || null,
       });
       lastResult = response;
       if (response.project) {
@@ -195,6 +204,24 @@
       <label class="flex flex-col gap-1 text-sm">
         <span class="font-medium">Profiles (optional, comma-separated)</span>
         <Input bind:value={profilesInput} placeholder="dev,debug" />
+      </label>
+
+      <label class="flex flex-col gap-1 text-sm">
+        <span class="font-medium">Engine (optional)</span>
+        <div class="relative">
+          <select
+            class="h-9 w-full appearance-none rounded-md border bg-background bg-none pr-8 pl-3 text-sm"
+            bind:value={engineProfileId}
+          >
+            <option value="">Use active engine</option>
+            {#each runtimeProfiles as profile (profile.id)}
+              <option value={profile.id}>{profile.display_name}</option>
+            {/each}
+          </select>
+          <ChevronDown
+            class="pointer-events-none absolute top-1/2 right-2 size-4 -translate-y-1/2 text-muted-foreground"
+          />
+        </div>
       </label>
 
       {#if errorMessage}
