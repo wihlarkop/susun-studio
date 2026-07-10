@@ -8,6 +8,7 @@
     runRuntimeAction,
     selectRuntimeProfile,
     type RuntimeAction,
+    type RuntimeActionResult,
     type RuntimeDimension,
     type RuntimeEndpointSummary,
     type RuntimeLogLine,
@@ -15,13 +16,26 @@
     type RuntimeProviderStatus,
     type RuntimeStatus,
   } from "$lib/daemon/client";
-  import { HardDrive, Play, RefreshCw, RotateCw, Square, Wrench } from "@lucide/svelte";
+  import {
+    AlertCircle,
+    CheckCircle2,
+    ChevronRight,
+    HardDrive,
+    Play,
+    RefreshCw,
+    RotateCw,
+    Server,
+    Square,
+    TerminalSquare,
+    Wrench,
+  } from "@lucide/svelte";
 
   let status = $state<RuntimeStatus | null>(null);
   let logs = $state<RuntimeLogLine[]>([]);
   let loading = $state(false);
-  let actionMessage = $state<string | null>(null);
+  let actionResult = $state<RuntimeActionResult | null>(null);
   let errorMessage = $state<string | null>(null);
+  let expandedProviders = $state<Set<string>>(new Set());
 
   const actionIcons = {
     install: Wrench,
@@ -30,6 +44,20 @@
     stop: Square,
     restart: RotateCw,
   } as const;
+
+  const providers = $derived(status?.providers ?? []);
+  const selectedProfiles = $derived(
+    providers.flatMap((provider) => provider.profiles.filter((profile) => profile.is_selected)),
+  );
+  const readyProviders = $derived(
+    providers.filter((provider) => provider.connection.state === "summarized"),
+  );
+  const enabledActions = $derived(
+    providers.reduce(
+      (total, provider) => total + provider.actions.filter((action) => action.enabled).length,
+      0,
+    ),
+  );
 
   $effect(() => {
     const controller = new AbortController();
@@ -57,8 +85,7 @@
   }
 
   async function handleAction(providerId: string, action: RuntimeAction) {
-    const result = await runRuntimeAction(providerId, action.id);
-    actionMessage = `${result.message} ${result.next_steps.join(" ")}`;
+    actionResult = await runRuntimeAction(providerId, action.id);
     await refresh();
   }
 
@@ -67,17 +94,49 @@
     await refresh();
   }
 
-  function dimensionVariant(dimension: RuntimeDimension): "default" | "secondary" | "outline" {
-    if (["installed", "running", "reachable"].includes(dimension.state)) return "default";
+  function stateLabel(value: string): string {
+    return value.replaceAll("_", " ");
+  }
+
+  function dimensionVariant(
+    dimension: RuntimeDimension,
+  ): "default" | "secondary" | "outline" | "destructive" {
+    if (["installed", "running", "reachable", "summarized"].includes(dimension.state)) {
+      return "default";
+    }
+    if (["failed", "not_installed", "unreachable"].includes(dimension.state)) {
+      return "destructive";
+    }
     if (["unknown", "not_applicable"].includes(dimension.state)) return "secondary";
     return "outline";
+  }
+
+  function providerVariant(
+    provider: RuntimeProviderStatus,
+  ): "default" | "secondary" | "outline" | "destructive" {
+    if (!provider.supported) return "secondary";
+    if (provider.connection.state === "summarized") return "default";
+    if (provider.installation.state === "not_installed") return "outline";
+    if (provider.process.state === "failed" || provider.connection.state === "failed") {
+      return "destructive";
+    }
+    return "outline";
+  }
+
+  function providerStatusLabel(provider: RuntimeProviderStatus): string {
+    if (!provider.supported) return "Unsupported";
+    if (provider.connection.state === "summarized") return "Ready";
+    if (provider.process.state === "running") return "Starting";
+    if (provider.installation.state === "installed") return "Installed";
+    if (provider.installation.state === "not_installed") return "Not installed";
+    return stateLabel(provider.connection.state);
   }
 
   function profileStatus(profile: RuntimeProfile): string {
     return [profile.installation.state, profile.process.state, profile.connection.state]
       .filter(Boolean)
-      .join(" / ")
-      .replaceAll("_", " ");
+      .map(stateLabel)
+      .join(" / ");
   }
 
   function endpointLabel(summary: RuntimeProfile["endpoint_summary"]): string | null {
@@ -92,149 +151,289 @@
 
   function providerDimensions(provider: RuntimeProviderStatus) {
     return [
-      { label: "Installation", value: provider.installation },
+      { label: "Install", value: provider.installation },
       { label: "Process", value: provider.process },
-      { label: "Connection", value: provider.connection },
+      { label: "Endpoint", value: provider.connection },
     ];
+  }
+
+  function enabledActionSummary(provider: RuntimeProviderStatus): string {
+    const enabled = provider.actions.filter((action) => action.enabled);
+    if (enabled.length === 0) return "No action is currently available.";
+    return enabled.map((action) => action.label).join(", ");
+  }
+
+  function toggleProvider(providerId: string) {
+    const next = new Set(expandedProviders);
+    if (next.has(providerId)) {
+      next.delete(providerId);
+    } else {
+      next.add(providerId);
+    }
+    expandedProviders = next;
+  }
+
+  function providerOpen(providerId: string): boolean {
+    return expandedProviders.has(providerId);
   }
 </script>
 
 <div class="flex flex-col gap-4">
-  <div class="flex items-center justify-between gap-3">
-    <div>
+  <div class="flex flex-wrap items-start justify-between gap-3">
+    <div class="max-w-3xl">
       <h3 class="text-lg font-semibold">Runtime</h3>
       <p class="text-sm text-muted-foreground">
-        Studio can guide you through installing and managing a container runtime. Existing
-        Docker-compatible engines keep working through the Engines page either way.
+        Manage local container providers and choose the profile Studio should use for project
+        actions. Existing Docker-compatible engines can still be used as the platform default.
       </p>
     </div>
     <Button size="sm" variant="outline" disabled={loading} onclick={() => refresh()}>
       <RefreshCw />
-      Recheck
+      {loading ? "Checking" : "Recheck"}
     </Button>
   </div>
 
-  {#if errorMessage}
-    <p class="text-sm text-destructive">{errorMessage}</p>
-  {/if}
-
-  {#if actionMessage}
-    <p class="text-sm text-muted-foreground">{actionMessage}</p>
-  {/if}
-
-  {#each status?.providers ?? [] as provider (provider.provider_id)}
-    <Card.Root class="gap-4 p-4">
-      <div class="flex flex-wrap items-center gap-2">
-        <h4 class="text-base font-semibold">{provider.display_name}</h4>
-        <Badge variant={provider.supported ? "default" : "outline"}>
-          {provider.supported ? "Supported target" : "Unsupported platform"}
+  <div class="grid gap-2 md:grid-cols-3">
+    <div class="rounded-md border p-3">
+      <div class="text-xs font-medium text-muted-foreground">Ready providers</div>
+      <div class="mt-2 flex items-center gap-2">
+        <Badge variant={readyProviders.length > 0 ? "default" : "outline"}>
+          {readyProviders.length} / {providers.length}
         </Badge>
-        <Badge variant="secondary">{provider.platform}</Badge>
-        <span class="text-xs text-muted-foreground">{provider.freshness}</span>
+        <span class="text-sm text-muted-foreground">
+          {readyProviders.length > 0 ? "runtime endpoint available" : "no endpoint ready"}
+        </span>
       </div>
+    </div>
+    <div class="rounded-md border p-3">
+      <div class="text-xs font-medium text-muted-foreground">Active profile</div>
+      <div class="mt-2 flex min-w-0 items-center gap-2">
+        <Server class="size-4 shrink-0 text-muted-foreground" />
+        <span class="min-w-0 truncate text-sm">
+          {selectedProfiles[0]?.display_name ?? "No profile selected"}
+        </span>
+      </div>
+    </div>
+    <div class="rounded-md border p-3">
+      <div class="text-xs font-medium text-muted-foreground">Available actions</div>
+      <div class="mt-2 flex items-center gap-2">
+        <Badge variant={enabledActions > 0 ? "default" : "secondary"}>{enabledActions}</Badge>
+        <span class="text-sm text-muted-foreground">
+          {enabledActions === 1 ? "provider action" : "provider actions"}
+        </span>
+      </div>
+    </div>
+  </div>
 
-      <p class="text-sm text-muted-foreground">{provider.summary}</p>
+  {#if errorMessage}
+    <div class="flex gap-2 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
+      <AlertCircle class="mt-0.5 size-4 shrink-0" />
+      <span>{errorMessage}</span>
+    </div>
+  {/if}
 
-      <div class="grid gap-2 md:grid-cols-3">
-        {#each providerDimensions(provider) as item (item.label)}
-          <div class="rounded-md border p-3">
-            <div class="text-xs font-medium text-muted-foreground">{item.label}</div>
-            <div class="mt-2 flex items-center gap-2">
-              <Badge variant={dimensionVariant(item.value)}>
-                {item.value.state.replace("_", " ")}
-              </Badge>
+  {#if actionResult}
+    <div class="rounded-md border bg-muted/30 p-3">
+      <div class="flex flex-wrap items-center gap-2">
+        <Badge variant={actionResult.status === "failed" ? "destructive" : "secondary"}>
+          {stateLabel(actionResult.status)}
+        </Badge>
+        <span class="text-sm">{actionResult.message}</span>
+      </div>
+      {#if actionResult.next_steps.length > 0}
+        <p class="mt-1 text-xs text-muted-foreground">{actionResult.next_steps.join(" ")}</p>
+      {/if}
+    </div>
+  {/if}
+
+  {#if !status && !errorMessage}
+    <div class="rounded-md border p-4 text-sm text-muted-foreground">
+      Checking runtime providers...
+    </div>
+  {/if}
+
+  <div class="flex flex-wrap items-end justify-between gap-2">
+    <div>
+      <h4 class="text-sm font-semibold">Runtime providers</h4>
+      <p class="text-xs text-muted-foreground">
+        Installed and available runtimes are listed together. Expand one to manage profiles and
+        lifecycle actions.
+      </p>
+    </div>
+    <Badge variant="outline">{providers.length}</Badge>
+  </div>
+
+  {#each providers as provider (provider.provider_id)}
+    {@const open = providerOpen(provider.provider_id)}
+    <Card.Root class="gap-0 overflow-hidden p-0">
+      <button
+        type="button"
+        class="w-full border-b bg-muted/20 p-4 text-left transition-colors hover:bg-muted/35"
+        aria-expanded={open}
+        onclick={() => toggleProvider(provider.provider_id)}
+      >
+        <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
+          <div class="min-w-0">
+            <div class="flex min-w-0 flex-wrap items-center gap-2">
+              <ChevronRight
+                class="size-4 shrink-0 text-muted-foreground transition-transform {open
+                  ? 'rotate-90'
+                  : ''}"
+              />
+              <span class="min-w-0 truncate text-base font-semibold">{provider.display_name}</span>
+              <Badge variant={providerVariant(provider)}>{providerStatusLabel(provider)}</Badge>
+              <Badge variant="secondary">{provider.platform}</Badge>
             </div>
-            {#if item.value.detail}
-              <p class="mt-2 text-xs text-muted-foreground">{item.value.detail}</p>
+            <p class="mt-2 max-w-3xl text-sm text-muted-foreground">{provider.summary}</p>
+          </div>
+          <div class="flex flex-wrap items-center gap-2 md:justify-end">
+            <Badge variant={provider.profiles.length > 0 ? "secondary" : "outline"}>
+              {provider.profiles.length}
+              {provider.profiles.length === 1 ? "profile" : "profiles"}
+            </Badge>
+            <span class="text-xs text-muted-foreground">{provider.freshness}</span>
+          </div>
+        </div>
+      </button>
+
+      {#if open}
+        <div class="grid gap-4 p-4 lg:grid-cols-[minmax(0,1fr)_minmax(18rem,24rem)]">
+          <div class="space-y-4">
+            <div class="grid gap-2 md:grid-cols-3">
+              {#each providerDimensions(provider) as item (item.label)}
+                <div class="min-w-0 rounded-md border p-3">
+                  <div class="flex min-w-0 flex-wrap items-center justify-between gap-2">
+                    <div class="shrink-0 text-xs font-medium text-muted-foreground">
+                      {item.label}
+                    </div>
+                    <Badge
+                      variant={dimensionVariant(item.value)}
+                      class="max-w-full whitespace-normal text-center leading-4 [overflow-wrap:anywhere]"
+                    >
+                      {stateLabel(item.value.state)}
+                    </Badge>
+                  </div>
+                  {#if item.value.detail}
+                    <p class="mt-2 text-xs leading-5 text-muted-foreground">{item.value.detail}</p>
+                  {/if}
+                </div>
+              {/each}
+            </div>
+
+            {#if provider.remediation.length > 0}
+              <div class="rounded-md border bg-muted/20 p-3">
+                <div class="text-xs font-medium text-muted-foreground">Next steps</div>
+                <ul class="mt-2 space-y-1 text-sm">
+                  {#each provider.remediation as step}
+                    <li class="leading-5">{step}</li>
+                  {/each}
+                </ul>
+              </div>
             {/if}
           </div>
-        {/each}
-      </div>
 
-      <div class="flex flex-wrap gap-2">
-        {#each provider.actions as action (action.id)}
-          {@const Icon = actionIcons[action.id]}
-          <Button
-            size="sm"
-            variant={action.destructive ? "destructive" : "outline"}
-            disabled={!action.enabled}
-            title={action.reason}
-            onclick={() => handleAction(provider.provider_id, action)}
-          >
-            <Icon />
-            {action.label}
-          </Button>
-        {/each}
-      </div>
-
-      {#if provider.remediation.length > 0}
-        <div class="rounded-md border bg-muted/30 p-3">
-          <div class="text-xs font-medium text-muted-foreground">Next steps</div>
-          <ul class="mt-2 space-y-1 text-sm">
-            {#each provider.remediation as step}
-              <li>{step}</li>
-            {/each}
-          </ul>
-        </div>
-      {/if}
-
-      <div class="flex items-center justify-between">
-        <h4 class="text-sm font-semibold">Profiles</h4>
-        <Badge variant="outline">{provider.profiles.length}</Badge>
-      </div>
-      {#if provider.profiles.length === 0}
-        <p class="text-sm text-muted-foreground">No profiles have been observed yet.</p>
-      {:else}
-        <ul class="space-y-2">
-          {#each provider.profiles as profile (profile.id)}
-            {@const endpoint = endpointLabel(profile.endpoint_summary)}
-            <li class="rounded-md border p-3">
-              <div class="flex flex-wrap items-center justify-between gap-2">
-                <div class="flex flex-wrap items-center gap-2">
-                  <span class="text-sm font-medium">{profile.display_name}</span>
-                  {#if profile.is_selected}
-                    <Badge variant="default" class="text-xs">Selected</Badge>
-                  {/if}
-                  <Badge variant="secondary" class="text-xs">{profileStatus(profile)}</Badge>
-                </div>
+          <div class="rounded-md border p-3">
+            <div class="flex items-center justify-between gap-2">
+              <div>
+                <div class="text-sm font-semibold">Provider actions</div>
+                <p class="text-xs text-muted-foreground">{enabledActionSummary(provider)}</p>
+              </div>
+            </div>
+            <div class="mt-3 grid gap-2">
+              {#each provider.actions as action (action.id)}
+                {@const Icon = actionIcons[action.id]}
                 <Button
                   size="sm"
-                  variant="outline"
-                  disabled={profile.is_selected}
-                  onclick={() => handleSelect(profile)}
+                  variant={action.destructive ? "destructive" : action.enabled ? "default" : "outline"}
+                  disabled={!action.enabled}
+                  title={action.reason}
+                  class="w-full justify-start"
+                  onclick={() => handleAction(provider.provider_id, action)}
                 >
-                  Select
+                  <Icon />
+                  {action.label}
                 </Button>
-              </div>
-              <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                <span>{profile.provider_runtime_key}</span>
-                <span>{profile.freshness}</span>
-                {#if endpoint}
-                  <span>{endpoint}</span>
-                {/if}
-              </div>
-            </li>
-          {/each}
-        </ul>
+              {/each}
+            </div>
+          </div>
+        </div>
+
+        <div class="border-t p-4">
+          <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h4 class="text-sm font-semibold">Runtime profiles</h4>
+              <p class="text-xs text-muted-foreground">
+                Profiles are persisted observations. Projects can pin one or use the active profile.
+              </p>
+            </div>
+            <Badge variant="outline">{provider.profiles.length}</Badge>
+          </div>
+
+          {#if provider.profiles.length === 0}
+            <p class="rounded-md border p-3 text-sm text-muted-foreground">
+              No profiles have been observed yet.
+            </p>
+          {:else}
+            <ul class="divide-y rounded-md border">
+              {#each provider.profiles as profile (profile.id)}
+                {@const endpoint = endpointLabel(profile.endpoint_summary)}
+                <li class="grid gap-3 p-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
+                  <div class="min-w-0">
+                    <div class="flex flex-wrap items-center gap-2">
+                      <span class="min-w-0 truncate text-sm font-medium">
+                        {profile.display_name}
+                      </span>
+                      {#if profile.is_selected}
+                        <Badge variant="default" class="text-xs">
+                          <CheckCircle2 />
+                          Active
+                        </Badge>
+                      {/if}
+                      <Badge variant="secondary" class="text-xs">{profileStatus(profile)}</Badge>
+                    </div>
+                    <div class="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                      <span>{profile.provider_runtime_key}</span>
+                      <span>{profile.freshness}</span>
+                      {#if endpoint}
+                        <span>{endpoint}</span>
+                      {/if}
+                    </div>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant={profile.is_selected ? "secondary" : "outline"}
+                    disabled={profile.is_selected}
+                    onclick={() => handleSelect(profile)}
+                  >
+                    {profile.is_selected ? "Active" : "Make active"}
+                  </Button>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
       {/if}
     </Card.Root>
   {/each}
 
-  <Card.Root class="gap-3 p-4">
-    <div class="flex items-center justify-between">
-      <h4 class="text-sm font-semibold">Runtime logs</h4>
+  <Card.Root class="gap-0 overflow-hidden p-0">
+    <div class="flex items-center justify-between border-b bg-muted/20 p-4">
+      <div class="flex items-center gap-2">
+        <TerminalSquare class="size-4 text-muted-foreground" />
+        <h4 class="text-sm font-semibold">Runtime logs</h4>
+      </div>
       <Badge variant="outline">{logs.length}</Badge>
     </div>
     {#if logs.length === 0}
-      <p class="text-sm text-muted-foreground">No runtime observations recorded.</p>
+      <p class="p-4 text-sm text-muted-foreground">No runtime observations recorded.</p>
     {:else}
-      <ul class="space-y-1 text-sm">
+      <ul class="max-h-64 divide-y overflow-auto">
         {#each logs as line}
-          <li class="flex gap-2">
+          <li class="grid gap-2 p-3 text-sm sm:grid-cols-[4rem_minmax(0,1fr)]">
             <Badge variant={line.level === "warn" ? "outline" : "secondary"} class="h-fit text-xs">
               {line.level}
             </Badge>
-            <span class="text-muted-foreground">{line.message}</span>
+            <span class="min-w-0 text-muted-foreground [overflow-wrap:anywhere]">{line.message}</span>
           </li>
         {/each}
       </ul>
