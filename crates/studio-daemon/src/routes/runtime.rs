@@ -24,6 +24,15 @@ pub async fn runtime_logs(
     Ok(Json(serde_json::json!({ "lines": runtime::logs() })))
 }
 
+pub async fn list_runtime_profiles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let profiles = runtime::list_all_profiles(&state.db).await?;
+    Ok(Json(serde_json::json!({ "profiles": profiles })))
+}
+
 pub async fn select_runtime_profile(
     State(state): State<AppState>,
     headers: HeaderMap,

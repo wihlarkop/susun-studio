@@ -52,6 +52,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/engines/{id}/prune", post(engines::prune_engine))
         .route("/v1/runtime/status", get(runtime::runtime_status))
         .route("/v1/runtime/logs", get(runtime::runtime_logs))
+        .route("/v1/runtime/profiles", get(runtime::list_runtime_profiles))
         .route(
             "/v1/runtime/profiles/{id}/select",
             post(runtime::select_runtime_profile),

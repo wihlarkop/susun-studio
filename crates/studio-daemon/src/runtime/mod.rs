@@ -147,6 +147,62 @@ pub async fn selected_engine_endpoint(
         .and_then(|provider| provider.endpoint_for_runtime_key(&provider_runtime_key)))
 }
 
+/// Engine endpoint for a specific project: the project's own binding wins
+/// (when the bound profile still exists and is connectable), then the
+/// globally selected profile, then `None` (platform default).
+pub async fn engine_endpoint_for(
+    db: &Database,
+    project_id: Option<&str>,
+) -> Result<Option<EngineEndpoint>, turso::Error> {
+    if let Some(project_id) = project_id
+        && let Some(endpoint) = bound_engine_endpoint(db, project_id).await?
+    {
+        return Ok(Some(endpoint));
+    }
+    selected_engine_endpoint(db).await
+}
+
+async fn bound_engine_endpoint(
+    db: &Database,
+    project_id: &str,
+) -> Result<Option<EngineEndpoint>, turso::Error> {
+    let conn = db.connect()?;
+    let bound_profile_id: Option<String> = {
+        let mut rows = conn
+            .query(
+                "SELECT runtime_profile_id FROM projects WHERE id = ?1 LIMIT 1",
+                params![project_id.to_owned()],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => row.get(0)?,
+            None => None,
+        }
+    };
+    let Some(profile_id) = bound_profile_id else {
+        return Ok(None);
+    };
+
+    let mut rows = conn
+        .query(
+            "SELECT provider_id, provider_runtime_key, connection_state
+             FROM runtime_profiles WHERE id = ?1 LIMIT 1",
+            params![profile_id],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    let provider_id: String = row.get(0)?;
+    let provider_runtime_key: String = row.get(1)?;
+    let connection_state: String = row.get(2)?;
+    if connection_state != "summarized" {
+        return Ok(None);
+    }
+    Ok(find_provider(&provider_id)
+        .and_then(|provider| provider.endpoint_for_runtime_key(&provider_runtime_key)))
+}
+
 pub async fn action(
     db: &Database,
     provider_id: &str,
@@ -409,31 +465,54 @@ async fn list_profiles_for_provider(
         .await?;
     let mut profiles = Vec::new();
     while let Some(row) = rows.next().await? {
-        let is_selected: i64 = row.get(13)?;
-        profiles.push(RuntimeProfile {
-            id: row.get(0)?,
-            provider_id: row.get(1)?,
-            provider_runtime_key: row.get(2)?,
-            display_name: row.get(3)?,
-            product: row.get(4)?,
-            platform: row.get(5)?,
-            installation: RuntimeDimension {
-                state: row.get(6)?,
-                detail: row.get(7)?,
-            },
-            process: RuntimeDimension {
-                state: row.get(8)?,
-                detail: row.get(9)?,
-            },
-            connection: RuntimeDimension {
-                state: row.get(10)?,
-                detail: row.get(11)?,
-            },
-            endpoint_summary: row.get(12)?,
-            is_selected: is_selected != 0,
-            observed_at_ms: row.get(14)?,
-            freshness: "fresh".to_owned(),
-        });
+        profiles.push(profile_from_row(&row)?);
+    }
+    Ok(profiles)
+}
+
+fn profile_from_row(row: &turso::Row) -> Result<RuntimeProfile, turso::Error> {
+    let is_selected: i64 = row.get(13)?;
+    Ok(RuntimeProfile {
+        id: row.get(0)?,
+        provider_id: row.get(1)?,
+        provider_runtime_key: row.get(2)?,
+        display_name: row.get(3)?,
+        product: row.get(4)?,
+        platform: row.get(5)?,
+        installation: RuntimeDimension {
+            state: row.get(6)?,
+            detail: row.get(7)?,
+        },
+        process: RuntimeDimension {
+            state: row.get(8)?,
+            detail: row.get(9)?,
+        },
+        connection: RuntimeDimension {
+            state: row.get(10)?,
+            detail: row.get(11)?,
+        },
+        endpoint_summary: row.get(12)?,
+        is_selected: is_selected != 0,
+        observed_at_ms: row.get(14)?,
+        freshness: "fresh".to_owned(),
+    })
+}
+
+pub async fn list_all_profiles(db: &Database) -> Result<Vec<RuntimeProfile>, turso::Error> {
+    let conn = db.connect()?;
+    let mut rows = conn
+        .query(
+            "SELECT id, provider_id, provider_runtime_key, display_name, product, platform,
+                    installation_state, installation_detail, process_state, process_detail,
+                    connection_state, connection_detail, endpoint_summary, is_selected,
+                    observed_at_ms
+             FROM runtime_profiles ORDER BY is_selected DESC, display_name ASC",
+            (),
+        )
+        .await?;
+    let mut profiles = Vec::new();
+    while let Some(row) = rows.next().await? {
+        profiles.push(profile_from_row(&row)?);
     }
     Ok(profiles)
 }
