@@ -29,6 +29,7 @@ pub struct ProjectResponse {
     pub has_errors: Option<bool>,
     pub summary: Option<ProjectSummary>,
     pub diagnostics: Option<serde_json::Value>,
+    pub runtime_profile_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,7 +48,7 @@ pub async fn list_projects(
     let mut rows = conn
         .query(
             "SELECT id, name, path, created_at_ms, last_analyzed_at_ms, has_errors,
-                    summary_json, diagnostics_json
+                    summary_json, diagnostics_json, runtime_profile_id
              FROM projects ORDER BY created_at_ms DESC",
             (),
         )
@@ -58,6 +59,7 @@ pub async fn list_projects(
         let has_errors: Option<i64> = row.get(5)?;
         let summary_json: Option<String> = row.get(6)?;
         let diagnostics_json: Option<String> = row.get(7)?;
+        let runtime_profile_id: Option<String> = row.get(8)?;
 
         projects.push(ProjectResponse {
             id: row.get(0)?,
@@ -72,6 +74,7 @@ pub async fn list_projects(
             diagnostics: diagnostics_json
                 .as_deref()
                 .and_then(|json| serde_json::from_str(json).ok()),
+            runtime_profile_id,
         });
     }
 
@@ -105,6 +108,7 @@ pub async fn create_project(
         has_errors: None,
         summary: None,
         diagnostics: None,
+        runtime_profile_id: None,
     };
 
     let conn = state.db.connect()?;
@@ -144,6 +148,8 @@ pub struct ImportProjectRequest {
     pub project_name: Option<String>,
     #[serde(default)]
     pub profiles: Vec<String>,
+    #[serde(default)]
+    pub runtime_profile_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,8 +229,9 @@ pub async fn import_project(
         "INSERT INTO projects (
             id, name, path, created_at_ms,
             compose_files, env_file, project_name_override, profiles,
-            last_analyzed_at_ms, summary_json, diagnostics_json, has_errors
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            last_analyzed_at_ms, summary_json, diagnostics_json, has_errors,
+            runtime_profile_id
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             path = excluded.path,
@@ -235,7 +242,8 @@ pub async fn import_project(
             last_analyzed_at_ms = excluded.last_analyzed_at_ms,
             summary_json = excluded.summary_json,
             diagnostics_json = excluded.diagnostics_json,
-            has_errors = excluded.has_errors",
+            has_errors = excluded.has_errors,
+            runtime_profile_id = COALESCE(excluded.runtime_profile_id, projects.runtime_profile_id)",
         params![
             source_id.clone(),
             display_name.clone(),
@@ -249,6 +257,7 @@ pub async fn import_project(
             summary_json,
             diagnostics_json,
             i64::from(analyzed.has_errors),
+            request.runtime_profile_id.clone(),
         ],
     )
     .await?;
@@ -274,14 +283,15 @@ pub async fn import_project(
 
     let mut created_rows = conn
         .query(
-            "SELECT created_at_ms FROM projects WHERE id = ?1 LIMIT 1",
+            "SELECT created_at_ms, runtime_profile_id FROM projects WHERE id = ?1 LIMIT 1",
             params![source_id.clone()],
         )
         .await?;
-    let created_at_ms = match created_rows.next().await? {
-        Some(row) => row.get(0)?,
-        None => now,
-    };
+    let (created_at_ms, stored_runtime_profile_id): (i64, Option<String>) =
+        match created_rows.next().await? {
+            Some(row) => (row.get(0)?, row.get(1)?),
+            None => (now, request.runtime_profile_id.clone()),
+        };
 
     Ok((
         StatusCode::CREATED,
@@ -295,6 +305,7 @@ pub async fn import_project(
                 has_errors: Some(analyzed.has_errors),
                 summary: Some(analyzed.summary.clone()),
                 diagnostics: Some(analyzed.diagnostics.clone()),
+                runtime_profile_id: stored_runtime_profile_id,
             }),
             summary: Some(analyzed.summary),
             diagnostics: analyzed.diagnostics,
@@ -310,6 +321,63 @@ fn canonicalize_paths(paths: &[String]) -> Result<Vec<PathBuf>, ApiError> {
 fn canonicalize_path(path: &str) -> Result<PathBuf, ApiError> {
     std::fs::canonicalize(path)
         .map_err(|source| ApiError::InvalidImport(format!("`{path}`: {source}")))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetProjectEngineRequest {
+    pub runtime_profile_id: Option<String>,
+}
+
+pub async fn set_project_engine(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(request): Json<SetProjectEngineRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let conn = state.db.connect()?;
+
+    if let Some(profile_id) = &request.runtime_profile_id {
+        // Materialize the existence check before writing on the same
+        // connection — turso silently drops a write issued while an earlier
+        // read cursor is still open.
+        let exists = {
+            let mut rows = conn
+                .query(
+                    "SELECT id FROM runtime_profiles WHERE id = ?1 LIMIT 1",
+                    params![profile_id.clone()],
+                )
+                .await?;
+            rows.next().await?.is_some()
+        };
+        if !exists {
+            return Err(ApiError::RuntimeProfileNotFound);
+        }
+    }
+
+    let affected = conn
+        .execute(
+            "UPDATE projects SET runtime_profile_id = ?1 WHERE id = ?2",
+            params![request.runtime_profile_id.clone(), project_id.clone()],
+        )
+        .await?;
+    if affected == 0 {
+        return Err(ApiError::ProjectNotFound);
+    }
+
+    logging::info(
+        "project_engine_bound",
+        &[
+            ("project_id", project_id),
+            (
+                "runtime_profile_id",
+                request
+                    .runtime_profile_id
+                    .unwrap_or_else(|| "<active>".to_owned()),
+            ),
+        ],
+    );
+    Ok(Json(serde_json::json!({ "updated": true })))
 }
 
 pub async fn delete_project(
