@@ -100,6 +100,7 @@ export type StudioProject = {
   has_errors: boolean | null;
   summary: StudioProjectSummary | null;
   diagnostics: DiagnosticsPayload | null;
+  runtime_profile_id: string | null;
 };
 
 export type StudioSettings = {
@@ -116,6 +117,7 @@ export type ImportProjectRequest = {
   env_file?: string | null;
   project_name?: string | null;
   profiles?: string[];
+  runtime_profile_id?: string | null;
 };
 
 export type ImportProjectResponse = {
@@ -525,6 +527,29 @@ export async function readRuntimeLogs(
 ): Promise<RuntimeLogLine[]> {
   const response = await readJson<RuntimeLogsResponse>("/v1/runtime/logs", options);
   return response.lines;
+}
+
+type RuntimeProfilesResponse = {
+  profiles: RuntimeProfile[];
+};
+
+export async function listRuntimeProfiles(
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeProfile[]> {
+  const response = await readJson<RuntimeProfilesResponse>("/v1/runtime/profiles", options);
+  return response.profiles;
+}
+
+export async function setProjectEngine(
+  projectId: string,
+  runtimeProfileId: string | null,
+  options: DaemonRequestOptions = {},
+): Promise<{ updated: boolean }> {
+  return readJson(`/v1/projects/${encodeURIComponent(projectId)}/engine`, {
+    ...options,
+    method: "PUT",
+    body: { runtime_profile_id: runtimeProfileId },
+  });
 }
 
 export async function selectRuntimeProfile(
