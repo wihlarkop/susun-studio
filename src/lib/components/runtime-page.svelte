@@ -12,9 +12,10 @@
     type RuntimeEndpointSummary,
     type RuntimeLogLine,
     type RuntimeProfile,
+    type RuntimeProviderStatus,
     type RuntimeStatus,
   } from "$lib/daemon/client";
-  import { Play, RefreshCw, RotateCw, Square, Wrench } from "@lucide/svelte";
+  import { HardDrive, Play, RefreshCw, RotateCw, Square, Wrench } from "@lucide/svelte";
 
   let status = $state<RuntimeStatus | null>(null);
   let logs = $state<RuntimeLogLine[]>([]);
@@ -24,6 +25,7 @@
 
   const actionIcons = {
     install: Wrench,
+    init: HardDrive,
     start: Play,
     stop: Square,
     restart: RotateCw,
@@ -54,8 +56,8 @@
     }
   }
 
-  async function handleAction(action: RuntimeAction) {
-    const result = await runRuntimeAction(action.id);
+  async function handleAction(providerId: string, action: RuntimeAction) {
+    const result = await runRuntimeAction(providerId, action.id);
     actionMessage = `${result.message} ${result.next_steps.join(" ")}`;
     await refresh();
   }
@@ -88,15 +90,13 @@
     }
   }
 
-  const dimensions = $derived(
-    status
-      ? [
-          { label: "Installation", value: status.installation },
-          { label: "Process", value: status.process },
-          { label: "Connection", value: status.connection },
-        ]
-      : [],
-  );
+  function providerDimensions(provider: RuntimeProviderStatus) {
+    return [
+      { label: "Installation", value: provider.installation },
+      { label: "Process", value: provider.process },
+      { label: "Connection", value: provider.connection },
+    ];
+  }
 </script>
 
 <div class="flex flex-col gap-4">
@@ -104,8 +104,8 @@
     <div>
       <h3 class="text-lg font-semibold">Runtime</h3>
       <p class="text-sm text-muted-foreground">
-        Windows Podman is the first managed-runtime target. Existing Docker-compatible engines keep
-        working while this setup path lands.
+        Studio can guide you through installing and managing a container runtime. Existing
+        Docker-compatible engines keep working through the Engines page either way.
       </p>
     </div>
     <Button size="sm" variant="outline" disabled={loading} onclick={() => refresh()}>
@@ -118,21 +118,25 @@
     <p class="text-sm text-destructive">{errorMessage}</p>
   {/if}
 
-  {#if status}
+  {#if actionMessage}
+    <p class="text-sm text-muted-foreground">{actionMessage}</p>
+  {/if}
+
+  {#each status?.providers ?? [] as provider (provider.provider_id)}
     <Card.Root class="gap-4 p-4">
       <div class="flex flex-wrap items-center gap-2">
-        <h4 class="text-base font-semibold">{status.display_name}</h4>
-        <Badge variant={status.supported ? "default" : "outline"}>
-          {status.supported ? "Supported target" : "Unsupported platform"}
+        <h4 class="text-base font-semibold">{provider.display_name}</h4>
+        <Badge variant={provider.supported ? "default" : "outline"}>
+          {provider.supported ? "Supported target" : "Unsupported platform"}
         </Badge>
-        <Badge variant="secondary">{status.platform}</Badge>
-        <span class="text-xs text-muted-foreground">{status.freshness}</span>
+        <Badge variant="secondary">{provider.platform}</Badge>
+        <span class="text-xs text-muted-foreground">{provider.freshness}</span>
       </div>
 
-      <p class="text-sm text-muted-foreground">{status.summary}</p>
+      <p class="text-sm text-muted-foreground">{provider.summary}</p>
 
       <div class="grid gap-2 md:grid-cols-3">
-        {#each dimensions as item (item.label)}
+        {#each providerDimensions(provider) as item (item.label)}
           <div class="rounded-md border p-3">
             <div class="text-xs font-medium text-muted-foreground">{item.label}</div>
             <div class="mt-2 flex items-center gap-2">
@@ -148,14 +152,14 @@
       </div>
 
       <div class="flex flex-wrap gap-2">
-        {#each status.actions as action (action.id)}
+        {#each provider.actions as action (action.id)}
           {@const Icon = actionIcons[action.id]}
           <Button
             size="sm"
             variant={action.destructive ? "destructive" : "outline"}
             disabled={!action.enabled}
             title={action.reason}
-            onclick={() => handleAction(action)}
+            onclick={() => handleAction(provider.provider_id, action)}
           >
             <Icon />
             {action.label}
@@ -163,32 +167,26 @@
         {/each}
       </div>
 
-      {#if actionMessage}
-        <p class="text-sm text-muted-foreground">{actionMessage}</p>
-      {/if}
-
-      {#if status.remediation.length > 0}
+      {#if provider.remediation.length > 0}
         <div class="rounded-md border bg-muted/30 p-3">
           <div class="text-xs font-medium text-muted-foreground">Next steps</div>
           <ul class="mt-2 space-y-1 text-sm">
-            {#each status.remediation as step}
+            {#each provider.remediation as step}
               <li>{step}</li>
             {/each}
           </ul>
         </div>
       {/if}
-    </Card.Root>
 
-    <Card.Root class="gap-3 p-4">
       <div class="flex items-center justify-between">
-        <h4 class="text-sm font-semibold">Runtime profiles</h4>
-        <Badge variant="outline">{status.profiles.length}</Badge>
+        <h4 class="text-sm font-semibold">Profiles</h4>
+        <Badge variant="outline">{provider.profiles.length}</Badge>
       </div>
-      {#if status.profiles.length === 0}
-        <p class="text-sm text-muted-foreground">No runtime profiles have been observed yet.</p>
+      {#if provider.profiles.length === 0}
+        <p class="text-sm text-muted-foreground">No profiles have been observed yet.</p>
       {:else}
         <ul class="space-y-2">
-          {#each status.profiles as profile (profile.id)}
+          {#each provider.profiles as profile (profile.id)}
             {@const endpoint = endpointLabel(profile.endpoint_summary)}
             <li class="rounded-md border p-3">
               <div class="flex flex-wrap items-center justify-between gap-2">
@@ -220,7 +218,7 @@
         </ul>
       {/if}
     </Card.Root>
-  {/if}
+  {/each}
 
   <Card.Root class="gap-3 p-4">
     <div class="flex items-center justify-between">

@@ -194,7 +194,7 @@ export type RuntimeDimension = {
 };
 
 export type RuntimeAction = {
-  id: "install" | "start" | "stop" | "restart";
+  id: "install" | "init" | "start" | "stop" | "restart";
   label: string;
   destructive: boolean;
   enabled: boolean;
@@ -222,7 +222,7 @@ export type RuntimeEndpointSummary = {
   redacted: string;
 };
 
-export type RuntimeStatus = {
+export type RuntimeProviderStatus = {
   provider_id: string;
   display_name: string;
   product: string;
@@ -236,6 +236,10 @@ export type RuntimeStatus = {
   remediation: string[];
   actions: RuntimeAction[];
   profiles: RuntimeProfile[];
+};
+
+export type RuntimeStatus = {
+  providers: RuntimeProviderStatus[];
 };
 
 export type RuntimeActionResult = {
@@ -503,13 +507,17 @@ export async function readRuntimeStatus(
 }
 
 export async function runRuntimeAction(
+  providerId: string,
   action: RuntimeAction["id"],
   options: DaemonRequestOptions = {},
 ): Promise<RuntimeActionResult> {
-  return readJson(`/v1/runtime/actions/${encodeURIComponent(action)}`, {
-    ...options,
-    method: "POST",
-  });
+  return readJson(
+    `/v1/runtime/providers/${encodeURIComponent(providerId)}/actions/${encodeURIComponent(action)}`,
+    {
+      ...options,
+      method: "POST",
+    },
+  );
 }
 
 export async function readRuntimeLogs(

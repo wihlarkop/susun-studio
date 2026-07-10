@@ -1,17 +1,26 @@
 mod provider;
+mod windows_docker_desktop;
 mod windows_podman;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use provider::{RuntimeCommand, RuntimeObservation, RuntimeProvider};
+use provider::{RuntimeCommand, RuntimeProvider};
 use serde::Serialize;
 use susun::EngineEndpoint;
 use tokio::time::{Duration, timeout};
 use turso::{Database, params};
+use windows_docker_desktop::WindowsDockerDesktopProvider;
 use windows_podman::WindowsPodmanProvider;
+
+pub use provider::{RuntimeAction, RuntimeDimension, RuntimeProfile};
 
 #[derive(Debug, Serialize)]
 pub struct RuntimeStatus {
+    pub providers: Vec<RuntimeProviderStatus>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeProviderStatus {
     pub provider_id: String,
     pub display_name: String,
     pub product: String,
@@ -25,38 +34,6 @@ pub struct RuntimeStatus {
     pub remediation: Vec<String>,
     pub actions: Vec<RuntimeAction>,
     pub profiles: Vec<RuntimeProfile>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct RuntimeDimension {
-    pub state: String,
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RuntimeAction {
-    pub id: String,
-    pub label: String,
-    pub destructive: bool,
-    pub enabled: bool,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct RuntimeProfile {
-    pub id: String,
-    pub provider_id: String,
-    pub provider_runtime_key: String,
-    pub display_name: String,
-    pub product: String,
-    pub platform: String,
-    pub installation: RuntimeDimension,
-    pub process: RuntimeDimension,
-    pub connection: RuntimeDimension,
-    pub endpoint_summary: Option<String>,
-    pub is_selected: bool,
-    pub observed_at_ms: i64,
-    pub freshness: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,28 +50,47 @@ pub struct RuntimeLogLine {
     pub message: String,
 }
 
-pub async fn status(db: &Database) -> Result<RuntimeStatus, turso::Error> {
-    let provider = WindowsPodmanProvider;
-    let observation = provider.detect();
-    persist_profiles(db, &observation.profiles).await?;
-    let profiles = list_profiles(db).await?;
-    let actions = planned_actions(&observation, &profiles);
+/// The full set of runtime providers Studio knows how to detect and manage.
+/// Add a new provider implementation and register it here to extend Runtime
+/// support to another platform or product.
+fn registered_providers() -> Vec<Box<dyn RuntimeProvider>> {
+    vec![
+        Box::new(WindowsPodmanProvider),
+        Box::new(WindowsDockerDesktopProvider),
+    ]
+}
 
-    Ok(RuntimeStatus {
-        provider_id: provider.id().to_owned(),
-        display_name: provider.display_name().to_owned(),
-        product: provider.product().to_owned(),
-        platform: provider.platform().to_owned(),
-        supported: provider.supported(),
-        installation: observation.installation,
-        process: observation.process,
-        connection: observation.connection,
-        freshness: "fresh".to_owned(),
-        summary: observation.summary,
-        remediation: observation.remediation,
-        actions,
-        profiles,
-    })
+fn find_provider(provider_id: &str) -> Option<Box<dyn RuntimeProvider>> {
+    registered_providers()
+        .into_iter()
+        .find(|provider| provider.id() == provider_id)
+}
+
+pub async fn status(db: &Database) -> Result<RuntimeStatus, turso::Error> {
+    let mut providers = Vec::new();
+    for provider in registered_providers() {
+        let observation = provider.detect();
+        persist_profiles(db, &observation.profiles).await?;
+        let profiles = list_profiles_for_provider(db, provider.id()).await?;
+        let actions = provider.planned_actions(&observation, &profiles);
+        providers.push(RuntimeProviderStatus {
+            provider_id: provider.id().to_owned(),
+            display_name: provider.display_name().to_owned(),
+            product: provider.product().to_owned(),
+            platform: provider.platform().to_owned(),
+            supported: provider.supported(),
+            installation: observation.installation,
+            process: observation.process,
+            connection: observation.connection,
+            freshness: "fresh".to_owned(),
+            summary: observation.summary,
+            remediation: observation.remediation,
+            actions,
+            profiles,
+        });
+    }
+
+    Ok(RuntimeStatus { providers })
 }
 
 pub async fn select_profile(db: &Database, profile_id: &str) -> Result<bool, turso::Error> {
@@ -141,24 +137,34 @@ pub async fn selected_engine_endpoint(
         return Ok(None);
     }
 
-    Ok(match provider_id.as_str() {
-        "windows-podman" => WindowsPodmanProvider::endpoint_for_runtime_key(&provider_runtime_key),
-        _ => None,
-    })
+    Ok(find_provider(&provider_id)
+        .and_then(|provider| provider.endpoint_for_runtime_key(&provider_runtime_key)))
 }
 
-pub async fn action(db: &Database, action: &str) -> Result<RuntimeActionResult, turso::Error> {
-    let provider = WindowsPodmanProvider;
+pub async fn action(
+    db: &Database,
+    provider_id: &str,
+    action: &str,
+) -> Result<RuntimeActionResult, turso::Error> {
+    let Some(provider) = find_provider(provider_id) else {
+        return Ok(RuntimeActionResult {
+            action: action.to_owned(),
+            status: "not_executed".to_owned(),
+            message: format!("Unknown runtime provider `{provider_id}`."),
+            next_steps: vec!["Recheck runtime status to see available providers.".to_owned()],
+        });
+    };
+
     let observation = provider.detect();
     persist_profiles(db, &observation.profiles).await?;
-    let profiles = list_profiles(db).await?;
-    let actions = planned_actions(&observation, &profiles);
+    let profiles = list_profiles_for_provider(db, provider_id).await?;
+    let actions = provider.planned_actions(&observation, &profiles);
     let Some(action_state) = actions.iter().find(|candidate| candidate.id == action) else {
         return Ok(RuntimeActionResult {
             action: action.to_owned(),
             status: "not_executed".to_owned(),
             message: "Unknown runtime action.".to_owned(),
-            next_steps: vec!["Use one of: install, start, stop, restart.".to_owned()],
+            next_steps: vec!["Recheck runtime status to see available actions.".to_owned()],
         });
     };
 
@@ -175,18 +181,7 @@ pub async fn action(db: &Database, action: &str) -> Result<RuntimeActionResult, 
         });
     }
 
-    let command = if action == "install" {
-        provider.command_for_profile_action("default", action)
-    } else {
-        profiles
-            .iter()
-            .find(|profile| profile.is_selected && profile.provider_id == provider.id())
-            .and_then(|profile| {
-                provider.command_for_profile_action(&profile.provider_runtime_key, action)
-            })
-    };
-
-    let Some(command) = command else {
+    let Some(command) = provider.command_for_action(action, &profiles) else {
         return Ok(RuntimeActionResult {
             action: action.to_owned(),
             status: "not_executed".to_owned(),
@@ -219,111 +214,34 @@ pub async fn action(db: &Database, action: &str) -> Result<RuntimeActionResult, 
 }
 
 pub fn logs() -> Vec<RuntimeLogLine> {
-    let provider = WindowsPodmanProvider;
-    let observation = provider.detect();
-    let mut lines = vec![
-        RuntimeLogLine {
+    let mut lines = Vec::new();
+    for provider in registered_providers() {
+        let observation = provider.detect();
+        lines.push(RuntimeLogLine {
             level: "info".to_owned(),
             message: format!(
                 "{} status: {}",
                 provider.display_name(),
                 observation.installation.state
             ),
-        },
-        RuntimeLogLine {
-            level: if provider.supported() { "info" } else { "warn" }.to_owned(),
-            message: observation.summary,
-        },
-    ];
-
-    for step in observation.remediation {
-        lines.push(RuntimeLogLine {
-            level: "info".to_owned(),
-            message: step,
         });
+        lines.push(RuntimeLogLine {
+            level: if provider.supported() { "info" } else { "warn" }.to_owned(),
+            message: format!("{}: {}", provider.display_name(), observation.summary),
+        });
+        for step in observation.remediation {
+            lines.push(RuntimeLogLine {
+                level: "info".to_owned(),
+                message: format!("{}: {step}", provider.display_name()),
+            });
+        }
     }
 
     lines
 }
 
-fn planned_actions(
-    observation: &RuntimeObservation,
-    profiles: &[RuntimeProfile],
-) -> Vec<RuntimeAction> {
-    let supported = cfg!(target_os = "windows");
-    let installed = observation.installation.state == "installed";
-    let missing = observation.installation.state == "not_installed";
-    let selected = profiles
-        .iter()
-        .find(|profile| profile.is_selected && profile.provider_id == "windows-podman");
-    let selected_running = selected.is_some_and(|profile| profile.process.state == "running");
-    let selected_stopped = selected.is_some_and(|profile| profile.process.state == "stopped");
-    let winget_check = supported
-        .then(|| command_output("winget", &["--version"]))
-        .transpose();
-    let winget_available = matches!(winget_check, Ok(Some(_)));
-    let winget_reason = match &winget_check {
-        Ok(Some(_)) => "Install Podman with winget.",
-        Ok(None) => "Runtime install is only available on Windows in this phase.",
-        Err(_) => "winget is unavailable from the daemon session.",
-    };
-
-    vec![
-        RuntimeAction {
-            id: "install".to_owned(),
-            label: "Install".to_owned(),
-            destructive: false,
-            enabled: supported && missing && winget_available,
-            reason: if !supported {
-                "Runtime install is only available on Windows in this phase."
-            } else if !missing {
-                "Podman is already installed or the install state is unknown."
-            } else {
-                winget_reason
-            }
-            .to_owned(),
-        },
-        RuntimeAction {
-            id: "start".to_owned(),
-            label: "Start".to_owned(),
-            destructive: false,
-            enabled: supported && installed && selected_stopped,
-            reason: if selected_stopped {
-                "Start the selected Podman machine."
-            } else {
-                "Select a stopped Podman machine first."
-            }
-            .to_owned(),
-        },
-        RuntimeAction {
-            id: "stop".to_owned(),
-            label: "Stop".to_owned(),
-            destructive: false,
-            enabled: supported && installed && selected_running,
-            reason: if selected_running {
-                "Stop the selected Podman machine."
-            } else {
-                "Select a running Podman machine first."
-            }
-            .to_owned(),
-        },
-        RuntimeAction {
-            id: "restart".to_owned(),
-            label: "Restart".to_owned(),
-            destructive: false,
-            enabled: supported && installed && selected_running,
-            reason: if selected_running {
-                "Restart the selected Podman machine."
-            } else {
-                "Select a running Podman machine first."
-            }
-            .to_owned(),
-        },
-    ]
-}
-
-pub(crate) fn dimension(state: &str, detail: Option<&str>) -> RuntimeDimension {
-    RuntimeDimension {
+pub(crate) fn dimension(state: &str, detail: Option<&str>) -> provider::RuntimeDimension {
+    provider::RuntimeDimension {
         state: state.to_owned(),
         detail: detail.map(str::to_owned),
     }
@@ -345,25 +263,81 @@ pub(crate) fn command_output(program: &str, args: &[&str]) -> Result<String, Str
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Runs a runtime command, retrying once via the OS's own UAC consent prompt
+/// when the command is marked `elevate_if_needed` and the unelevated attempt
+/// fails. This is a one-shot elevation per action (no persistent privileged
+/// helper), matching the Phase 9 design's `2026-07-06-privileged-helper-design.md`.
 async fn run_command(command: &RuntimeCommand) -> Result<String, String> {
+    match run_once(command.program, &command.args, command.timeout_secs).await {
+        Ok(output) => Ok(output),
+        Err(error) if command.elevate_if_needed => {
+            run_elevated(command.program, &command.args, command.timeout_secs)
+                .await
+                .map_err(|elevated_error| {
+                    format!("{error}; elevated retry also failed: {elevated_error}")
+                })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn run_once(program: &str, args: &[String], timeout_secs: u64) -> Result<String, String> {
     let output = timeout(
-        Duration::from_secs(command.timeout_secs),
-        tokio::process::Command::new(command.program)
-            .args(&command.args)
-            .output(),
+        Duration::from_secs(timeout_secs),
+        tokio::process::Command::new(program).args(args).output(),
     )
     .await
-    .map_err(|_| format!("{} timed out", command.program))?
+    .map_err(|_| format!("{program} timed out"))?
     .map_err(|error| error.to_string())?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         return Err(if stderr.is_empty() {
-            format!("{} exited with {}", command.program, output.status)
+            format!("{program} exited with {}", output.status)
         } else {
             stderr
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+async fn run_elevated(program: &str, args: &[String], timeout_secs: u64) -> Result<String, String> {
+    let argument_list = args
+        .iter()
+        .map(|arg| format!("'{}'", arg.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let start_process = if argument_list.is_empty() {
+        format!("Start-Process -FilePath '{program}' -Verb RunAs -Wait -PassThru")
+    } else {
+        format!(
+            "Start-Process -FilePath '{program}' -ArgumentList {argument_list} -Verb RunAs -Wait -PassThru"
+        )
+    };
+    let ps_command = format!("$p = {start_process}; exit $p.ExitCode");
+
+    let output = timeout(
+        Duration::from_secs(timeout_secs),
+        tokio::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &ps_command,
+            ])
+            .output(),
+    )
+    .await
+    .map_err(|_| "elevated command timed out".to_owned())?
+    .map_err(|error| error.to_string())?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "elevated command exited with {} (the UAC prompt may have been declined)",
+            output.status
+        ));
+    }
+    Ok(String::new())
 }
 
 async fn persist_profiles(db: &Database, profiles: &[RuntimeProfile]) -> Result<(), turso::Error> {
@@ -412,7 +386,10 @@ async fn persist_profiles(db: &Database, profiles: &[RuntimeProfile]) -> Result<
     Ok(())
 }
 
-async fn list_profiles(db: &Database) -> Result<Vec<RuntimeProfile>, turso::Error> {
+async fn list_profiles_for_provider(
+    db: &Database,
+    provider_id: &str,
+) -> Result<Vec<RuntimeProfile>, turso::Error> {
     let conn = db.connect()?;
     let mut rows = conn
         .query(
@@ -420,8 +397,8 @@ async fn list_profiles(db: &Database) -> Result<Vec<RuntimeProfile>, turso::Erro
                     installation_state, installation_detail, process_state, process_detail,
                     connection_state, connection_detail, endpoint_summary, is_selected,
                     observed_at_ms
-             FROM runtime_profiles ORDER BY is_selected DESC, display_name ASC",
-            (),
+             FROM runtime_profiles WHERE provider_id = ?1 ORDER BY is_selected DESC, display_name ASC",
+            params![provider_id.to_owned()],
         )
         .await?;
     let mut profiles = Vec::new();

@@ -3,7 +3,10 @@ use susun::EngineEndpoint;
 
 use super::{
     RuntimeProfile, command_output, dimension, now_ms,
-    provider::{EndpointSummary, RuntimeCommand, RuntimeObservation, RuntimeProvider, profile_id},
+    provider::{
+        EndpointSummary, RuntimeAction, RuntimeCommand, RuntimeObservation, RuntimeProvider,
+        profile_id,
+    },
 };
 
 pub struct WindowsPodmanProvider;
@@ -62,20 +65,103 @@ impl RuntimeProvider for WindowsPodmanProvider {
             Err(error) => self.detect_missing(error.trim()),
         }
     }
-}
 
-impl WindowsPodmanProvider {
-    pub fn endpoint_for_runtime_key(provider_runtime_key: &str) -> Option<EngineEndpoint> {
-        let machine_name = provider_runtime_key.strip_prefix("machine/")?;
-        let pipe = machine_pipe_from_inspect(machine_name)
-            .unwrap_or_else(|| format!(r"\\.\pipe\podman-machine-{machine_name}"));
-        Some(EngineEndpoint::WindowsNamedPipe(pipe.into()))
+    fn planned_actions(
+        &self,
+        observation: &RuntimeObservation,
+        profiles: &[RuntimeProfile],
+    ) -> Vec<RuntimeAction> {
+        let supported = self.supported();
+        let installed = observation.installation.state == "installed";
+        let missing = observation.installation.state == "not_installed";
+        let not_created = observation.process.state == "not_created";
+        let selected = profiles
+            .iter()
+            .find(|profile| profile.is_selected && profile.provider_id == self.id());
+        let selected_running = selected.is_some_and(|profile| profile.process.state == "running");
+        let selected_stopped = selected.is_some_and(|profile| profile.process.state == "stopped");
+        let winget_check = supported
+            .then(|| command_output("winget", &["--version"]))
+            .transpose();
+        let winget_available = matches!(winget_check, Ok(Some(_)));
+        let winget_reason = match &winget_check {
+            Ok(Some(_)) => "Install Podman with winget.",
+            Ok(None) => "Runtime install is only available on Windows in this phase.",
+            Err(_) => "winget is unavailable from the daemon session.",
+        };
+
+        vec![
+            RuntimeAction {
+                id: "install".to_owned(),
+                label: "Install".to_owned(),
+                destructive: false,
+                enabled: supported && missing && winget_available,
+                reason: if !supported {
+                    "Runtime install is only available on Windows in this phase."
+                } else if !missing {
+                    "Podman is already installed or the install state is unknown."
+                } else {
+                    winget_reason
+                }
+                .to_owned(),
+            },
+            RuntimeAction {
+                id: "init".to_owned(),
+                label: "Initialize".to_owned(),
+                destructive: false,
+                enabled: supported && installed && not_created,
+                reason: if not_created {
+                    "Create a Podman machine."
+                } else if !installed {
+                    "Install Podman first."
+                } else {
+                    "A Podman machine already exists."
+                }
+                .to_owned(),
+            },
+            RuntimeAction {
+                id: "start".to_owned(),
+                label: "Start".to_owned(),
+                destructive: false,
+                enabled: supported && installed && selected_stopped,
+                reason: if selected_stopped {
+                    "Start the selected Podman machine."
+                } else {
+                    "Select a stopped Podman machine first."
+                }
+                .to_owned(),
+            },
+            RuntimeAction {
+                id: "stop".to_owned(),
+                label: "Stop".to_owned(),
+                destructive: false,
+                enabled: supported && installed && selected_running,
+                reason: if selected_running {
+                    "Stop the selected Podman machine."
+                } else {
+                    "Select a running Podman machine first."
+                }
+                .to_owned(),
+            },
+            RuntimeAction {
+                id: "restart".to_owned(),
+                label: "Restart".to_owned(),
+                destructive: false,
+                enabled: supported && installed && selected_running,
+                reason: if selected_running {
+                    "Restart the selected Podman machine."
+                } else {
+                    "Select a running Podman machine first."
+                }
+                .to_owned(),
+            },
+        ]
     }
 
-    pub fn command_for_profile_action(
+    fn command_for_action(
         &self,
-        provider_runtime_key: &str,
         action: &str,
+        profiles: &[RuntimeProfile],
     ) -> Option<RuntimeCommand> {
         if !self.supported() {
             return None;
@@ -94,49 +180,57 @@ impl WindowsPodmanProvider {
                 ],
                 timeout_secs: 30 * 60,
                 success_message: "Podman install command finished.".to_owned(),
+                elevate_if_needed: true,
             }),
-            "start" | "stop" => {
-                let machine = provider_runtime_key.strip_prefix("machine/")?;
+            "init" => Some(RuntimeCommand {
+                program: "podman",
+                args: vec!["machine".to_owned(), "init".to_owned()],
+                timeout_secs: 10 * 60,
+                success_message: "Podman machine created. Use Start to bring it online.".to_owned(),
+                elevate_if_needed: false,
+            }),
+            "start" | "stop" | "restart" => {
+                let profile = profiles
+                    .iter()
+                    .find(|profile| profile.is_selected && profile.provider_id == self.id())?;
+                let machine = profile.provider_runtime_key.strip_prefix("machine/")?;
                 Some(RuntimeCommand {
                     program: "podman",
                     args: vec!["machine".to_owned(), action.to_owned(), machine.to_owned()],
                     timeout_secs: 5 * 60,
                     success_message: format!("Podman machine {action} command finished."),
-                })
-            }
-            "restart" => {
-                let machine = provider_runtime_key.strip_prefix("machine/")?;
-                Some(RuntimeCommand {
-                    program: "podman",
-                    args: vec![
-                        "machine".to_owned(),
-                        "restart".to_owned(),
-                        machine.to_owned(),
-                    ],
-                    timeout_secs: 5 * 60,
-                    success_message: "Podman machine restart command finished.".to_owned(),
+                    elevate_if_needed: false,
                 })
             }
             _ => None,
         }
     }
 
+    fn endpoint_for_runtime_key(&self, provider_runtime_key: &str) -> Option<EngineEndpoint> {
+        let machine_name = provider_runtime_key.strip_prefix("machine/")?;
+        let pipe = machine_pipe_from_inspect(machine_name)
+            .unwrap_or_else(|| format!(r"\\.\pipe\podman-machine-{machine_name}"));
+        Some(EngineEndpoint::WindowsNamedPipe(pipe.into()))
+    }
+}
+
+impl WindowsPodmanProvider {
     fn detect_installed(&self, version: &str) -> RuntimeObservation {
         let machine_profiles = self.machine_profiles(version);
         if machine_profiles.is_empty() {
             return RuntimeObservation {
                 installation: dimension("installed", Some(version)),
-                process: dimension("stopped", Some("No Podman machine was detected.")),
+                process: dimension("not_created", Some("No Podman machine was detected.")),
                 connection: dimension("not_applicable", None),
                 summary: "Podman is installed, but no machine was detected.".to_owned(),
                 remediation: vec![
-                    "Next: prepare a trusted setup plan to create a Podman machine.".to_owned(),
+                    "Next: click Initialize to create a Podman machine.".to_owned(),
                     "Manual setup for now: podman machine init && podman machine start".to_owned(),
                 ],
                 profiles: vec![self.placeholder_profile(
                     "installed",
                     Some(version),
-                    "stopped",
+                    "not_created",
                     Some("No Podman machine was detected."),
                     "not_applicable",
                     None,

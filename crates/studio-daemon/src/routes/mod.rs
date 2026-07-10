@@ -57,7 +57,7 @@ pub fn app(state: AppState) -> Router {
             post(runtime::select_runtime_profile),
         )
         .route(
-            "/v1/runtime/actions/{action}",
+            "/v1/runtime/providers/{provider_id}/actions/{action}",
             post(runtime::runtime_action),
         )
         .route("/v1/projects/{id}/actions/up", post(jobs::action_up))

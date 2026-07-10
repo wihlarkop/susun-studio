@@ -43,9 +43,17 @@ pub async fn select_runtime_profile(
 pub async fn runtime_action(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(action): Path<String>,
+    Path((provider_id, action)): Path<(String, String)>,
 ) -> Result<Json<runtime::RuntimeActionResult>, ApiError> {
     authorize(&state, &headers)?;
-    logging::warn("runtime_action_requested", &[("action", action.clone())]);
-    Ok(Json(runtime::action(&state.db, &action).await?))
+    logging::warn(
+        "runtime_action_requested",
+        &[
+            ("provider_id", provider_id.clone()),
+            ("action", action.clone()),
+        ],
+    );
+    Ok(Json(
+        runtime::action(&state.db, &provider_id, &action).await?,
+    ))
 }
