@@ -39,7 +39,9 @@ pub(crate) async fn engine_context(
     project_id: &str,
 ) -> Result<(RuntimeContext, BollardEngine), ApiError> {
     let source = load_project_source(state, project_id).await?;
-    let engine = susun_integration::connect_docker_engine().map_err(ApiError::EngineUnavailable)?;
+    let engine = susun_integration::connect_engine(&state.db)
+        .await
+        .map_err(ApiError::EngineUnavailable)?;
     let context = susun_integration::runtime_context(
         &source.files,
         source.env_file.as_ref(),

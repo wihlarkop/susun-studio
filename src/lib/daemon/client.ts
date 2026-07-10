@@ -188,6 +188,72 @@ type EngineListResponse = {
   engines: StudioEngine[];
 };
 
+export type RuntimeDimension = {
+  state: string;
+  detail: string | null;
+};
+
+export type RuntimeAction = {
+  id: "install" | "start" | "stop" | "restart";
+  label: string;
+  destructive: boolean;
+  enabled: boolean;
+  reason: string;
+};
+
+export type RuntimeProfile = {
+  id: string;
+  provider_id: string;
+  provider_runtime_key: string;
+  display_name: string;
+  product: string;
+  platform: string;
+  installation: RuntimeDimension;
+  process: RuntimeDimension;
+  connection: RuntimeDimension;
+  endpoint_summary: string | RuntimeEndpointSummary | null;
+  is_selected: boolean;
+  observed_at_ms: number;
+  freshness: string;
+};
+
+export type RuntimeEndpointSummary = {
+  kind: string;
+  redacted: string;
+};
+
+export type RuntimeStatus = {
+  provider_id: string;
+  display_name: string;
+  product: string;
+  platform: string;
+  supported: boolean;
+  installation: RuntimeDimension;
+  process: RuntimeDimension;
+  connection: RuntimeDimension;
+  freshness: string;
+  summary: string;
+  remediation: string[];
+  actions: RuntimeAction[];
+  profiles: RuntimeProfile[];
+};
+
+export type RuntimeActionResult = {
+  action: string;
+  status: string;
+  message: string;
+  next_steps: string[];
+};
+
+export type RuntimeLogLine = {
+  level: string;
+  message: string;
+};
+
+type RuntimeLogsResponse = {
+  lines: RuntimeLogLine[];
+};
+
 export type JobStatus = "running" | "succeeded" | "failed" | "cancelled";
 
 export type JobExecutionSummary = {
@@ -428,6 +494,39 @@ export async function readEngineCapabilities(
   options: DaemonRequestOptions = {},
 ): Promise<EngineCapabilities> {
   return readJson(`/v1/engines/${encodeURIComponent(engineId)}/capabilities`, options);
+}
+
+export async function readRuntimeStatus(
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeStatus> {
+  return readJson("/v1/runtime/status", options);
+}
+
+export async function runRuntimeAction(
+  action: RuntimeAction["id"],
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeActionResult> {
+  return readJson(`/v1/runtime/actions/${encodeURIComponent(action)}`, {
+    ...options,
+    method: "POST",
+  });
+}
+
+export async function readRuntimeLogs(
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeLogLine[]> {
+  const response = await readJson<RuntimeLogsResponse>("/v1/runtime/logs", options);
+  return response.lines;
+}
+
+export async function selectRuntimeProfile(
+  profileId: string,
+  options: DaemonRequestOptions = {},
+): Promise<{ selected: boolean }> {
+  return readJson(`/v1/runtime/profiles/${encodeURIComponent(profileId)}/select`, {
+    ...options,
+    method: "POST",
+  });
 }
 
 export type PruneScope = "containers" | "networks" | "volumes" | "images";

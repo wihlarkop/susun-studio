@@ -6,7 +6,7 @@
   import type { StudioSettings } from "$lib/daemon/client";
   import type { HealthState } from "$lib/daemon/daemon-state.svelte";
 
-  type View = "projects" | "jobs";
+  type View = "projects" | "jobs" | "runtime";
 
   type NavItem = {
     label: string;
@@ -30,15 +30,15 @@
       view: "jobs",
     },
     {
+      label: "Runtime",
+      description: "Managed runtime setup and status",
+      icon: Server,
+      view: "runtime",
+    },
+    {
       label: "Reports",
       description: "Analysis and review history (planned)",
       icon: FileText,
-      planned: true,
-    },
-    {
-      label: "Engines",
-      description: "Docker-compatible runtimes (planned)",
-      icon: Server,
       planned: true,
     },
     {

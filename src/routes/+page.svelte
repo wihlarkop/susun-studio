@@ -7,6 +7,7 @@
   import ProjectWorkspace from "$lib/components/project-workspace.svelte";
   import EngineStatusCard from "$lib/components/engine-status-card.svelte";
   import JobsPage from "$lib/components/jobs-page.svelte";
+  import RuntimePage from "$lib/components/runtime-page.svelte";
   import ImportProjectDialog from "$lib/components/import-project-dialog.svelte";
   import BetaOnboardingPanel from "$lib/components/beta-onboarding-panel.svelte";
   import { createDaemonState } from "$lib/daemon/daemon-state.svelte";
@@ -14,7 +15,7 @@
 
   const daemonState = createDaemonState();
   let importDialogOpen = $state(false);
-  let activeView = $state<"projects" | "jobs">("projects");
+  let activeView = $state<"projects" | "jobs" | "runtime">("projects");
   let selectedProjectId = $state<string | null>(null);
   const selectedProject = $derived(
     daemonState.projects.find((project) => project.id === selectedProjectId) ??
@@ -101,8 +102,10 @@
           onRemoved={handleProjectRemoved}
         />
         <ProjectWorkspace project={selectedProject} />
-      {:else}
+      {:else if activeView === "jobs"}
         <JobsPage projects={daemonState.projects} />
+      {:else}
+        <RuntimePage />
       {/if}
     </div>
   </Sidebar.Inset>

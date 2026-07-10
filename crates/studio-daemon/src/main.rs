@@ -7,6 +7,7 @@ mod logging;
 mod plans_maintenance;
 mod project_source;
 mod routes;
+mod runtime;
 mod state;
 mod susun_integration;
 mod watch;

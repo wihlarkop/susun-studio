@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS runtime_profiles (
+    id TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL,
+    provider_runtime_key TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    product TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    installation_state TEXT NOT NULL,
+    installation_detail TEXT,
+    process_state TEXT NOT NULL,
+    process_detail TEXT,
+    connection_state TEXT NOT NULL,
+    connection_detail TEXT,
+    endpoint_summary TEXT,
+    is_selected INTEGER NOT NULL DEFAULT 0,
+    observed_at_ms INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    UNIQUE(provider_id, provider_runtime_key)
+);

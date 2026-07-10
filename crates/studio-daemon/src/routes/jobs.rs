@@ -110,8 +110,11 @@ pub(crate) async fn start_up_job(
     options: susun::UpPlanOptions,
 ) -> Result<Json<JobResponse>, ApiError> {
     let source = load_project_source(&state, &project_id).await?;
-    let engine =
-        Arc::new(susun_integration::connect_docker_engine().map_err(ApiError::EngineUnavailable)?);
+    let engine = Arc::new(
+        susun_integration::connect_engine(&state.db)
+            .await
+            .map_err(ApiError::EngineUnavailable)?,
+    );
 
     // Plan up front so we can hand the UI a named step manifest, then execute
     // that same plan (no double-planning).
@@ -178,8 +181,11 @@ async fn start_down_job(
     options: susun::DownPlanOptions,
 ) -> Result<Json<JobResponse>, ApiError> {
     let source = load_project_source(&state, &project_id).await?;
-    let engine =
-        Arc::new(susun_integration::connect_docker_engine().map_err(ApiError::EngineUnavailable)?);
+    let engine = Arc::new(
+        susun_integration::connect_engine(&state.db)
+            .await
+            .map_err(ApiError::EngineUnavailable)?,
+    );
 
     let (plan, manifest) = susun_integration::plan_down_for_execution(
         &source.files,

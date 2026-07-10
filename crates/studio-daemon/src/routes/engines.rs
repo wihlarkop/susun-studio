@@ -92,7 +92,7 @@ pub async fn engine_health(
     logging::info("engine_health_started", &[("engine_id", engine_id.clone())]);
 
     // Connect and check Docker (no DB cursor open here).
-    let health = match susun_integration::connect_docker_engine() {
+    let health = match susun_integration::connect_engine(&state.db).await {
         Ok(engine) => susun_integration::engine_health(&engine).await,
         Err(error) => susun_integration::EngineHealthRow {
             reachable: false,
@@ -149,7 +149,9 @@ pub async fn engine_capabilities(
 ) -> Result<Json<EngineCapabilitiesResponse>, ApiError> {
     authorize(&state, &headers)?;
 
-    let engine = susun_integration::connect_docker_engine().map_err(ApiError::EngineUnavailable)?;
+    let engine = susun_integration::connect_engine(&state.db)
+        .await
+        .map_err(ApiError::EngineUnavailable)?;
     let capabilities = susun_integration::engine_capabilities(&engine)
         .await
         .map_err(ApiError::EngineUnavailable)?;
@@ -197,7 +199,9 @@ pub async fn prune_engine(
         ],
     );
 
-    let engine = susun_integration::connect_docker_engine().map_err(ApiError::EngineUnavailable)?;
+    let engine = susun_integration::connect_engine(&state.db)
+        .await
+        .map_err(ApiError::EngineUnavailable)?;
     let report = susun_integration::system_prune(&engine, &request.scopes, request.all_images)
         .await
         .map_err(ApiError::EngineUnavailable)?;

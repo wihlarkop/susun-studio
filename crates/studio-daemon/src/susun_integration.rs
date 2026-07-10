@@ -1,13 +1,14 @@
 use std::{path::PathBuf, sync::Arc, time::SystemTime};
 
 use susun::{
-    CancellationToken, ContainerEngine, DownPlanOptions, EngineCapabilities, EngineSnapshot,
-    EventSink, ExecutionPlan, ExecutionReport, PlanOutcome, ProjectSummary, Runtime, SdkProject,
-    SusunWorkspace, UpPlanOptions, render_diagnostics_json, render_plan_json,
+    CancellationToken, ContainerEngine, DownPlanOptions, EngineCapabilities, EngineEndpoint,
+    EngineSnapshot, EventSink, ExecutionPlan, ExecutionReport, PlanOutcome, ProjectSummary,
+    Runtime, SdkProject, SusunWorkspace, UpPlanOptions, render_diagnostics_json, render_plan_json,
 };
 use susun_engine_bollard::BollardEngine;
+use turso::Database;
 
-use crate::error::ApiError;
+use crate::{error::ApiError, runtime};
 
 pub struct AnalyzedImport {
     pub source_id: Option<String>,
@@ -224,10 +225,14 @@ pub struct EngineCapabilitiesRow {
     pub max_container_name_length: Option<usize>,
 }
 
-/// Constructs a local Docker client handle. This does not contact Docker; a
-/// stopped daemon surfaces later as an error from the first real API call.
-pub fn connect_docker_engine() -> Result<BollardEngine, String> {
-    BollardEngine::connect_local().map_err(|error| error.to_string())
+/// Constructs a Docker-compatible client handle from Studio's selected runtime
+/// profile when available, otherwise Bollard's platform local default.
+pub async fn connect_engine(db: &Database) -> Result<BollardEngine, String> {
+    let endpoint = runtime::selected_engine_endpoint(db)
+        .await
+        .map_err(|error| error.to_string())?
+        .unwrap_or(EngineEndpoint::Local);
+    BollardEngine::connect_to(endpoint).map_err(|error| error.to_string())
 }
 
 /// Checks engine reachability by requesting its capabilities.

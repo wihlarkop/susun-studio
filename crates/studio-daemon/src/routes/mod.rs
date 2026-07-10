@@ -5,6 +5,7 @@ mod jobs;
 mod observe;
 mod plans;
 mod projects;
+mod runtime;
 mod service_actions;
 mod settings;
 mod watch;
@@ -49,6 +50,16 @@ pub fn app(state: AppState) -> Router {
             get(engines::engine_capabilities),
         )
         .route("/v1/engines/{id}/prune", post(engines::prune_engine))
+        .route("/v1/runtime/status", get(runtime::runtime_status))
+        .route("/v1/runtime/logs", get(runtime::runtime_logs))
+        .route(
+            "/v1/runtime/profiles/{id}/select",
+            post(runtime::select_runtime_profile),
+        )
+        .route(
+            "/v1/runtime/actions/{action}",
+            post(runtime::runtime_action),
+        )
         .route("/v1/projects/{id}/actions/up", post(jobs::action_up))
         .route("/v1/projects/{id}/actions/down", post(jobs::action_down))
         .route("/v1/projects/{id}/actions/clean", post(jobs::action_clean))

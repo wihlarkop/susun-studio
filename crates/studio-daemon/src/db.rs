@@ -48,6 +48,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "watch",
         sql: include_str!("../migrations/0009_watch.sql"),
     },
+    Migration {
+        version: 10,
+        name: "runtime_profiles",
+        sql: include_str!("../migrations/0010_runtime_profiles.sql"),
+    },
 ];
 
 #[derive(Debug, thiserror::Error)]

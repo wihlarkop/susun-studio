@@ -71,6 +71,9 @@ pub enum ApiError {
     #[error("watch session not found")]
     WatchNotFound,
 
+    #[error("runtime profile not found")]
+    RuntimeProfileNotFound,
+
     #[error("planning failed: {0}")]
     PlanningFailed(String),
 
@@ -113,7 +116,8 @@ impl IntoResponse for ApiError {
             | Self::PlanNotFound
             | Self::JobNotFound
             | Self::ServiceNotFound
-            | Self::WatchNotFound => StatusCode::NOT_FOUND,
+            | Self::WatchNotFound
+            | Self::RuntimeProfileNotFound => StatusCode::NOT_FOUND,
             Self::EngineUnavailable(_) => StatusCode::BAD_GATEWAY,
             Self::InvalidImport(_) | Self::PlanningFailed(_) | Self::ActionUnavailable(_) => {
                 StatusCode::UNPROCESSABLE_ENTITY
