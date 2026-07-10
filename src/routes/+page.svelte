@@ -5,7 +5,7 @@
   import HeroPanel from "$lib/components/hero-panel.svelte";
   import ProjectsTable from "$lib/components/projects-table.svelte";
   import ProjectWorkspace from "$lib/components/project-workspace.svelte";
-  import EngineStatusCard from "$lib/components/engine-status-card.svelte";
+  import ActiveEngineStrip from "$lib/components/active-engine-strip.svelte";
   import JobsPage from "$lib/components/jobs-page.svelte";
   import RuntimePage from "$lib/components/runtime-page.svelte";
   import ImportProjectDialog from "$lib/components/import-project-dialog.svelte";
@@ -90,10 +90,17 @@
         <BetaOnboardingPanel
           healthState={daemonState.healthState}
           projectCount={daemonState.projects.length}
+          runtimeProfiles={daemonState.runtimeProfiles}
           onImportClick={() => (importDialogOpen = true)}
           onRetry={daemonState.refresh}
+          onSetupRuntime={() => (activeView = "runtime")}
         />
-        <EngineStatusCard />
+        <ActiveEngineStrip
+          profiles={daemonState.runtimeProfiles}
+          connected={daemonState.healthState.kind === "connected"}
+          onManageRuntimes={() => (activeView = "runtime")}
+          onChanged={() => daemonState.refresh()}
+        />
         <ProjectsTable
           projects={daemonState.projects}
           workspaceDetail={daemonState.workspaceDetail}

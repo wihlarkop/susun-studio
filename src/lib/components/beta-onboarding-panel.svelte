@@ -3,69 +3,46 @@
   import { Badge } from "$lib/components/ui/badge/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
   import { CheckCircle2, CircleAlert, FolderPlus, RefreshCw, Server } from "@lucide/svelte";
-  import {
-    listEngines,
-    readEngineHealth,
-    type StudioEngine,
-  } from "$lib/daemon/client";
+  import { readRuntimeStatus, type RuntimeProfile } from "$lib/daemon/client";
   import type { HealthState } from "$lib/daemon/daemon-state.svelte";
 
   let {
     healthState,
     projectCount,
+    runtimeProfiles,
     onImportClick,
     onRetry,
+    onSetupRuntime,
   }: {
     healthState: HealthState;
     projectCount: number;
+    runtimeProfiles: RuntimeProfile[];
     onImportClick: () => void;
     onRetry: () => void;
+    onSetupRuntime: () => void;
   } = $props();
 
-  let engine = $state<StudioEngine | null>(null);
-  let engineError = $state<string | null>(null);
   let checkingEngine = $state(false);
 
   const connected = $derived(healthState.kind === "connected");
   const hasProjects = $derived(projectCount > 0);
-  const engineReachable = $derived(engine?.last_health?.reachable === true);
-  const showPanel = $derived(!connected || !hasProjects || !engineReachable);
+  const selectedProfile = $derived(
+    runtimeProfiles.find((profile) => profile.is_selected) ?? null,
+  );
+  const engineReady = $derived(selectedProfile?.connection.state === "summarized");
+  const showPanel = $derived(!connected || !hasProjects || !engineReady);
 
-  $effect(() => {
-    if (!connected) {
-      engine = null;
-      engineError = null;
-      return;
-    }
-
-    const controller = new AbortController();
-    void refreshEngine(controller.signal);
-    return () => controller.abort();
-  });
-
-  async function refreshEngine(signal?: AbortSignal) {
+  // Re-runs provider detection daemon-side (repersisting profiles), then
+  // refreshes shared state so the new observations land everywhere.
+  async function recheckEngine() {
     checkingEngine = true;
-    engineError = null;
     try {
-      const engines = await listEngines({ signal });
-      const selected = engines.find((item) => item.is_default) ?? engines[0] ?? null;
-      if (!selected) {
-        engine = null;
-        engineError = "No engine provider is registered.";
-        return;
-      }
-      const health = await readEngineHealth(selected.id, { signal });
-      engine = { ...selected, last_health: health };
-      engineError = health.error;
-    } catch (error) {
-      if (!signal?.aborted) {
-        engine = null;
-        engineError = error instanceof Error ? error.message : "Engine check failed.";
-      }
+      await readRuntimeStatus();
+    } catch {
+      // detection failure surfaces through the profiles list staying stale
     } finally {
-      if (!signal?.aborted) {
-        checkingEngine = false;
-      }
+      checkingEngine = false;
+      onRetry();
     }
   }
 
@@ -79,8 +56,8 @@
     <div class="flex flex-col gap-1">
       <div class="flex flex-wrap items-center gap-2">
         <h2 class="text-base font-semibold">Beta setup</h2>
-        <Badge variant={connected && engineReachable && hasProjects ? "default" : "secondary"}>
-          {connected && engineReachable && hasProjects ? "Ready" : "Needs attention"}
+        <Badge variant={connected && engineReady && hasProjects ? "default" : "secondary"}>
+          {connected && engineReady && hasProjects ? "Ready" : "Needs attention"}
         </Badge>
       </div>
       <p class="max-w-2xl text-sm text-muted-foreground">
@@ -111,7 +88,7 @@
       </div>
 
       <div class="flex min-w-0 gap-3 rounded-md border p-3">
-        {#if engineReachable}
+        {#if engineReady}
           <CheckCircle2 class="mt-0.5 size-4 shrink-0 text-primary" />
         {:else}
           <Server class="mt-0.5 size-4 shrink-0 text-muted-foreground" />
@@ -119,28 +96,31 @@
         <div class="min-w-0 space-y-2">
           <div class="flex items-center gap-2">
             <p class="text-sm font-medium">Engine</p>
-            <Badge variant={engineReachable ? "default" : "outline"} class="text-xs">
-              {engineReachable ? "Reachable" : "Check needed"}
+            <Badge variant={engineReady ? "default" : "outline"} class="text-xs">
+              {engineReady ? "Ready" : "Setup needed"}
             </Badge>
           </div>
           <p class="text-xs text-muted-foreground">
-            {engine?.display_name ?? "Local Docker-compatible engine"}
-            {#if engine?.last_health?.api_version}
-              , API {engine.last_health.api_version}
+            {#if selectedProfile}
+              {selectedProfile.display_name} — {selectedProfile.process.state.replace("_", " ")}
+            {:else}
+              No runtime selected yet. Set one up to run project actions.
             {/if}
           </p>
-          {#if engineError}
-            <p class="text-xs text-destructive">{engineError}</p>
-          {/if}
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={!connected || checkingEngine}
-            onclick={() => refreshEngine()}
-          >
-            <RefreshCw />
-            {checkingEngine ? "Checking" : "Recheck"}
-          </Button>
+          <div class="flex gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={!connected || checkingEngine}
+              onclick={recheckEngine}
+            >
+              <RefreshCw />
+              {checkingEngine ? "Checking" : "Recheck"}
+            </Button>
+            {#if !engineReady}
+              <Button size="sm" disabled={!connected} onclick={onSetupRuntime}>Set up</Button>
+            {/if}
+          </div>
         </div>
       </div>
 
