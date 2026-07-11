@@ -7,6 +7,7 @@ mod jobs;
 mod logging;
 mod plans_maintenance;
 mod project_source;
+mod restore;
 mod routes;
 mod runtime;
 mod state;
@@ -31,6 +32,11 @@ async fn run() -> Result<(), DaemonError> {
     logging::info("daemon_starting", &[]);
     let bind_addr = config::bind_addr()?;
     let db_path = config::db_path();
+    // Before opening the database, recover from an interrupted restore swap (a
+    // missing active database with a surviving rollback copy) and clear stale
+    // staged/pre-restore artifacts from a previous run.
+    restore::recover_incomplete_swap(&db_path);
+    restore::sweep_stale_artifacts(&db_path);
     let db = db::open_database(db_path.clone()).await?;
 
     match jobs::maintenance::reconcile_interrupted_jobs(&db).await {
@@ -65,6 +71,7 @@ async fn run() -> Result<(), DaemonError> {
         Err(error) => logging::error("plans_reredact_failed", &[("error", error.to_string())]),
     }
 
+    let restore = Arc::new(restore::RestoreCoordinator::new());
     let state = AppState {
         db: Arc::new(db),
         db_path: db_path.clone(),
@@ -72,6 +79,7 @@ async fn run() -> Result<(), DaemonError> {
         jobs: Arc::new(jobs::registry::JobRegistry::new()),
         stream_tickets: Arc::new(jobs::tickets::StreamTickets::new()),
         watch: Arc::new(watch::registry::WatchRegistry::new()),
+        restore: restore.clone(),
     };
 
     let listener = TcpListener::bind(bind_addr)
@@ -108,14 +116,23 @@ async fn run() -> Result<(), DaemonError> {
     );
 
     axum::serve(listener, routes::app(state))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(restore))
         .await
         .map_err(DaemonError::Serve)
 }
 
-async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        logging::error("shutdown_signal_failed", &[("error", error.to_string())]);
+/// The server drains and exits on either an OS interrupt or a restore swap
+/// request (the supervisor asks the daemon to release the database file).
+async fn shutdown_signal(restore: Arc<restore::RestoreCoordinator>) {
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            if let Err(error) = result {
+                logging::error("shutdown_signal_failed", &[("error", error.to_string())]);
+            }
+            logging::info("shutdown_signal_received", &[]);
+        }
+        () = restore.shutdown_requested() => {
+            logging::warn("shutdown_for_restore_received", &[]);
+        }
     }
-    logging::info("shutdown_signal_received", &[]);
 }

@@ -6,7 +6,7 @@ use axum::{
     response::IntoResponse,
 };
 
-use crate::{auth::authorize, backup, db, error::ApiError, logging, state::AppState};
+use crate::{auth::authorize, backup, db, error::ApiError, logging, restore, state::AppState};
 
 /// Streams a freshly-built Studio metadata backup archive. The caller (the
 /// Tauri app) writes the bytes to the user-chosen path atomically.
@@ -57,4 +57,62 @@ pub async fn preview_restore(
         &[("compatible", preview.compatible.to_string())],
     );
     Ok(Json(preview))
+}
+
+/// Prepares a restore: validates, stages a migrated copy, writes a pre-restore
+/// backup, and returns the on-disk handoff for the Tauri supervisor. Active data
+/// is not mutated here.
+pub async fn prepare_restore(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<restore::PreparedRestore>, ApiError> {
+    authorize(&state, &headers)?;
+    logging::warn(
+        "restore_prepare_requested",
+        &[("bytes", body.len().to_string())],
+    );
+
+    let prepared = restore::prepare_restore(&state.restore, &state.db, &state.db_path, &body)
+        .await
+        .map_err(map_restore_error)?;
+
+    logging::warn(
+        "restore_prepare_finished",
+        &[("restore_id", prepared.restore_id.clone())],
+    );
+    Ok(Json(prepared))
+}
+
+/// Enters the shutdown-pending state and triggers graceful shutdown so the
+/// supervisor can swap the database file with no live handle held here.
+pub async fn begin_restore_shutdown(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &headers)?;
+    logging::warn("restore_shutdown_requested", &[]);
+    state.restore.begin_restore_shutdown();
+    Ok(Json(serde_json::json!({ "status": "shutting_down" })))
+}
+
+/// Reports daemon availability so the supervisor/UI can block while a restore
+/// is preparing or the daemon is about to exit for a swap.
+pub async fn restore_availability(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &headers)?;
+    Ok(Json(
+        serde_json::json!({ "availability": state.restore.availability() }),
+    ))
+}
+
+fn map_restore_error(error: restore::RestoreError) -> ApiError {
+    match error {
+        restore::RestoreError::Archive(_) | restore::RestoreError::Incompatible(_) => {
+            ApiError::RestoreArchiveInvalid(error.to_string())
+        }
+        other => ApiError::RestoreFailed(other.to_string()),
+    }
 }

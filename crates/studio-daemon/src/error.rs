@@ -89,6 +89,12 @@ pub enum ApiError {
     #[error("invalid backup archive: {0}")]
     RestoreArchiveInvalid(String),
 
+    #[error("restore preparation failed: {0}")]
+    RestoreFailed(String),
+
+    #[error("a restore is in progress; the daemon is not accepting changes")]
+    RestoreInProgress,
+
     #[error("database error: {0}")]
     Database(#[from] turso::Error),
 
@@ -129,9 +135,12 @@ impl IntoResponse for ApiError {
             | Self::PlanningFailed(_)
             | Self::ActionUnavailable(_)
             | Self::RestoreArchiveInvalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::Database(_) | Self::Json(_) | Self::Clock | Self::BackupFailed(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::RestoreInProgress => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Database(_)
+            | Self::Json(_)
+            | Self::Clock
+            | Self::BackupFailed(_)
+            | Self::RestoreFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let fields = [
             ("status", status.as_u16().to_string()),
