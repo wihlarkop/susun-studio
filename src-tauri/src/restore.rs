@@ -101,7 +101,7 @@ pub async fn apply_restore(
         .ok_or(RestoreCommandError::NoConnection)?;
 
     // Reuse the archive the user picked at preview time — no second dialog.
-    let archive = std::fs::read(archive_path)?;
+    let archive = crate::backup::read_capped_archive(std::path::Path::new(archive_path))?;
 
     // 1. Daemon validates + stages a migrated copy + writes a pre-restore backup.
     let prepared = request_prepare(&connection, archive).await?;

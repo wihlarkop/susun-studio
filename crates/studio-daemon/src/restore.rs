@@ -202,9 +202,38 @@ async fn migrate_and_validate_staged(staged_path: &Path) -> Result<(), RestoreEr
         ensure_table_readable(&conn, table).await?;
     }
 
+    // Restored ownership is untrusted: a backup could carry studio_managed
+    // profiles and owner tokens from another install. Reset ownership to unknown
+    // and mark profiles as needing fresh detection, so the daemon re-probes and
+    // re-adopts through the normal flow rather than inheriting trust from a file.
+    sanitize_restored_ownership(&conn).await?;
+
     // Drop the handle before returning so nothing keeps the staged file open.
     drop(conn);
     drop(staged);
+    Ok(())
+}
+
+/// Strip trusted ownership evidence from a restored database so nothing is
+/// treated as Studio-managed until live detection confirms it.
+async fn sanitize_restored_ownership(conn: &turso::Connection) -> Result<(), RestoreError> {
+    conn.execute(
+        "UPDATE runtime_profiles
+         SET ownership_state = 'ownership_unknown',
+             owner_token = NULL,
+             source = 'restored_metadata',
+             availability_state = 'unknown',
+             missing_since_ms = NULL",
+        (),
+    )
+    .await?;
+    // The ownership event log is history from a prior install; its tokens carry
+    // no authority here, so clear them while keeping the audit trail.
+    conn.execute(
+        "UPDATE runtime_ownership_events SET owner_token = NULL WHERE owner_token IS NOT NULL",
+        (),
+    )
+    .await?;
     Ok(())
 }
 

@@ -69,6 +69,58 @@ async fn prepare_stages_migrated_copy_and_pre_restore_backup() -> TestResult {
 }
 
 #[tokio::test]
+async fn prepare_sanitizes_restored_ownership() -> TestResult {
+    let dir = unique_dir();
+    let active = dir.join("studio.db");
+    let db = seeded_db(&active).await?;
+    // A backup that claims a Studio-managed built-in with an owner token.
+    db.connect()?
+        .execute(
+            "INSERT INTO runtime_profiles (id, provider_id, provider_runtime_key, display_name,
+                product, platform, runtime_class, ownership_state, source, owner_token,
+                installation_state, process_state, connection_state, availability_state,
+                observed_at_ms, created_at_ms, updated_at_ms)
+             VALUES ('b','windows-podman','machine/susun-runtime-default','Built-in','podman',
+                'windows','built_in','studio_managed','studio_setup','tok-123',
+                'installed','running','summarized','available',1,1,1)",
+            (),
+        )
+        .await?;
+    let archive = backup::create_backup_archive(&db, &active).await?;
+
+    let coordinator = RestoreCoordinator::new();
+    let prepared = prepare_restore(&coordinator, &db, &active, &archive).await?;
+
+    // The staged database must not carry trusted ownership forward.
+    let staged = turso::Builder::new_local(&prepared.staged_database_path)
+        .build()
+        .await?;
+    let conn = staged.connect()?;
+    let mut rows = conn
+        .query(
+            "SELECT ownership_state, owner_token, source, availability_state
+             FROM runtime_profiles WHERE id = 'b'",
+            (),
+        )
+        .await?;
+    let row = rows
+        .next()
+        .await?
+        .ok_or_else(|| std::io::Error::other("expected the built-in profile"))?;
+    let ownership_state: String = row.get(0)?;
+    let owner_token: Option<String> = row.get(1)?;
+    let source: String = row.get(2)?;
+    let availability_state: String = row.get(3)?;
+    assert_eq!(ownership_state, "ownership_unknown");
+    assert!(owner_token.is_none());
+    assert_eq!(source, "restored_metadata");
+    assert_eq!(availability_state, "unknown");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[tokio::test]
 async fn prepare_rejects_a_non_archive() -> TestResult {
     let dir = unique_dir();
     let active = dir.join("studio.db");
