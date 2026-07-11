@@ -17,7 +17,7 @@ use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use turso::{Database, params};
 
 use crate::{
-    auth::authorize, error::ApiError, logging, project_source::load_project_source,
+    auth::authorize, error::ApiError, logging, project_source::load_project_source, runtime,
     state::AppState, susun_integration,
 };
 
@@ -111,7 +111,7 @@ pub(crate) async fn start_up_job(
 ) -> Result<Json<JobResponse>, ApiError> {
     let source = load_project_source(&state, &project_id).await?;
     let engine = Arc::new(
-        susun_integration::connect_engine(&state.db)
+        susun_integration::connect_engine(&state.db, Some(&project_id))
             .await
             .map_err(ApiError::EngineUnavailable)?,
     );
@@ -182,7 +182,7 @@ async fn start_down_job(
 ) -> Result<Json<JobResponse>, ApiError> {
     let source = load_project_source(&state, &project_id).await?;
     let engine = Arc::new(
-        susun_integration::connect_engine(&state.db)
+        susun_integration::connect_engine(&state.db, Some(&project_id))
             .await
             .map_err(ApiError::EngineUnavailable)?,
     );
@@ -291,16 +291,23 @@ async fn insert_job(
             .collect::<Vec<_>>(),
     )
     .unwrap_or_default();
+    // Attribute the job to the runtime it will actually use so reports keep
+    // provenance even after that profile later changes or disappears.
+    let (runtime_profile_id, runtime_class) =
+        runtime::attribution_for(&state.db, Some(project_id)).await?;
     let conn = state.db.connect()?;
     conn.execute(
-        "INSERT INTO jobs (id, kind, status, project_id, engine_id, request_json, manifest_json, created_at_ms, updated_at_ms)
-         VALUES (?1, ?2, 'running', ?3, 'engine-docker-local', ?4, ?5, ?6, ?6)",
+        "INSERT INTO jobs (id, kind, status, project_id, engine_id, request_json, manifest_json,
+            runtime_profile_id, runtime_class, created_at_ms, updated_at_ms)
+         VALUES (?1, ?2, 'running', ?3, 'engine-docker-local', ?4, ?5, ?6, ?7, ?8, ?8)",
         params![
             job_id.to_owned(),
             kind.to_owned(),
             project_id.to_owned(),
             request_json,
             manifest_json,
+            runtime_profile_id,
+            runtime_class,
             now
         ],
     )

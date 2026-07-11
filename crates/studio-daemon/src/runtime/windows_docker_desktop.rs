@@ -3,8 +3,8 @@ use susun::EngineEndpoint;
 use super::{
     RuntimeProfile, command_output, dimension, now_ms,
     provider::{
-        EndpointSummary, RuntimeAction, RuntimeCommand, RuntimeObservation, RuntimeProvider,
-        profile_id,
+        EndpointSummary, ObservedProfile, PLACEHOLDER_KEY, RuntimeAction, RuntimeClass,
+        RuntimeCommand, RuntimeObservation, RuntimeProvider, profile_id,
     },
 };
 
@@ -62,6 +62,7 @@ impl RuntimeProvider for WindowsDockerDesktopProvider {
                     "not_applicable",
                     None,
                 )],
+                scanned_keys: None,
             };
         }
 
@@ -235,7 +236,7 @@ impl WindowsDockerDesktopProvider {
     fn detect_installed(&self, version: &str) -> RuntimeObservation {
         let running =
             command_output("docker", &["info", "--format", "{{json .ServerVersion}}"]).is_ok();
-        let key = "default";
+        let key = PLACEHOLDER_KEY;
         let observed_at_ms = now_ms();
         let endpoint_summary = running
             .then(EndpointSummary::windows_named_pipe)
@@ -268,21 +269,24 @@ impl WindowsDockerDesktopProvider {
                 "Next: use the selected profile's endpoint summary to connect through the engine provider model."
                     .to_owned(),
             ],
-            profiles: vec![RuntimeProfile {
+            profiles: vec![ObservedProfile {
                 id: profile_id(self.id(), key),
                 provider_id: self.id().to_owned(),
                 provider_runtime_key: key.to_owned(),
                 display_name: self.display_name().to_owned(),
                 product: self.product().to_owned(),
                 platform: self.platform().to_owned(),
+                runtime_class: RuntimeClass::ExternalLocal,
                 installation: dimension("installed", Some(version)),
                 process: dimension(if running { "running" } else { "stopped" }, None),
                 connection: dimension(if running { "summarized" } else { "not_applicable" }, None),
                 endpoint_summary,
-                is_selected: false,
+                provider_default: false,
                 observed_at_ms,
-                freshness: "fresh".to_owned(),
             }],
+            // Docker Desktop is a single logical engine keyed by the synthetic
+            // placeholder, which reconciliation ignores; still report it present.
+            scanned_keys: Some(vec![key.to_owned()]),
         }
     }
 
@@ -317,6 +321,7 @@ impl WindowsDockerDesktopProvider {
                 "not_applicable",
                 None,
             )],
+            scanned_keys: None,
         }
     }
 
@@ -328,22 +333,21 @@ impl WindowsDockerDesktopProvider {
         process_detail: Option<&str>,
         connection_state: &str,
         connection_detail: Option<&str>,
-    ) -> RuntimeProfile {
-        let key = "default";
-        RuntimeProfile {
-            id: profile_id(self.id(), key),
+    ) -> ObservedProfile {
+        ObservedProfile {
+            id: profile_id(self.id(), PLACEHOLDER_KEY),
             provider_id: self.id().to_owned(),
-            provider_runtime_key: key.to_owned(),
+            provider_runtime_key: PLACEHOLDER_KEY.to_owned(),
             display_name: self.display_name().to_owned(),
             product: self.product().to_owned(),
             platform: self.platform().to_owned(),
+            runtime_class: RuntimeClass::ExternalLocal,
             installation: dimension(installation_state, installation_detail),
             process: dimension(process_state, process_detail),
             connection: dimension(connection_state, connection_detail),
             endpoint_summary: None,
-            is_selected: false,
+            provider_default: false,
             observed_at_ms: now_ms(),
-            freshness: "fresh".to_owned(),
         }
     }
 }

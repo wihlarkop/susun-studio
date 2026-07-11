@@ -6,3 +6,5 @@ ALTER TABLE projects ADD COLUMN last_analyzed_at_ms INTEGER;
 ALTER TABLE projects ADD COLUMN summary_json TEXT;
 ALTER TABLE projects ADD COLUMN diagnostics_json TEXT;
 ALTER TABLE projects ADD COLUMN has_errors INTEGER;
+
+ALTER TABLE projects ADD COLUMN runtime_profile_id TEXT;

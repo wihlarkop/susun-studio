@@ -4,58 +4,30 @@
   import { Badge } from "$lib/components/ui/badge/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
   import { Separator } from "$lib/components/ui/separator/index.js";
-  import { Download, LifeBuoy, Moon, Plus, RefreshCw, Sun } from "@lucide/svelte";
+  import { Moon, Plus, Settings, Sun } from "@lucide/svelte";
   import { toggleMode } from "mode-watcher";
-  import { invoke, isTauri } from "@tauri-apps/api/core";
-  import { checkForUpdate, type UpdateCheckResult } from "$lib/tauri/updater";
   import type { HealthState } from "$lib/daemon/daemon-state.svelte";
 
   let {
     healthState,
+    title,
     onImportClick,
-  }: { healthState: HealthState; onImportClick: () => void } = $props();
+    onOpenSettings,
+  }: {
+    healthState: HealthState;
+    title: string;
+    onImportClick: () => void;
+    onOpenSettings: () => void;
+  } = $props();
 
   const connected = $derived(healthState.kind === "connected");
-
-  async function exportDiagnostics() {
-    try {
-      await invoke("export_diagnostics_bundle");
-    } catch (error) {
-      console.error("failed to export diagnostics bundle", error);
-    }
-  }
-
-  type UpdateUiState = "idle" | "checking" | "none" | "available" | "installing";
-
-  let updateState = $state<UpdateUiState>("idle");
-  let pendingUpdate = $state<UpdateCheckResult | null>(null);
-
-  async function handleCheckForUpdate() {
-    updateState = "checking";
-    const result = await checkForUpdate();
-    if (!result.available) {
-      updateState = "none";
-      pendingUpdate = null;
-      return;
-    }
-    updateState = "available";
-    pendingUpdate = result;
-  }
-
-  async function handleInstallUpdate() {
-    if (!pendingUpdate?.available) {
-      return;
-    }
-    updateState = "installing";
-    await pendingUpdate.install();
-  }
 </script>
 
 <header class="flex items-center justify-between gap-4">
   <div class="flex items-center gap-3">
     <Sidebar.Trigger />
     <Separator orientation="vertical" class="h-6" />
-    <h2 class="text-2xl leading-tight font-semibold">Projects</h2>
+    <h2 class="text-2xl leading-tight font-semibold">{title}</h2>
     <Tooltip.Provider>
       <Tooltip.Root>
         <Tooltip.Trigger>
@@ -66,39 +38,15 @@
     </Tooltip.Provider>
   </div>
   <div class="flex items-center gap-2">
-    {#if isTauri()}
-      {#if updateState === "available"}
-        <Button
-          variant="default"
-          size="sm"
-          aria-label={`Install update ${pendingUpdate?.available ? pendingUpdate.version : ""}`}
-          onclick={handleInstallUpdate}
-        >
-          <Download />
-          Install update
-        </Button>
-      {:else}
-        <Button
-          variant="ghost"
-          size="icon"
-          aria-label="Check for updates"
-          title={updateState === "checking" ? "Checking for updates…" : "Check for updates"}
-          disabled={updateState === "checking" || updateState === "installing"}
-          onclick={handleCheckForUpdate}
-        >
-          <RefreshCw />
-        </Button>
-      {/if}
-      <Button
-        variant="ghost"
-        size="icon"
-        aria-label="Export diagnostics bundle (sensitive values redacted)"
-        title="Export diagnostics bundle (sensitive values redacted)"
-        onclick={exportDiagnostics}
-      >
-        <LifeBuoy />
-      </Button>
-    {/if}
+    <Button
+      variant="ghost"
+      size="icon"
+      aria-label="Open settings"
+      title="Open settings"
+      onclick={onOpenSettings}
+    >
+      <Settings />
+    </Button>
     <Button variant="ghost" size="icon" aria-label="Toggle theme" onclick={toggleMode}>
       <Sun class="dark:hidden" />
       <Moon class="hidden dark:block" />

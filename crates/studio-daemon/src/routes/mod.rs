@@ -22,6 +22,7 @@ use axum::{
     routing::delete,
     routing::get,
     routing::post,
+    routing::put,
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -36,6 +37,10 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/v1/projects/import", post(projects::import_project))
         .route("/v1/projects/{id}", delete(projects::delete_project))
+        .route(
+            "/v1/projects/{id}/engine",
+            put(projects::set_project_engine),
+        )
         .route("/v1/projects/{id}/plans/up", post(plans::create_up_plan))
         .route(
             "/v1/projects/{id}/plans/down",
@@ -52,9 +57,18 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/engines/{id}/prune", post(engines::prune_engine))
         .route("/v1/runtime/status", get(runtime::runtime_status))
         .route("/v1/runtime/logs", get(runtime::runtime_logs))
+        .route("/v1/runtime/profiles", get(runtime::list_runtime_profiles))
         .route(
             "/v1/runtime/profiles/{id}/select",
             post(runtime::select_runtime_profile),
+        )
+        .route(
+            "/v1/runtime/profiles/{id}/forget",
+            post(runtime::forget_runtime_profile),
+        )
+        .route(
+            "/v1/runtime/profiles/{id}/adopt",
+            post(runtime::adopt_runtime_profile),
         )
         .route(
             "/v1/runtime/providers/{provider_id}/actions/{action}",

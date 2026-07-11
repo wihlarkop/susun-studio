@@ -7,21 +7,30 @@
   import { Trash2 } from "@lucide/svelte";
   import RemoveProjectDialog from "./remove-project-dialog.svelte";
   import { cn, displayPath, formatTimestamp, relativeTime } from "$lib/utils";
-  import type { StudioProject } from "$lib/daemon/client";
+  import type { RuntimeProfile, StudioProject } from "$lib/daemon/client";
 
   let {
     projects,
+    profiles,
     workspaceDetail,
     selectedId,
     onSelect,
     onRemoved,
   }: {
     projects: StudioProject[];
+    profiles: RuntimeProfile[];
     workspaceDetail: string;
     selectedId: string | null;
     onSelect: (project: StudioProject) => void;
     onRemoved: (projectId: string) => void;
   } = $props();
+
+  const profilesById = $derived(new Map(profiles.map((profile) => [profile.id, profile])));
+
+  function engineLabel(project: StudioProject): string {
+    if (!project.runtime_profile_id) return "Active";
+    return profilesById.get(project.runtime_profile_id)?.display_name ?? "Missing engine";
+  }
 
   let removeTarget = $state<StudioProject | null>(null);
   let removeDialogOpen = $state(false);
@@ -72,6 +81,7 @@
           <Table.Head>Name</Table.Head>
           <Table.Head>Path</Table.Head>
           <Table.Head class="text-right">Services</Table.Head>
+          <Table.Head>Engine</Table.Head>
           <Table.Head>Status</Table.Head>
           <Table.Head class="w-10"></Table.Head>
         </Table.Row>
@@ -113,6 +123,18 @@
                   {project.summary ? project.summary.service_count : "—"}
                 </Table.Cell>
                 <Table.Cell>
+                  <Badge
+                    variant={project.runtime_profile_id
+                      ? profilesById.has(project.runtime_profile_id)
+                        ? "secondary"
+                        : "destructive"
+                      : "outline"}
+                    class="text-xs"
+                  >
+                    {engineLabel(project)}
+                  </Badge>
+                </Table.Cell>
+                <Table.Cell>
                   {#if project.has_errors === null}
                     <Badge variant="outline">Manual entry</Badge>
                   {:else if project.has_errors}
@@ -137,7 +159,7 @@
           </Tooltip.Provider>
         {:else}
           <Table.Row>
-            <Table.Cell colspan={5} class="h-24 text-center text-muted-foreground">
+            <Table.Cell colspan={6} class="h-24 text-center text-muted-foreground">
               No projects yet. Use <span class="font-medium">Import Project</span> to add a
               Compose workspace.
             </Table.Cell>

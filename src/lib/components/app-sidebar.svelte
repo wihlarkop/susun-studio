@@ -6,7 +6,7 @@
   import type { StudioSettings } from "$lib/daemon/client";
   import type { HealthState } from "$lib/daemon/daemon-state.svelte";
 
-  type View = "projects" | "jobs" | "runtime";
+  type View = "projects" | "jobs" | "runtime" | "settings";
 
   type NavItem = {
     label: string;
@@ -43,9 +43,9 @@
     },
     {
       label: "Settings",
-      description: "Studio and daemon preferences (planned)",
+      description: "Updates and app maintenance",
       icon: Settings,
-      planned: true,
+      view: "settings",
     },
   ];
 
@@ -64,9 +64,11 @@
 
 <Sidebar.Root collapsible="icon">
   <Sidebar.Header>
-    <div class="flex items-center gap-3 px-2 py-1">
+    <div
+      class="flex items-center gap-3 px-2 py-1 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0"
+    >
       <div
-        class="flex size-9 items-center justify-center rounded-lg bg-primary font-bold text-primary-foreground"
+        class="flex size-9 shrink-0 items-center justify-center rounded-full bg-primary font-bold text-primary-foreground"
       >
         S
       </div>
@@ -78,7 +80,7 @@
   </Sidebar.Header>
 
   <Sidebar.Content>
-    <Sidebar.Group>
+    <Sidebar.Group class="group-data-[collapsible=icon]:px-2">
       <Sidebar.GroupLabel>Navigate</Sidebar.GroupLabel>
       <Sidebar.GroupContent>
         <Sidebar.Menu>

@@ -225,13 +225,25 @@ pub struct EngineCapabilitiesRow {
     pub max_container_name_length: Option<usize>,
 }
 
-/// Constructs a Docker-compatible client handle from Studio's selected runtime
-/// profile when available, otherwise Bollard's platform local default.
-pub async fn connect_engine(db: &Database) -> Result<BollardEngine, String> {
-    let endpoint = runtime::selected_engine_endpoint(db)
+/// Constructs a Docker-compatible client handle. A configured project/global
+/// profile never silently falls back when unavailable; platform local defaults
+/// are used only when the user has not selected or bound a runtime.
+pub async fn connect_engine(
+    db: &Database,
+    project_id: Option<&str>,
+) -> Result<BollardEngine, String> {
+    let endpoint = match runtime::engine_endpoint_for(db, project_id)
         .await
         .map_err(|error| error.to_string())?
-        .unwrap_or(EngineEndpoint::Local);
+    {
+        runtime::EngineEndpointResolution::Explicit(endpoint) => endpoint,
+        runtime::EngineEndpointResolution::PlatformDefault => EngineEndpoint::Local,
+        runtime::EngineEndpointResolution::Unavailable { profile_id } => {
+            return Err(format!(
+                "runtime profile `{profile_id}` is unavailable; Studio will not switch engines automatically"
+            ));
+        }
+    };
     BollardEngine::connect_to(endpoint).map_err(|error| error.to_string())
 }
 

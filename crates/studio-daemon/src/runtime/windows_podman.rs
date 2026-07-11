@@ -4,7 +4,8 @@ use susun::EngineEndpoint;
 use super::{
     RuntimeProfile, command_output, dimension, now_ms,
     provider::{
-        EndpointSummary, RuntimeAction, RuntimeCommand, RuntimeObservation, RuntimeProvider,
+        EndpointSummary, ObservedProfile, PLACEHOLDER_KEY, RESERVED_BUILT_IN_MACHINE,
+        RuntimeAction, RuntimeClass, RuntimeCommand, RuntimeObservation, RuntimeProvider,
         profile_id,
     },
 };
@@ -57,6 +58,9 @@ impl RuntimeProvider for WindowsPodmanProvider {
                     "not_applicable",
                     None,
                 )],
+                // Non-Windows: the provider does not run, so it cannot say
+                // whether any previously-imported machine is still present.
+                scanned_keys: None,
             };
         }
 
@@ -235,8 +239,15 @@ impl WindowsPodmanProvider {
                     "not_applicable",
                     None,
                 )],
+                // Authoritative empty inventory: any previously-seen machine is
+                // genuinely gone (removed outside Studio), not just unobservable.
+                scanned_keys: Some(Vec::new()),
             };
         }
+        let scanned_keys = machine_profiles
+            .iter()
+            .map(|profile| profile.provider_runtime_key.clone())
+            .collect::<Vec<_>>();
 
         let running = machine_profiles
             .iter()
@@ -266,6 +277,7 @@ impl WindowsPodmanProvider {
                 "Then: prepare trusted start/stop plans for machine lifecycle.".to_owned(),
             ],
             profiles: machine_profiles,
+            scanned_keys: Some(scanned_keys),
         }
     }
 
@@ -300,6 +312,9 @@ impl WindowsPodmanProvider {
                 "not_applicable",
                 None,
             )],
+            // Provider unavailable: cannot enumerate machines, so do not treat
+            // previously-imported ones as removed.
+            scanned_keys: None,
         }
     }
 
@@ -311,26 +326,25 @@ impl WindowsPodmanProvider {
         process_detail: Option<&str>,
         connection_state: &str,
         connection_detail: Option<&str>,
-    ) -> RuntimeProfile {
-        let key = "default";
-        RuntimeProfile {
-            id: profile_id(self.id(), key),
+    ) -> ObservedProfile {
+        ObservedProfile {
+            id: profile_id(self.id(), PLACEHOLDER_KEY),
             provider_id: self.id().to_owned(),
-            provider_runtime_key: key.to_owned(),
+            provider_runtime_key: PLACEHOLDER_KEY.to_owned(),
             display_name: self.display_name().to_owned(),
             product: self.product().to_owned(),
             platform: self.platform().to_owned(),
+            runtime_class: RuntimeClass::ExternalLocal,
             installation: dimension(installation_state, installation_detail),
             process: dimension(process_state, process_detail),
             connection: dimension(connection_state, connection_detail),
             endpoint_summary: None,
-            is_selected: false,
+            provider_default: false,
             observed_at_ms: now_ms(),
-            freshness: "fresh".to_owned(),
         }
     }
 
-    fn machine_profiles(&self, version: &str) -> Vec<RuntimeProfile> {
+    fn machine_profiles(&self, version: &str) -> Vec<ObservedProfile> {
         let Ok(output) = command_output("podman", &["machine", "list", "--format", "json"]) else {
             return Vec::new();
         };
@@ -350,7 +364,7 @@ impl WindowsPodmanProvider {
         version: &str,
         observed_at_ms: i64,
         machine: PodmanMachine,
-    ) -> Option<RuntimeProfile> {
+    ) -> Option<ObservedProfile> {
         let name = machine.name.as_deref()?;
         let key = format!("machine/{name}");
         let running = machine.running.unwrap_or(false);
@@ -358,14 +372,23 @@ impl WindowsPodmanProvider {
         let endpoint_summary = running
             .then(EndpointSummary::windows_named_pipe)
             .and_then(|summary| summary.to_json_string());
+        // A machine carrying Studio's reserved name is classified built-in so
+        // that, absent an ownership token, reconciliation records an ownership
+        // conflict instead of silently adopting a machine Studio did not create.
+        let runtime_class = if name == RESERVED_BUILT_IN_MACHINE {
+            RuntimeClass::BuiltIn
+        } else {
+            RuntimeClass::ExternalLocal
+        };
 
-        Some(RuntimeProfile {
+        Some(ObservedProfile {
             id: profile_id(self.id(), &key),
             provider_id: self.id().to_owned(),
             provider_runtime_key: key,
             display_name: format!("Podman machine {name}"),
             product: self.product().to_owned(),
             platform: self.platform().to_owned(),
+            runtime_class,
             installation: dimension("installed", Some(version)),
             process: dimension(
                 if running { "running" } else { "stopped" },
@@ -384,9 +407,8 @@ impl WindowsPodmanProvider {
                 }),
             ),
             endpoint_summary,
-            is_selected: machine.default.unwrap_or(false),
+            provider_default: machine.default.unwrap_or(false),
             observed_at_ms,
-            freshness: "fresh".to_owned(),
         })
     }
 }

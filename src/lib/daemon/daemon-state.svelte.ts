@@ -2,12 +2,14 @@ import {
   getDaemonBaseUrl,
   importProject as importProjectRequest,
   listProjects,
+  listRuntimeProfiles,
   readDaemonHealth,
   readSettings,
   updateSettings as updateSettingsRequest,
   type DaemonHealth,
   type ImportProjectRequest,
   type ImportProjectResponse,
+  type RuntimeProfile,
   type StudioProject,
   type StudioSettings,
 } from "$lib/daemon/client";
@@ -26,6 +28,7 @@ export function createDaemonState() {
     detail: `Reading ${getDaemonBaseUrl()}/v1/health`,
   });
   let projects = $state<StudioProject[]>([]);
+  let runtimeProfiles = $state<RuntimeProfile[]>([]);
   let settings = $state<StudioSettings | undefined>(undefined);
   let workspaceDetail = $state(
     "Persisted projects will appear here after the daemon API is wired.",
@@ -40,13 +43,15 @@ export function createDaemonState() {
   async function refresh(signal?: AbortSignal) {
     try {
       const health = await readDaemonHealth(getDaemonBaseUrl(), signal);
-      const [projectList, daemonSettings] = await Promise.all([
+      const [projectList, daemonSettings, profiles] = await Promise.all([
         listProjects({ signal }),
         readSettings({ signal }),
+        listRuntimeProfiles({ signal }),
       ]);
 
       projects = projectList;
       settings = daemonSettings;
+      runtimeProfiles = profiles;
       workspaceDetail = describeWorkspace(projectList);
       healthState = {
         kind: "connected",
@@ -60,6 +65,7 @@ export function createDaemonState() {
       }
 
       projects = [];
+      runtimeProfiles = [];
       settings = undefined;
       workspaceDetail = "Start the local daemon to load projects and settings.";
       healthState = {
@@ -113,6 +119,9 @@ export function createDaemonState() {
     },
     get projects() {
       return projects;
+    },
+    get runtimeProfiles() {
+      return runtimeProfiles;
     },
     get settings() {
       return settings;

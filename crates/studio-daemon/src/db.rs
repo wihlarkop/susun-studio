@@ -53,6 +53,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "runtime_profiles",
         sql: include_str!("../migrations/0010_runtime_profiles.sql"),
     },
+    Migration {
+        version: 11,
+        name: "runtime_ownership",
+        sql: include_str!("../migrations/0011_runtime_ownership.sql"),
+    },
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -146,6 +151,57 @@ async fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
     }
 
     Ok(())
+}
+
+/// Apply only the migrations up to and including `max_version`, leaving later
+/// ones pending. Used by tests to reconstruct a pre-upgrade database and then
+/// exercise the newer migration against it.
+#[cfg(test)]
+pub async fn apply_migrations_upto(conn: &Connection, max_version: i64) -> Result<(), DbError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS _studio_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at_ms INTEGER NOT NULL DEFAULT (unixepoch('subsec') * 1000)
+        )",
+        (),
+    )
+    .await
+    .map_err(|source| DbError::Migration {
+        version: 0,
+        name: "migration_table",
+        source,
+    })?;
+
+    for migration in MIGRATIONS.iter().filter(|m| m.version <= max_version) {
+        if migration_applied(conn, migration).await? {
+            continue;
+        }
+        conn.execute_batch(migration.sql)
+            .await
+            .map_err(|source| DbError::Migration {
+                version: migration.version,
+                name: migration.name,
+                source,
+            })?;
+        conn.execute(
+            "INSERT INTO _studio_migrations (version, name) VALUES (?1, ?2)",
+            params![migration.version, migration.name],
+        )
+        .await
+        .map_err(|source| DbError::Migration {
+            version: migration.version,
+            name: migration.name,
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+/// Run any pending migrations on an already-open connection (tests only).
+#[cfg(test)]
+pub async fn apply_pending_migrations(conn: &Connection) -> Result<(), DbError> {
+    apply_migrations(conn).await
 }
 
 async fn migration_applied(conn: &Connection, migration: &Migration) -> Result<bool, DbError> {
