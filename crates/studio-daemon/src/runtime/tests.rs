@@ -4,7 +4,10 @@
 
 use turso::{Connection, Database, params};
 
+use super::command::{CommandKind, ProcessElevation, TrustedProgram};
 use super::provider::{ObservedProfile, RESERVED_BUILT_IN_MACHINE, RuntimeClass, profile_id};
+use super::windows_docker_desktop::WindowsDockerDesktopProvider;
+use super::windows_podman::WindowsPodmanProvider;
 use super::{AdoptOutcome, ForgetOutcome, RuntimeProfile, dimension, now_ms};
 use crate::db;
 
@@ -371,4 +374,83 @@ async fn forget_removes_metadata_but_keeps_binding() -> TestResult {
 
     let _ = std::fs::remove_file(&path);
     Ok(())
+}
+
+// --- Trusted command model (Runtime Security 1) ---------------------------
+//
+// These exercise `build_command` directly (not `command_for_action`, which is
+// platform-gated) so command content is verified on any host, including the
+// ubuntu CI runner where the Windows providers report `supported() == false`.
+
+#[test]
+fn podman_install_is_a_one_shot_elevated_package_manager_command() -> TestResult {
+    let command = WindowsPodmanProvider
+        .build_command("install", &[])
+        .ok_or("podman install command should exist")?;
+    assert_eq!(command.program, TrustedProgram::Winget);
+    assert_eq!(command.kind, CommandKind::PackageManager);
+    assert_eq!(command.elevation, ProcessElevation::OneShotOsMediated);
+    assert!(command.args.iter().any(|arg| arg == "RedHat.Podman"));
+    Ok(())
+}
+
+#[test]
+fn podman_lifecycle_without_a_selected_profile_has_no_command() {
+    // start/stop/restart require a selected machine profile; with none, the
+    // provider produces no command rather than guessing a target.
+    assert!(WindowsPodmanProvider.build_command("start", &[]).is_none());
+    assert!(WindowsPodmanProvider.build_command("stop", &[]).is_none());
+    assert!(WindowsPodmanProvider.build_command("restart", &[]).is_none());
+}
+
+#[test]
+fn podman_init_runs_as_current_user_runtime_cli() -> TestResult {
+    let command = WindowsPodmanProvider
+        .build_command("init", &[])
+        .ok_or("podman init command should exist")?;
+    assert_eq!(command.program, TrustedProgram::Podman);
+    assert_eq!(command.kind, CommandKind::RuntimeCli);
+    assert_eq!(command.elevation, ProcessElevation::CurrentUser);
+    Ok(())
+}
+
+#[test]
+fn docker_desktop_install_is_a_one_shot_elevated_package_manager_command() -> TestResult {
+    let command = WindowsDockerDesktopProvider
+        .build_command("install", &[])
+        .ok_or("docker desktop install command should exist")?;
+    assert_eq!(command.program, TrustedProgram::Winget);
+    assert_eq!(command.kind, CommandKind::PackageManager);
+    assert_eq!(command.elevation, ProcessElevation::OneShotOsMediated);
+    assert!(command.args.iter().any(|arg| arg == "Docker.DockerDesktop"));
+    Ok(())
+}
+
+#[test]
+fn docker_desktop_lifecycle_is_a_current_user_os_config_command() -> TestResult {
+    // Fixed daemon-owned PowerShell scripts, no interpolated user data, no
+    // elevation: modelled as a current-user OS-config command.
+    for action in ["start", "stop", "restart"] {
+        let command = WindowsDockerDesktopProvider
+            .build_command(action, &[])
+            .ok_or("docker desktop lifecycle command should exist")?;
+        assert_eq!(command.program, TrustedProgram::PowerShell);
+        assert_eq!(command.kind, CommandKind::OsConfigTool);
+        assert_eq!(command.elevation, ProcessElevation::CurrentUser);
+    }
+    Ok(())
+}
+
+#[test]
+fn unknown_action_has_no_command() {
+    assert!(
+        WindowsPodmanProvider
+            .build_command("frobnicate", &[])
+            .is_none()
+    );
+    assert!(
+        WindowsDockerDesktopProvider
+            .build_command("frobnicate", &[])
+            .is_none()
+    );
 }

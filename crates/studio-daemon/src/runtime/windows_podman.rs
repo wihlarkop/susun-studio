@@ -2,13 +2,15 @@ use serde::Deserialize;
 use susun::EngineEndpoint;
 
 use super::{
-    RuntimeProfile, command_output, dimension, now_ms,
+    RuntimeProfile,
+    command::{CommandKind, ExecutableCommand, ProcessElevation, TrustedProgram},
+    command_output, dimension, now_ms,
     provider::{
         EndpointSummary, ObservedProfile, PLACEHOLDER_KEY, RESERVED_BUILT_IN_MACHINE,
-        RuntimeAction, RuntimeClass, RuntimeCommand, RuntimeObservation, RuntimeProvider,
-        profile_id,
+        RuntimeAction, RuntimeClass, RuntimeObservation, RuntimeProvider, profile_id,
     },
 };
+use std::time::Duration;
 
 pub struct WindowsPodmanProvider;
 
@@ -166,48 +168,11 @@ impl RuntimeProvider for WindowsPodmanProvider {
         &self,
         action: &str,
         profiles: &[RuntimeProfile],
-    ) -> Option<RuntimeCommand> {
+    ) -> Option<ExecutableCommand> {
         if !self.supported() {
             return None;
         }
-
-        match action {
-            "install" => Some(RuntimeCommand {
-                program: "winget",
-                args: vec![
-                    "install".to_owned(),
-                    "--id".to_owned(),
-                    "RedHat.Podman".to_owned(),
-                    "--accept-package-agreements".to_owned(),
-                    "--accept-source-agreements".to_owned(),
-                    "--disable-interactivity".to_owned(),
-                ],
-                timeout_secs: 30 * 60,
-                success_message: "Podman install command finished.".to_owned(),
-                elevate_if_needed: true,
-            }),
-            "init" => Some(RuntimeCommand {
-                program: "podman",
-                args: vec!["machine".to_owned(), "init".to_owned()],
-                timeout_secs: 10 * 60,
-                success_message: "Podman machine created. Use Start to bring it online.".to_owned(),
-                elevate_if_needed: false,
-            }),
-            "start" | "stop" | "restart" => {
-                let profile = profiles
-                    .iter()
-                    .find(|profile| profile.is_selected && profile.provider_id == self.id())?;
-                let machine = profile.provider_runtime_key.strip_prefix("machine/")?;
-                Some(RuntimeCommand {
-                    program: "podman",
-                    args: vec!["machine".to_owned(), action.to_owned(), machine.to_owned()],
-                    timeout_secs: 5 * 60,
-                    success_message: format!("Podman machine {action} command finished."),
-                    elevate_if_needed: false,
-                })
-            }
-            _ => None,
-        }
+        self.build_command(action, profiles)
     }
 
     fn endpoint_for_runtime_key(&self, provider_runtime_key: &str) -> Option<EngineEndpoint> {
@@ -219,6 +184,62 @@ impl RuntimeProvider for WindowsPodmanProvider {
 }
 
 impl WindowsPodmanProvider {
+    /// Builds the trusted command for an action, independent of the platform
+    /// gate in [`command_for_action`]. Kept separate so it is unit-testable on
+    /// any host, and so command content lives entirely in trusted provider code.
+    pub(crate) fn build_command(
+        &self,
+        action: &str,
+        profiles: &[RuntimeProfile],
+    ) -> Option<ExecutableCommand> {
+        match action {
+            "install" => Some(ExecutableCommand {
+                program: TrustedProgram::Winget,
+                args: vec![
+                    "install".to_owned(),
+                    "--id".to_owned(),
+                    "RedHat.Podman".to_owned(),
+                    "--accept-package-agreements".to_owned(),
+                    "--accept-source-agreements".to_owned(),
+                    "--disable-interactivity".to_owned(),
+                ],
+                env_allowlist: Vec::new(),
+                working_dir: None,
+                timeout: Duration::from_secs(30 * 60),
+                kind: CommandKind::PackageManager,
+                elevation: ProcessElevation::OneShotOsMediated,
+                success_message: "Podman install command finished.".to_owned(),
+            }),
+            "init" => Some(ExecutableCommand {
+                program: TrustedProgram::Podman,
+                args: vec!["machine".to_owned(), "init".to_owned()],
+                env_allowlist: Vec::new(),
+                working_dir: None,
+                timeout: Duration::from_secs(10 * 60),
+                kind: CommandKind::RuntimeCli,
+                elevation: ProcessElevation::CurrentUser,
+                success_message: "Podman machine created. Use Start to bring it online.".to_owned(),
+            }),
+            "start" | "stop" | "restart" => {
+                let profile = profiles
+                    .iter()
+                    .find(|profile| profile.is_selected && profile.provider_id == self.id())?;
+                let machine = profile.provider_runtime_key.strip_prefix("machine/")?;
+                Some(ExecutableCommand {
+                    program: TrustedProgram::Podman,
+                    args: vec!["machine".to_owned(), action.to_owned(), machine.to_owned()],
+                    env_allowlist: Vec::new(),
+                    working_dir: None,
+                    timeout: Duration::from_secs(5 * 60),
+                    kind: CommandKind::RuntimeCli,
+                    elevation: ProcessElevation::CurrentUser,
+                    success_message: format!("Podman machine {action} command finished."),
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn detect_installed(&self, version: &str) -> RuntimeObservation {
         let machine_profiles = self.machine_profiles(version);
         if machine_profiles.is_empty() {

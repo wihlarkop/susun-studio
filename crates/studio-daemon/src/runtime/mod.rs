@@ -1,13 +1,15 @@
+mod command;
 mod provider;
 mod windows_docker_desktop;
 mod windows_podman;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use provider::{ObservedProfile, RuntimeClass, RuntimeCommand, RuntimeProvider};
+use command::{ExecutableCommand, ProcessElevation};
+use provider::{ObservedProfile, RuntimeClass, RuntimeProvider};
 use serde::Serialize;
 use susun::EngineEndpoint;
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 use turso::{Connection, Database, params};
 use windows_docker_desktop::WindowsDockerDesktopProvider;
 use windows_podman::WindowsPodmanProvider;
@@ -605,31 +607,35 @@ pub(crate) fn command_output(program: &str, args: &[&str]) -> Result<String, Str
 }
 
 /// Runs a runtime command, retrying once via the OS's own UAC consent prompt
-/// when the command is marked `elevate_if_needed` and the unelevated attempt
-/// fails. This is a one-shot elevation per action (no persistent privileged
-/// helper), matching the Phase 9 design's `2026-07-06-privileged-helper-design.md`.
-async fn run_command(command: &RuntimeCommand) -> Result<String, String> {
-    match run_once(command.program, &command.args, command.timeout_secs).await {
+/// when the command asks for one-shot OS-mediated elevation and the unelevated
+/// attempt fails. This is a one-shot elevation per action (no persistent
+/// privileged helper), matching the Phase 9 design's
+/// `2026-07-06-privileged-helper-design.md`.
+async fn run_command(command: &ExecutableCommand) -> Result<String, String> {
+    match run_once(command).await {
         Ok(output) => Ok(output),
-        Err(error) if command.elevate_if_needed => {
-            run_elevated(command.program, &command.args, command.timeout_secs)
-                .await
-                .map_err(|elevated_error| {
-                    format!("{error}; elevated retry also failed: {elevated_error}")
-                })
+        Err(error) if matches!(command.elevation, ProcessElevation::OneShotOsMediated) => {
+            run_elevated(command).await.map_err(|elevated_error| {
+                format!("{error}; elevated retry also failed: {elevated_error}")
+            })
         }
         Err(error) => Err(error),
     }
 }
 
-async fn run_once(program: &str, args: &[String], timeout_secs: u64) -> Result<String, String> {
-    let output = timeout(
-        Duration::from_secs(timeout_secs),
-        tokio::process::Command::new(program).args(args).output(),
-    )
-    .await
-    .map_err(|_| format!("{program} timed out"))?
-    .map_err(|error| error.to_string())?;
+async fn run_once(command: &ExecutableCommand) -> Result<String, String> {
+    let program = command.program.name();
+    let mut process = tokio::process::Command::new(program);
+    process.args(&command.args);
+    forward_allowed_environment(&mut process, &command.env_allowlist);
+    if let Some(dir) = &command.working_dir {
+        process.current_dir(dir);
+    }
+
+    let output = timeout(command.timeout, process.output())
+        .await
+        .map_err(|_| format!("{program} timed out"))?
+        .map_err(|error| error.to_string())?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         return Err(if stderr.is_empty() {
@@ -641,8 +647,22 @@ async fn run_once(program: &str, args: &[String], timeout_secs: u64) -> Result<S
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-async fn run_elevated(program: &str, args: &[String], timeout_secs: u64) -> Result<String, String> {
-    let argument_list = args
+/// Forwards only the explicitly allow-listed environment variables from the
+/// daemon's own environment. Full environment isolation (clearing everything
+/// else and redacting captured output) lands with the execution-hardening step;
+/// today every runtime command declares an empty allowlist.
+fn forward_allowed_environment(process: &mut tokio::process::Command, allowlist: &[&str]) {
+    for key in allowlist {
+        if let Ok(value) = std::env::var(key) {
+            process.env(key, value);
+        }
+    }
+}
+
+async fn run_elevated(command: &ExecutableCommand) -> Result<String, String> {
+    let program = command.program.name();
+    let argument_list = command
+        .args
         .iter()
         .map(|arg| format!("'{}'", arg.replace('\'', "''")))
         .collect::<Vec<_>>()
@@ -657,7 +677,7 @@ async fn run_elevated(program: &str, args: &[String], timeout_secs: u64) -> Resu
     let ps_command = format!("$p = {start_process}; exit $p.ExitCode");
 
     let output = timeout(
-        Duration::from_secs(timeout_secs),
+        command.timeout,
         tokio::process::Command::new("powershell")
             .args([
                 "-NoProfile",

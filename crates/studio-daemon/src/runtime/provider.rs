@@ -1,6 +1,7 @@
 use serde::Serialize;
 use susun::EngineEndpoint;
 
+use super::command::ExecutableCommand;
 use super::stable_suffix;
 
 /// The machine name Studio reserves for the built-in managed runtime. A machine
@@ -29,7 +30,7 @@ pub trait RuntimeProvider: Send + Sync {
         &self,
         action: &str,
         profiles: &[RuntimeProfile],
-    ) -> Option<RuntimeCommand>;
+    ) -> Option<ExecutableCommand>;
     fn endpoint_for_runtime_key(&self, provider_runtime_key: &str) -> Option<EngineEndpoint>;
 }
 
@@ -167,19 +168,6 @@ impl ManagementCapabilities {
             blocks_destructive_actions: unproven_built_in,
         }
     }
-}
-
-/// A single command executed on behalf of a runtime action. `elevate_if_needed`
-/// signals that, if the unelevated attempt fails, Studio should retry once via
-/// the OS's own UAC consent prompt (`Start-Process -Verb RunAs`) rather than
-/// running a persistent privileged helper — matching the Phase 9 design's
-/// "one-shot OS-mediated elevation only" decision.
-pub struct RuntimeCommand {
-    pub program: &'static str,
-    pub args: Vec<String>,
-    pub timeout_secs: u64,
-    pub success_message: String,
-    pub elevate_if_needed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
