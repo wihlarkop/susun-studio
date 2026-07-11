@@ -1,0 +1,25 @@
+[package]
+name = "studio-windows-trust"
+version.workspace = true
+description = "Windows-only executable trust verification (Authenticode + MSIX package identity) for Susun Studio"
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+
+# This crate deliberately does NOT inherit the workspace `unsafe_code = "forbid"`
+# lint: it is the one place allowed to hold Win32/WinRT FFI. Unsafe is denied by
+# default here and narrowly re-enabled only inside the documented `ffi` modules.
+# The rest of the clippy discipline is kept in step with the workspace.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+expect_used = "deny"
+panic = "deny"
+unwrap_used = "deny"
+
+[dependencies]
+thiserror = "2.0.18"
+
+# The `windows` crate (Win32/WinRT FFI) is added with the FFI increment that
+# actually uses it, as a `[target.'cfg(windows)'.dependencies]` entry.

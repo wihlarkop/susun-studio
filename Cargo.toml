@@ -1,5 +1,9 @@
 ﻿[workspace]
-members = ["crates/studio-daemon", "src-tauri"]
+members = [
+  "crates/studio-daemon",
+  "crates/studio-windows-trust",
+  "src-tauri",
+]
 resolver = "2"
 
 [workspace.package]
