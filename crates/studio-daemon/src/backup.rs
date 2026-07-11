@@ -36,6 +36,9 @@ pub const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DATABASE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 
+/// The 16-byte header every SQLite database file starts with.
+const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
+
 /// Categories deliberately excluded from every backup, surfaced in the manifest
 /// and to the user so the boundary is explicit.
 const EXCLUDED_CLASSES: &[&str] = &[
@@ -72,8 +75,12 @@ pub enum RestoreError {
     InvalidArchive(String),
     #[error("backup archive contains an unexpected entry `{0}`")]
     UnexpectedEntry(String),
+    #[error("backup archive contains a duplicate `{0}` entry")]
+    DuplicateEntry(String),
     #[error("backup archive contains an unsafe path `{0}`")]
     UnsafePath(String),
+    #[error("the backup does not contain a valid SQLite database")]
+    NotADatabase,
     #[error("backup archive entry `{name}` exceeds its {limit} byte limit")]
     EntryTooLarge { name: String, limit: u64 },
     #[error("backup archive is missing the `{0}` entry")]
@@ -382,6 +389,11 @@ fn read_known_entries(archive: &[u8]) -> Result<KnownEntries, RestoreError> {
             DATABASE_ENTRY => (MAX_DATABASE_BYTES, &mut db_bytes),
             _ => return Err(RestoreError::UnexpectedEntry(name)),
         };
+        // Two entries with the same known name make the archive's meaning
+        // ambiguous (different readers could pick different bytes) — reject it.
+        if slot.is_some() {
+            return Err(RestoreError::DuplicateEntry(name));
+        }
 
         let declared = entry.header().size().unwrap_or(u64::MAX);
         if declared > limit {
@@ -394,6 +406,12 @@ fn read_known_entries(archive: &[u8]) -> Result<KnownEntries, RestoreError> {
             .map_err(|error| RestoreError::InvalidArchive(error.to_string()))?;
         if buffer.len() as u64 > limit {
             return Err(RestoreError::EntryTooLarge { name, limit });
+        }
+        // The database entry must actually be a SQLite database. The manifest
+        // checksum only proves internal consistency (an attacker controls both
+        // the bytes and the checksum), so verify the file magic here.
+        if name == DATABASE_ENTRY && !buffer.starts_with(SQLITE_MAGIC) {
+            return Err(RestoreError::NotADatabase);
         }
         *slot = Some(buffer);
     }

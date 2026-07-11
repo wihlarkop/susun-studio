@@ -89,7 +89,7 @@ pub async fn preview_restore(app: &AppHandle) -> Result<RestorePreviewOutcome, B
         return Ok(RestorePreviewOutcome::Cancelled);
     };
 
-    let archive = std::fs::read(&archive_path)?;
+    let archive = read_capped_archive(&archive_path)?;
     let preview = request_preview(&connection, archive).await?;
     info!("event=restore_preview_finished");
     Ok(RestorePreviewOutcome::Previewed { preview })
@@ -145,9 +145,28 @@ async fn request_preview(
     serde_json::from_str(&body).map_err(|error| BackupCommandError::Daemon(error.to_string()))
 }
 
+/// The daemon's own archive limit, mirrored so a huge file is rejected before it
+/// is read into memory here.
+const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Reads a backup archive into memory, rejecting an oversized file by its size
+/// on disk before allocating. The daemon still enforces its own body limit.
+pub(crate) fn read_capped_archive(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let size = std::fs::metadata(path)?.len();
+    if size > MAX_ARCHIVE_BYTES {
+        return Err(std::io::Error::other(format!(
+            "backup archive is {size} bytes, larger than the {MAX_ARCHIVE_BYTES} byte limit"
+        )));
+    }
+    std::fs::read(path)
+}
+
 /// Writes `bytes` to `target` via a sibling temp file and a final rename, so a
 /// partial write never leaves a corrupt backup at the destination. Rust's
-/// `rename` replaces an existing file on both Windows and Unix.
+/// `rename` maps to `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` on Windows,
+/// so it replaces an existing file; the rare case where the target is locked
+/// (e.g. open in another app) surfaces here as a clear error rather than a
+/// partial write.
 fn write_atomically(target: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let directory = target.parent().unwrap_or_else(|| std::path::Path::new("."));
     let temp = directory.join(format!(

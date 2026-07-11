@@ -40,6 +40,14 @@ async fn seeded_db() -> TestResult<(turso::Database, std::path::PathBuf)> {
     Ok((db, path))
 }
 
+/// A byte blob that passes the SQLite magic-header check (but is not a real
+/// database) — enough to exercise the manifest/checksum/schema logic.
+fn fake_db(tag: &[u8]) -> Vec<u8> {
+    let mut bytes = super::SQLITE_MAGIC.to_vec();
+    bytes.extend_from_slice(tag);
+    bytes
+}
+
 fn archive_from(entries: &[(&str, &[u8])]) -> TestResult<Vec<u8>> {
     let mut builder = tar::Builder::new(Vec::new());
     for (name, bytes) in entries {
@@ -108,7 +116,7 @@ async fn roundtrip_backup_validates_and_summarizes() -> TestResult {
 
 #[tokio::test]
 async fn tampered_database_fails_checksum() -> TestResult {
-    let db_bytes = b"not-a-real-db-but-checksum-still-applies".to_vec();
+    let db_bytes = fake_db(b"-not-a-real-db-but-checksum-still-applies");
     let manifest = manifest_json(db::latest_migration_version(), &db_bytes)?;
     // Same length so the size check passes but the content (and hash) differs.
     let mut tampered = db_bytes.clone();
@@ -126,7 +134,7 @@ async fn tampered_database_fails_checksum() -> TestResult {
 
 #[tokio::test]
 async fn future_schema_is_reported_incompatible() -> TestResult {
-    let db_bytes = b"db".to_vec();
+    let db_bytes = fake_db(b"payload");
     let current = db::latest_migration_version();
     let manifest = manifest_json(current + 5, &db_bytes)?;
     let archive = archive_from(&[("manifest.json", &manifest), (DATABASE_ENTRY, &db_bytes)])?;
@@ -141,7 +149,10 @@ async fn future_schema_is_reported_incompatible() -> TestResult {
 fn safe_entry_name_rejects_traversal_and_absolute() -> TestResult {
     // The tar writer refuses to emit `..` paths, so the traversal guard is
     // verified directly — this is the function the archive reader relies on.
-    assert_eq!(safe_entry_name(Path::new("manifest.json"))?, "manifest.json");
+    assert_eq!(
+        safe_entry_name(Path::new("manifest.json"))?,
+        "manifest.json"
+    );
     assert!(matches!(
         safe_entry_name(Path::new("../evil.txt")),
         Err(RestoreError::UnsafePath(_))
@@ -163,7 +174,7 @@ fn safe_entry_name_rejects_traversal_and_absolute() -> TestResult {
 
 #[tokio::test]
 async fn unexpected_entry_is_rejected() -> TestResult {
-    let db_bytes = b"db".to_vec();
+    let db_bytes = fake_db(b"payload");
     let manifest = manifest_json(db::latest_migration_version(), &db_bytes)?;
     let archive = archive_from(&[
         ("manifest.json", &manifest),
@@ -174,6 +185,38 @@ async fn unexpected_entry_is_rejected() -> TestResult {
     assert!(matches!(
         validate_restore_archive(&archive, db::latest_migration_version()),
         Err(RestoreError::UnexpectedEntry(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_sqlite_content_is_rejected_even_with_matching_checksum() -> TestResult {
+    // The manifest checksum is self-referential, so a matching checksum over
+    // arbitrary bytes must still be rejected as not-a-database.
+    let db_bytes = b"totally not a sqlite database".to_vec();
+    let manifest = manifest_json(db::latest_migration_version(), &db_bytes)?;
+    let archive = archive_from(&[("manifest.json", &manifest), (DATABASE_ENTRY, &db_bytes)])?;
+
+    assert!(matches!(
+        validate_restore_archive(&archive, db::latest_migration_version()),
+        Err(RestoreError::NotADatabase)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn duplicate_database_entry_is_rejected() -> TestResult {
+    let db_bytes = fake_db(b"payload");
+    let manifest = manifest_json(db::latest_migration_version(), &db_bytes)?;
+    let archive = archive_from(&[
+        ("manifest.json", &manifest),
+        (DATABASE_ENTRY, &db_bytes),
+        (DATABASE_ENTRY, &db_bytes),
+    ])?;
+
+    assert!(matches!(
+        validate_restore_archive(&archive, db::latest_migration_version()),
+        Err(RestoreError::DuplicateEntry(_))
     ));
     Ok(())
 }
