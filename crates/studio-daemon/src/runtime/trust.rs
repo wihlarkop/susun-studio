@@ -246,7 +246,8 @@ fn normalize_cn(cn: &str) -> String {
 }
 
 fn path_eq_ignore_case(a: &Path, b: &Path) -> bool {
-    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
 }
 
 #[cfg(test)]

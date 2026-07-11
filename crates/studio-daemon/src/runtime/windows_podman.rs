@@ -196,12 +196,12 @@ impl WindowsPodmanProvider {
             "install" => Some(ExecutableCommand {
                 program: TrustedProgram::Winget,
                 args: vec![
-                    "install".to_owned(),
-                    "--id".to_owned(),
-                    "RedHat.Podman".to_owned(),
-                    "--accept-package-agreements".to_owned(),
-                    "--accept-source-agreements".to_owned(),
-                    "--disable-interactivity".to_owned(),
+                    "install".into(),
+                    "--id".into(),
+                    "RedHat.Podman".into(),
+                    "--accept-package-agreements".into(),
+                    "--accept-source-agreements".into(),
+                    "--disable-interactivity".into(),
                 ],
                 env_allowlist: Vec::new(),
                 working_dir: None,
@@ -212,7 +212,7 @@ impl WindowsPodmanProvider {
             }),
             "init" => Some(ExecutableCommand {
                 program: TrustedProgram::Podman,
-                args: vec!["machine".to_owned(), "init".to_owned()],
+                args: vec!["machine".into(), "init".into()],
                 env_allowlist: Vec::new(),
                 working_dir: None,
                 timeout: Duration::from_secs(10 * 60),
@@ -227,7 +227,7 @@ impl WindowsPodmanProvider {
                 let machine = profile.provider_runtime_key.strip_prefix("machine/")?;
                 Some(ExecutableCommand {
                     program: TrustedProgram::Podman,
-                    args: vec!["machine".to_owned(), action.to_owned(), machine.to_owned()],
+                    args: vec!["machine".into(), action.into(), machine.into()],
                     env_allowlist: Vec::new(),
                     working_dir: None,
                     timeout: Duration::from_secs(5 * 60),

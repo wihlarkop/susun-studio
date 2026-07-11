@@ -11,6 +11,7 @@
 //! no field through which frontend/API input can name a new executable, inject
 //! shell content, or request elevation.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -78,7 +79,13 @@ pub enum ProcessElevation {
 /// persisted profile state (e.g. a machine name), never raw frontend/API input.
 pub struct ExecutableCommand {
     pub program: TrustedProgram,
-    pub args: Vec<String>,
+    /// Arguments passed structurally to the process API as OS-native strings.
+    /// `OsString` (not `String`) because Windows paths and arguments are not
+    /// guaranteed to be valid UTF-8, and the trusted internal representation
+    /// must never lose or normalize a valid native argument value. Display-only
+    /// previews are built separately as safe UTF-8 summaries, never by
+    /// serializing these values.
+    pub args: Vec<OsString>,
     /// Environment variable names allowed to pass through to the child process.
     /// Empty means "inherit nothing extra"; secret-bearing parent environment is
     /// never forwarded. Enforced at execution time.

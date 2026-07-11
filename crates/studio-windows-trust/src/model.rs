@@ -219,7 +219,11 @@ mod tests {
 
     #[test]
     fn unexpected_publisher_is_rejected() {
-        let id = identity(SignatureStatus::Trusted, "Definitely Not Microsoft", "AABBCC");
+        let id = identity(
+            SignatureStatus::Trusted,
+            "Definitely Not Microsoft",
+            "AABBCC",
+        );
         assert!(!microsoft_windows().accepts(&id));
     }
 

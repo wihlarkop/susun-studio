@@ -667,10 +667,16 @@ fn forward_allowed_environment(process: &mut tokio::process::Command, allowlist:
 
 async fn run_elevated(command: &ExecutableCommand) -> Result<String, String> {
     let program = command.program.name();
+    // NOTE: legacy elevation path — this joins args into a PowerShell command
+    // string and is a known temporary violation of the "no concatenated command
+    // string" rule. It is removed in the one-shot-elevation redesign (Task 8)
+    // and must not be reused by the new trusted verifier. `to_string_lossy` is
+    // acceptable here only because every command that sets OneShotOsMediated
+    // uses ASCII winget arguments.
     let argument_list = command
         .args
         .iter()
-        .map(|arg| format!("'{}'", arg.replace('\'', "''")))
+        .map(|arg| format!("'{}'", arg.to_string_lossy().replace('\'', "''")))
         .collect::<Vec<_>>()
         .join(",");
     let start_process = if argument_list.is_empty() {

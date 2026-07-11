@@ -9,6 +9,7 @@ use super::{
         RuntimeObservation, RuntimeProvider, profile_id,
     },
 };
+use std::ffi::OsString;
 use std::time::Duration;
 
 const DOCKER_DESKTOP_EXE: &str = r"C:\Program Files\Docker\Docker\frontend\Docker Desktop.exe";
@@ -189,12 +190,12 @@ impl WindowsDockerDesktopProvider {
             "install" => Some(ExecutableCommand {
                 program: TrustedProgram::Winget,
                 args: vec![
-                    "install".to_owned(),
-                    "--id".to_owned(),
-                    "Docker.DockerDesktop".to_owned(),
-                    "--accept-package-agreements".to_owned(),
-                    "--accept-source-agreements".to_owned(),
-                    "--disable-interactivity".to_owned(),
+                    "install".into(),
+                    "--id".into(),
+                    "Docker.DockerDesktop".into(),
+                    "--accept-package-agreements".into(),
+                    "--accept-source-agreements".into(),
+                    "--disable-interactivity".into(),
                 ],
                 env_allowlist: Vec::new(),
                 working_dir: None,
@@ -206,11 +207,11 @@ impl WindowsDockerDesktopProvider {
             "start" => Some(ExecutableCommand {
                 program: TrustedProgram::PowerShell,
                 args: vec![
-                    "-NoProfile".to_owned(),
-                    "-WindowStyle".to_owned(),
-                    "Hidden".to_owned(),
-                    "-Command".to_owned(),
-                    format!("Start-Process -FilePath '{DOCKER_DESKTOP_EXE}'"),
+                    "-NoProfile".into(),
+                    "-WindowStyle".into(),
+                    "Hidden".into(),
+                    "-Command".into(),
+                    OsString::from(format!("Start-Process -FilePath '{DOCKER_DESKTOP_EXE}'")),
                 ],
                 env_allowlist: Vec::new(),
                 working_dir: None,
@@ -224,11 +225,11 @@ impl WindowsDockerDesktopProvider {
             "stop" => Some(ExecutableCommand {
                 program: TrustedProgram::PowerShell,
                 args: vec![
-                    "-NoProfile".to_owned(),
-                    "-WindowStyle".to_owned(),
-                    "Hidden".to_owned(),
-                    "-Command".to_owned(),
-                    DOCKER_STOP_SCRIPT.to_owned(),
+                    "-NoProfile".into(),
+                    "-WindowStyle".into(),
+                    "Hidden".into(),
+                    "-Command".into(),
+                    OsString::from(DOCKER_STOP_SCRIPT),
                 ],
                 env_allowlist: Vec::new(),
                 working_dir: None,
@@ -241,13 +242,13 @@ impl WindowsDockerDesktopProvider {
             "restart" => Some(ExecutableCommand {
                 program: TrustedProgram::PowerShell,
                 args: vec![
-                    "-NoProfile".to_owned(),
-                    "-WindowStyle".to_owned(),
-                    "Hidden".to_owned(),
-                    "-Command".to_owned(),
-                    format!(
+                    "-NoProfile".into(),
+                    "-WindowStyle".into(),
+                    "Hidden".into(),
+                    "-Command".into(),
+                    OsString::from(format!(
                         "{DOCKER_STOP_SCRIPT}; Start-Sleep -Seconds 2; Start-Process -FilePath '{DOCKER_DESKTOP_EXE}'"
-                    ),
+                    )),
                 ],
                 env_allowlist: Vec::new(),
                 working_dir: None,
