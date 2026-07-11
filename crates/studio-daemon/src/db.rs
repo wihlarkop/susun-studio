@@ -88,6 +88,17 @@ struct Migration {
     sql: &'static str,
 }
 
+/// The highest migration version this build knows how to apply. A backup
+/// records this so restore can tell whether an archive is older (migrate it
+/// forward) or from a newer, incompatible app (refuse).
+pub fn latest_migration_version() -> i64 {
+    MIGRATIONS
+        .iter()
+        .map(|migration| migration.version)
+        .max()
+        .unwrap_or(0)
+}
+
 pub async fn open_database(path: PathBuf) -> Result<Database, DbError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| DbError::CreateDir {

@@ -2,18 +2,99 @@
   import * as Card from "$lib/components/ui/card/index.js";
   import { Badge } from "$lib/components/ui/badge/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
-  import { Download, LifeBuoy, RefreshCw, ShieldCheck } from "@lucide/svelte";
+  import {
+    ArchiveRestore,
+    DatabaseBackup,
+    Download,
+    LifeBuoy,
+    RefreshCw,
+    ShieldCheck,
+  } from "@lucide/svelte";
   import { invoke, isTauri } from "@tauri-apps/api/core";
   import { checkForUpdate, type UpdateCheckResult } from "$lib/tauri/updater";
 
   type UpdateUiState = "idle" | "checking" | "none" | "available" | "installing" | "failed";
 
+  type RestorePreview = {
+    compatible: boolean;
+    reason: string | null;
+    manifest: {
+      app_version: string;
+      schema_migration_version: number;
+      current_schema_migration_version: number;
+      platform_os: string;
+      platform_arch: string;
+      created_at_epoch_seconds: number;
+      project_count: number;
+      runtime_profile_count: number;
+      job_count: number;
+      content_classes: string[];
+      excluded: string[];
+    };
+    replacement_scope: string[];
+    reenter_after_restore: string[];
+  };
+
+  type RestorePreviewOutcome =
+    | { outcome: "cancelled" }
+    | { outcome: "previewed"; preview: RestorePreview };
+
+  const backupIncludes = [
+    "Projects, preferences, and runtime profile bindings",
+    "Runtime profiles, plans, jobs, and history",
+    "A consistent database snapshot with a versioned, checksummed manifest",
+  ];
+  const backupExcludes = [
+    "Registry credentials and auth tokens",
+    "Updater keys and raw endpoint secrets",
+    "Engine images, containers, and volumes",
+  ];
+
   let updateState = $state<UpdateUiState>("idle");
   let pendingUpdate = $state<UpdateCheckResult | null>(null);
   let updateMessage = $state("Check whether a newer Susun Studio build is available.");
   let diagnosticsState = $state<"idle" | "exporting" | "done" | "cancelled" | "failed">("idle");
+  let backupState = $state<"idle" | "backing-up" | "saved" | "cancelled" | "failed">("idle");
+  let backupError = $state<string | null>(null);
+  let restoreState = $state<"idle" | "validating" | "previewed" | "cancelled" | "failed">("idle");
+  let restorePreview = $state<RestorePreview | null>(null);
+  let restoreError = $state<string | null>(null);
 
   const canUseDesktopFeatures = $derived(isTauri());
+
+  async function backUpStudioData() {
+    backupState = "backing-up";
+    backupError = null;
+    try {
+      const outcome = await invoke<"saved" | "cancelled">("backup_studio_data");
+      backupState = outcome === "cancelled" ? "cancelled" : "saved";
+    } catch (error) {
+      backupState = "failed";
+      backupError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  async function previewRestore() {
+    restoreState = "validating";
+    restoreError = null;
+    restorePreview = null;
+    try {
+      const outcome = await invoke<RestorePreviewOutcome>("preview_restore_studio_data");
+      if (outcome.outcome === "cancelled") {
+        restoreState = "cancelled";
+        return;
+      }
+      restorePreview = outcome.preview;
+      restoreState = "previewed";
+    } catch (error) {
+      restoreState = "failed";
+      restoreError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  function formatEpochSeconds(seconds: number): string {
+    return new Date(seconds * 1000).toLocaleString();
+  }
 
   async function handleCheckForUpdate() {
     updateState = "checking";
@@ -174,5 +255,156 @@
         {diagnosticsState === "exporting" ? "Exporting" : "Export diagnostics"}
       </Button>
     </div>
+  </Card.Root>
+
+  <Card.Root class="gap-0 overflow-hidden p-0">
+    <div class="border-b bg-muted/20 p-4">
+      <div class="flex min-w-0 items-start justify-between gap-3">
+        <div class="flex min-w-0 gap-3">
+          <div class="flex size-9 shrink-0 items-center justify-center rounded-md border bg-background">
+            <DatabaseBackup class="size-4 text-muted-foreground" />
+          </div>
+          <div class="min-w-0">
+            <div class="flex flex-wrap items-center gap-2">
+              <h4 class="text-base font-semibold">Back up Studio data</h4>
+              {#if backupState !== "idle"}
+                <Badge
+                  variant={backupState === "failed"
+                    ? "destructive"
+                    : backupState === "cancelled"
+                      ? "outline"
+                      : backupState === "saved"
+                        ? "default"
+                        : "secondary"}
+                >
+                  {backupState === "backing-up" ? "backing up" : backupState}
+                </Badge>
+              {/if}
+            </div>
+            <p class="mt-1 max-w-2xl text-sm text-muted-foreground">
+              Save a snapshot of Studio metadata. This is separate from the diagnostics bundle.
+            </p>
+          </div>
+        </div>
+        <Button
+          variant="outline"
+          disabled={!canUseDesktopFeatures || backupState === "backing-up"}
+          onclick={backUpStudioData}
+        >
+          <DatabaseBackup />
+          {backupState === "backing-up" ? "Backing up" : "Back up"}
+        </Button>
+      </div>
+    </div>
+
+    <div class="grid gap-4 p-4 md:grid-cols-2">
+      <div class="rounded-md border p-3">
+        <div class="text-xs font-medium text-muted-foreground">Included</div>
+        <ul class="mt-2 space-y-1 text-sm">
+          {#each backupIncludes as item (item)}
+            <li class="leading-5">{item}</li>
+          {/each}
+        </ul>
+      </div>
+      <div class="rounded-md border p-3">
+        <div class="text-xs font-medium text-muted-foreground">Not included</div>
+        <ul class="mt-2 space-y-1 text-sm text-muted-foreground">
+          {#each backupExcludes as item (item)}
+            <li class="leading-5">{item}</li>
+          {/each}
+        </ul>
+      </div>
+    </div>
+
+    {#if backupError}
+      <div class="border-t p-4 text-sm text-destructive">{backupError}</div>
+    {/if}
+  </Card.Root>
+
+  <Card.Root class="gap-0 overflow-hidden p-0">
+    <div class="border-b bg-muted/20 p-4">
+      <div class="flex min-w-0 items-start justify-between gap-3">
+        <div class="flex min-w-0 gap-3">
+          <div class="flex size-9 shrink-0 items-center justify-center rounded-md border bg-background">
+            <ArchiveRestore class="size-4 text-muted-foreground" />
+          </div>
+          <div class="min-w-0">
+            <div class="flex flex-wrap items-center gap-2">
+              <h4 class="text-base font-semibold">Restore Studio data</h4>
+              {#if restoreState === "cancelled"}
+                <Badge variant="outline">cancelled</Badge>
+              {:else if restoreState === "failed"}
+                <Badge variant="destructive">invalid</Badge>
+              {:else if restorePreview}
+                <Badge variant={restorePreview.compatible ? "default" : "destructive"}>
+                  {restorePreview.compatible ? "Compatible" : "Incompatible"}
+                </Badge>
+              {/if}
+            </div>
+            <p class="mt-1 max-w-2xl text-sm text-muted-foreground">
+              Check a backup archive before restoring it. Applying a restore lands in a later update.
+            </p>
+          </div>
+        </div>
+        <Button
+          variant="outline"
+          disabled={!canUseDesktopFeatures || restoreState === "validating"}
+          onclick={previewRestore}
+        >
+          <ArchiveRestore />
+          {restoreState === "validating" ? "Checking" : "Check a backup"}
+        </Button>
+      </div>
+    </div>
+
+    {#if restoreError}
+      <div class="p-4 text-sm text-destructive">{restoreError}</div>
+    {:else if restorePreview}
+      {@const preview = restorePreview}
+      <div class="grid gap-4 p-4">
+        {#if !preview.compatible && preview.reason}
+          <div class="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
+            {preview.reason}
+          </div>
+        {/if}
+
+        <div class="grid gap-2 text-sm md:grid-cols-2">
+          <div class="rounded-md border p-3">
+            <div class="text-xs font-medium text-muted-foreground">Backup</div>
+            <p class="mt-1">Created {formatEpochSeconds(preview.manifest.created_at_epoch_seconds)}</p>
+            <p class="text-xs text-muted-foreground">
+              App {preview.manifest.app_version} · {preview.manifest.platform_os}/{preview.manifest
+                .platform_arch} · schema v{preview.manifest.schema_migration_version} (this app v{preview
+                .manifest.current_schema_migration_version})
+            </p>
+          </div>
+          <div class="rounded-md border p-3">
+            <div class="text-xs font-medium text-muted-foreground">Contents</div>
+            <p class="mt-1">
+              {preview.manifest.project_count} projects · {preview.manifest.runtime_profile_count} runtime
+              profiles · {preview.manifest.job_count} jobs
+            </p>
+          </div>
+        </div>
+
+        <div class="rounded-md border p-3">
+          <div class="text-xs font-medium text-muted-foreground">A restore would replace</div>
+          <ul class="mt-2 space-y-1 text-sm">
+            {#each preview.replacement_scope as item (item)}
+              <li class="leading-5">{item}</li>
+            {/each}
+          </ul>
+        </div>
+
+        <div class="rounded-md border p-3">
+          <div class="text-xs font-medium text-muted-foreground">You must re-enter after restore</div>
+          <ul class="mt-2 space-y-1 text-sm text-muted-foreground">
+            {#each preview.reenter_after_restore as item (item)}
+              <li class="leading-5">{item}</li>
+            {/each}
+          </ul>
+        </div>
+      </div>
+    {/if}
   </Card.Root>
 </div>

@@ -33,3 +33,4 @@ turso = { version = "0.6.1", default-features = false }
 futures-util = "0.3.32"
 tar = "0.4.46"
 indexmap = "2.14.0"
+sha2 = "0.10.9"

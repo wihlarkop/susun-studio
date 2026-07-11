@@ -1,3 +1,4 @@
+mod backup;
 mod diagnostics;
 mod engines;
 mod health;
@@ -13,6 +14,7 @@ mod watch;
 use axum::{
     Router,
     body::Body,
+    extract::DefaultBodyLimit,
     http::{
         HeaderValue, Method, Request, StatusCode,
         header::{AUTHORIZATION, CONTENT_TYPE},
@@ -31,6 +33,16 @@ use crate::{auth, logging, state::AppState};
 pub fn app(state: AppState) -> Router {
     let protected_routes = Router::new()
         .route("/v1/diagnostics", get(diagnostics::diagnostics))
+        .route("/v1/backup", get(backup::create_backup))
+        .route(
+            "/v1/restore/preview",
+            post(backup::preview_restore)
+                // Backup archives far exceed axum's 2 MB default body limit;
+                // allow up to the archive cap the validator itself enforces.
+                .layer(DefaultBodyLimit::max(
+                    crate::backup::MAX_ARCHIVE_BYTES as usize,
+                )),
+        )
         .route(
             "/v1/projects",
             get(projects::list_projects).post(projects::create_project),
