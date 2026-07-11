@@ -181,10 +181,22 @@ pub struct RestoreManifestSummary {
 pub async fn create_backup_archive(db: &Database, db_path: &Path) -> Result<Vec<u8>, BackupError> {
     let snapshot = SnapshotFile::create(db, db_path).await?;
     let db_bytes = std::fs::read(&snapshot.path)?;
-    // The snapshot temp file is no longer needed once read into memory.
-    drop(snapshot);
 
-    let summary = collect_summary(db).await?;
+    // Summarize the snapshot itself, not the live database, so the manifest's
+    // counts always describe exactly the bytes archived here. Reading the live
+    // db would let a concurrent write (e.g. a background job) land between
+    // `VACUUM INTO` and the count queries, yielding a manifest that disagrees
+    // with the snapshot it accompanies.
+    let summary = {
+        let snapshot_db = turso::Builder::new_local(&snapshot.path.to_string_lossy())
+            .build()
+            .await?;
+        collect_summary(&snapshot_db).await?
+        // snapshot_db is dropped here, releasing the file handle before the
+        // snapshot temp file (and its sidecars) are removed.
+    };
+    // The snapshot temp file is no longer needed once read and summarized.
+    drop(snapshot);
     let manifest = BackupManifest {
         manifest_version: ManifestVersion {
             major: CURRENT_MANIFEST_MAJOR,
@@ -308,6 +320,13 @@ impl SnapshotFile {
 impl Drop for SnapshotFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        // Opening the snapshot to summarize it can create WAL/SHM sidecars;
+        // remove them too so no stray files are left beside the database.
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = self.path.clone().into_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(sidecar);
+        }
     }
 }
 
