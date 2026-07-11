@@ -1,3 +1,4 @@
+mod backup;
 mod daemon;
 mod diagnostics;
 
@@ -26,7 +27,9 @@ pub fn run() {
         .manage(DaemonSupervisor::default())
         .invoke_handler(tauri::generate_handler![
             resolve_daemon_connection,
-            export_diagnostics_bundle
+            export_diagnostics_bundle,
+            backup_studio_data,
+            preview_restore_studio_data
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
@@ -57,6 +60,24 @@ async fn export_diagnostics_bundle(
 ) -> Result<diagnostics::DiagnosticsExportOutcome, String> {
     diagnostics::export_bundle(&app).await.map_err(|error| {
         error!("event=export_diagnostics_bundle_command_failed error={error}");
+        error.to_string()
+    })
+}
+
+#[tauri::command]
+async fn backup_studio_data(app: tauri::AppHandle) -> Result<backup::BackupOutcome, String> {
+    backup::backup_studio_data(&app).await.map_err(|error| {
+        error!("event=backup_studio_data_command_failed error={error}");
+        error.to_string()
+    })
+}
+
+#[tauri::command]
+async fn preview_restore_studio_data(
+    app: tauri::AppHandle,
+) -> Result<backup::RestorePreviewOutcome, String> {
+    backup::preview_restore(&app).await.map_err(|error| {
+        error!("event=preview_restore_studio_data_command_failed error={error}");
         error.to_string()
     })
 }

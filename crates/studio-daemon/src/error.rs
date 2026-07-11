@@ -83,6 +83,12 @@ pub enum ApiError {
     #[error("action unavailable: {0}")]
     ActionUnavailable(String),
 
+    #[error("backup failed: {0}")]
+    BackupFailed(String),
+
+    #[error("invalid backup archive: {0}")]
+    RestoreArchiveInvalid(String),
+
     #[error("database error: {0}")]
     Database(#[from] turso::Error),
 
@@ -119,10 +125,13 @@ impl IntoResponse for ApiError {
             | Self::WatchNotFound
             | Self::RuntimeProfileNotFound => StatusCode::NOT_FOUND,
             Self::EngineUnavailable(_) => StatusCode::BAD_GATEWAY,
-            Self::InvalidImport(_) | Self::PlanningFailed(_) | Self::ActionUnavailable(_) => {
-                StatusCode::UNPROCESSABLE_ENTITY
+            Self::InvalidImport(_)
+            | Self::PlanningFailed(_)
+            | Self::ActionUnavailable(_)
+            | Self::RestoreArchiveInvalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Database(_) | Self::Json(_) | Self::Clock | Self::BackupFailed(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
             }
-            Self::Database(_) | Self::Json(_) | Self::Clock => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let fields = [
             ("status", status.as_u16().to_string()),
