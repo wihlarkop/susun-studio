@@ -30,7 +30,9 @@ pub enum BackupOutcome {
 pub enum RestorePreviewOutcome {
     Cancelled,
     /// A validated, non-mutating preview passed straight through from the daemon.
-    Previewed { preview: serde_json::Value },
+    Previewed {
+        preview: serde_json::Value,
+    },
 }
 
 /// Fetches a freshly-built backup archive from the daemon and writes it to a
@@ -69,9 +71,7 @@ pub async fn backup_studio_data(app: &AppHandle) -> Result<BackupOutcome, Backup
 
 /// Lets the user pick a backup archive and asks the daemon to validate it,
 /// returning a safe preview. Nothing is restored here — this is read-only.
-pub async fn preview_restore(
-    app: &AppHandle,
-) -> Result<RestorePreviewOutcome, BackupCommandError> {
+pub async fn preview_restore(app: &AppHandle) -> Result<RestorePreviewOutcome, BackupCommandError> {
     info!("event=restore_preview_started");
     let connection = connection(app)?;
 
@@ -132,7 +132,12 @@ async fn request_preview(
         // mismatch, incompatible schema) rather than a generic HTTP error.
         let message = serde_json::from_str::<serde_json::Value>(&body)
             .ok()
-            .and_then(|value| value.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .map(str::to_owned)
+            })
             .unwrap_or_else(|| format!("daemon returned {status}"));
         return Err(BackupCommandError::Daemon(message));
     }
@@ -145,7 +150,10 @@ async fn request_preview(
 /// `rename` replaces an existing file on both Windows and Unix.
 fn write_atomically(target: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let directory = target.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let temp = directory.join(format!(".susun-backup-{}.tmp", uuid::Uuid::new_v4().simple()));
+    let temp = directory.join(format!(
+        ".susun-backup-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
     std::fs::write(&temp, bytes)?;
     match std::fs::rename(&temp, target) {
         Ok(()) => Ok(()),

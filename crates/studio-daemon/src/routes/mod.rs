@@ -39,7 +39,9 @@ pub fn app(state: AppState) -> Router {
             post(backup::preview_restore)
                 // Backup archives far exceed axum's 2 MB default body limit;
                 // allow up to the archive cap the validator itself enforces.
-                .layer(DefaultBodyLimit::max(crate::backup::MAX_ARCHIVE_BYTES as usize)),
+                .layer(DefaultBodyLimit::max(
+                    crate::backup::MAX_ARCHIVE_BYTES as usize,
+                )),
         )
         .route(
             "/v1/projects",

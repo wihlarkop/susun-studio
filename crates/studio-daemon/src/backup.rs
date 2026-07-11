@@ -171,10 +171,7 @@ pub struct RestoreManifestSummary {
 /// Build a backup archive: a consistent snapshot of the database plus a
 /// versioned, checksummed manifest, returned as tar bytes ready to be written
 /// atomically by the caller.
-pub async fn create_backup_archive(
-    db: &Database,
-    db_path: &Path,
-) -> Result<Vec<u8>, BackupError> {
+pub async fn create_backup_archive(db: &Database, db_path: &Path) -> Result<Vec<u8>, BackupError> {
     let snapshot = SnapshotFile::create(db, db_path).await?;
     let db_bytes = std::fs::read(&snapshot.path)?;
     // The snapshot temp file is no longer needed once read into memory.
@@ -291,8 +288,12 @@ impl SnapshotFile {
         // turso needs the destination as a SQL literal. Forward slashes are
         // valid on Windows, and single quotes are doubled to stay inside the
         // literal. The path is daemon-generated, never user input.
-        let literal = path.to_string_lossy().replace('\\', "/").replace('\'', "''");
-        conn.execute(&format!("VACUUM INTO '{literal}'"), ()).await?;
+        let literal = path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('\'', "''");
+        conn.execute(&format!("VACUUM INTO '{literal}'"), ())
+            .await?;
         Ok(Self { path })
     }
 }
@@ -355,11 +356,12 @@ async fn scalar_count(conn: &turso::Connection, sql: &str) -> Result<i64, turso:
     })
 }
 
+/// The manifest and database bytes read from an archive, each present or not.
+type KnownEntries = (Option<Vec<u8>>, Option<Vec<u8>>);
+
 /// Read only the two entries a Studio backup may contain, enforcing shape,
 /// path-safety, and per-entry size limits. Any other entry is rejected.
-fn read_known_entries(
-    archive: &[u8],
-) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), RestoreError> {
+fn read_known_entries(archive: &[u8]) -> Result<KnownEntries, RestoreError> {
     let mut manifest_bytes = None;
     let mut db_bytes = None;
 
@@ -403,8 +405,7 @@ fn read_known_entries(
 /// single plain filename.
 fn safe_entry_name(path: &Path) -> Result<String, RestoreError> {
     let mut components = path.components();
-    let (Some(std::path::Component::Normal(name)), None) =
-        (components.next(), components.next())
+    let (Some(std::path::Component::Normal(name)), None) = (components.next(), components.next())
     else {
         return Err(RestoreError::UnsafePath(path.display().to_string()));
     };

@@ -1,17 +1,22 @@
 //! Backup/restore-validation tests. Uses a file-backed turso database so the
 //! `VACUUM INTO` snapshot path is exercised for real.
 
+use std::path::Path;
+
 use super::{
     BackupContentEntry, BackupManifest, BackupPlatform, BackupSummary, CURRENT_MANIFEST_MAJOR,
     CURRENT_MANIFEST_MINOR, DATABASE_ENTRY, KIND, ManifestVersion, RestoreError, append_bytes,
-    create_backup_archive, sha256_hex, validate_restore_archive,
+    create_backup_archive, safe_entry_name, sha256_hex, validate_restore_archive,
 };
 use crate::db;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 fn unique_db_path() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("studio-backup-test-{}.db", uuid::Uuid::new_v4().simple()))
+    std::env::temp_dir().join(format!(
+        "studio-backup-test-{}.db",
+        uuid::Uuid::new_v4().simple()
+    ))
 }
 
 async fn seeded_db() -> TestResult<(turso::Database, std::path::PathBuf)> {
@@ -88,7 +93,13 @@ async fn roundtrip_backup_validates_and_summarizes() -> TestResult {
     assert_eq!(preview.manifest.runtime_profile_count, 1);
     assert_eq!(preview.manifest.schema_migration_version, current);
     // The exclusion boundary and re-entry guidance are surfaced.
-    assert!(preview.manifest.excluded.iter().any(|c| c == "registry_credentials"));
+    assert!(
+        preview
+            .manifest
+            .excluded
+            .iter()
+            .any(|c| c == "registry_credentials")
+    );
     assert!(!preview.reenter_after_restore.is_empty());
 
     let _ = std::fs::remove_file(&path);
@@ -101,11 +112,15 @@ async fn tampered_database_fails_checksum() -> TestResult {
     let manifest = manifest_json(db::latest_migration_version(), &db_bytes)?;
     // Same length so the size check passes but the content (and hash) differs.
     let mut tampered = db_bytes.clone();
-    *tampered.last_mut().unwrap() ^= 0xff;
+    if let Some(last) = tampered.last_mut() {
+        *last ^= 0xff;
+    }
     let archive = archive_from(&[("manifest.json", &manifest), (DATABASE_ENTRY, &tampered)])?;
 
-    let error = validate_restore_archive(&archive, db::latest_migration_version()).unwrap_err();
-    assert!(matches!(error, RestoreError::ChecksumMismatch));
+    assert!(matches!(
+        validate_restore_archive(&archive, db::latest_migration_version()),
+        Err(RestoreError::ChecksumMismatch)
+    ));
     Ok(())
 }
 
@@ -123,20 +138,16 @@ async fn future_schema_is_reported_incompatible() -> TestResult {
 }
 
 #[test]
-fn safe_entry_name_rejects_traversal_and_absolute() {
-    use std::path::Path;
+fn safe_entry_name_rejects_traversal_and_absolute() -> TestResult {
     // The tar writer refuses to emit `..` paths, so the traversal guard is
     // verified directly — this is the function the archive reader relies on.
-    assert_eq!(
-        super::safe_entry_name(Path::new("manifest.json")).unwrap(),
-        "manifest.json"
-    );
+    assert_eq!(safe_entry_name(Path::new("manifest.json"))?, "manifest.json");
     assert!(matches!(
-        super::safe_entry_name(Path::new("../evil.txt")),
+        safe_entry_name(Path::new("../evil.txt")),
         Err(RestoreError::UnsafePath(_))
     ));
     assert!(matches!(
-        super::safe_entry_name(Path::new("nested/child")),
+        safe_entry_name(Path::new("nested/child")),
         Err(RestoreError::UnsafePath(_))
     ));
     #[cfg(windows)]
@@ -144,9 +155,10 @@ fn safe_entry_name_rejects_traversal_and_absolute() {
     #[cfg(not(windows))]
     let absolute = Path::new("/etc/evil");
     assert!(matches!(
-        super::safe_entry_name(absolute),
+        safe_entry_name(absolute),
         Err(RestoreError::UnsafePath(_))
     ));
+    Ok(())
 }
 
 #[tokio::test]
@@ -159,8 +171,10 @@ async fn unexpected_entry_is_rejected() -> TestResult {
         ("surprise.txt", b"hi"),
     ])?;
 
-    let error = validate_restore_archive(&archive, db::latest_migration_version()).unwrap_err();
-    assert!(matches!(error, RestoreError::UnexpectedEntry(_)));
+    assert!(matches!(
+        validate_restore_archive(&archive, db::latest_migration_version()),
+        Err(RestoreError::UnexpectedEntry(_))
+    ));
     Ok(())
 }
 
@@ -169,7 +183,9 @@ async fn missing_database_entry_is_rejected() -> TestResult {
     let manifest = manifest_json(db::latest_migration_version(), b"db")?;
     let archive = archive_from(&[("manifest.json", &manifest)])?;
 
-    let error = validate_restore_archive(&archive, db::latest_migration_version()).unwrap_err();
-    assert!(matches!(error, RestoreError::MissingEntry(_)));
+    assert!(matches!(
+        validate_restore_archive(&archive, db::latest_migration_version()),
+        Err(RestoreError::MissingEntry(_))
+    ));
     Ok(())
 }
