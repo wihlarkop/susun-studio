@@ -1,5 +1,11 @@
 mod command;
 mod provider;
+// The trusted-resolution layer that follows wires these into execution; the
+// policy types and matching logic land first so they can be reviewed and tested
+// on their own. Remove this allow once `evaluate_trust` is called from the
+// execution path.
+#[allow(dead_code)]
+mod trust;
 mod windows_docker_desktop;
 mod windows_podman;
 
