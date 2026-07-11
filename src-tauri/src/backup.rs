@@ -29,9 +29,12 @@ pub enum BackupOutcome {
 #[serde(rename_all = "snake_case", tag = "outcome")]
 pub enum RestorePreviewOutcome {
     Cancelled,
-    /// A validated, non-mutating preview passed straight through from the daemon.
+    /// A validated, non-mutating preview passed straight through from the daemon,
+    /// plus the path of the archive the user picked so a subsequent apply can
+    /// reuse it without a second file dialog.
     Previewed {
         preview: serde_json::Value,
+        archive_path: String,
     },
 }
 
@@ -92,7 +95,10 @@ pub async fn preview_restore(app: &AppHandle) -> Result<RestorePreviewOutcome, B
     let archive = read_capped_archive(&archive_path)?;
     let preview = request_preview(&connection, archive).await?;
     info!("event=restore_preview_finished");
-    Ok(RestorePreviewOutcome::Previewed { preview })
+    Ok(RestorePreviewOutcome::Previewed {
+        preview,
+        archive_path: archive_path.to_string_lossy().into_owned(),
+    })
 }
 
 fn connection(app: &AppHandle) -> Result<DaemonConnection, BackupCommandError> {

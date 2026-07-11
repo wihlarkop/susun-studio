@@ -1,6 +1,7 @@
 mod backup;
 mod daemon;
 mod diagnostics;
+mod restore;
 
 use daemon::DaemonSupervisor;
 use log::{error, info};
@@ -29,7 +30,8 @@ pub fn run() {
             resolve_daemon_connection,
             export_diagnostics_bundle,
             backup_studio_data,
-            preview_restore_studio_data
+            preview_restore_studio_data,
+            apply_restore_studio_data
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
@@ -80,4 +82,17 @@ async fn preview_restore_studio_data(
         error!("event=preview_restore_studio_data_command_failed error={error}");
         error.to_string()
     })
+}
+
+#[tauri::command]
+async fn apply_restore_studio_data(
+    app: tauri::AppHandle,
+    archive_path: String,
+) -> Result<restore::RestoreOutcome, String> {
+    restore::apply_restore(&app, &archive_path)
+        .await
+        .map_err(|error| {
+            error!("event=apply_restore_studio_data_command_failed error={error}");
+            error.to_string()
+        })
 }

@@ -229,6 +229,16 @@ pub fn validate_restore_archive(
     archive: &[u8],
     current_schema_version: i64,
 ) -> Result<RestorePreview, RestoreError> {
+    validated_database(archive, current_schema_version).map(|(preview, _)| preview)
+}
+
+/// Validate an archive and, on success, return both the preview and the raw
+/// database bytes it carries. The restore-apply prepare step uses this so the
+/// untrusted archive is parsed and checked exactly once before staging.
+pub fn validated_database(
+    archive: &[u8],
+    current_schema_version: i64,
+) -> Result<(RestorePreview, Vec<u8>), RestoreError> {
     if archive.len() as u64 > MAX_ARCHIVE_BYTES {
         return Err(RestoreError::ArchiveTooLarge {
             limit: MAX_ARCHIVE_BYTES,
@@ -272,7 +282,7 @@ pub fn validate_restore_archive(
         )
     });
 
-    Ok(RestorePreview {
+    let preview = RestorePreview {
         compatible,
         reason,
         manifest: RestoreManifestSummary {
@@ -292,7 +302,8 @@ pub fn validate_restore_archive(
             "All Studio metadata: projects, preferences, runtime profiles and bindings, plans, jobs, and history".to_owned(),
         ],
         reenter_after_restore: REENTER_AFTER_RESTORE.iter().map(|s| (*s).to_owned()).collect(),
-    })
+    };
+    Ok((preview, db_bytes))
 }
 
 /// A `VACUUM INTO` snapshot that deletes its temp file on drop.
@@ -382,11 +393,11 @@ async fn scalar_count(conn: &turso::Connection, sql: &str) -> Result<i64, turso:
     })
 }
 
+/// Read only the two entries a Studio backup may contain, enforcing shape,
+/// path-safety, and per-entry size limits. Any other entry is rejected.
 /// The manifest and database bytes read from an archive, each present or not.
 type KnownEntries = (Option<Vec<u8>>, Option<Vec<u8>>);
 
-/// Read only the two entries a Studio backup may contain, enforcing shape,
-/// path-safety, and per-entry size limits. Any other entry is rejected.
 fn read_known_entries(archive: &[u8]) -> Result<KnownEntries, RestoreError> {
     let mut manifest_bytes = None;
     let mut db_bytes = None;

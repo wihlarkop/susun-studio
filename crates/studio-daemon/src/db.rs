@@ -164,6 +164,12 @@ async fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Run any pending migrations on an already-open connection. Used to migrate a
+/// staged restore database forward to the current schema before it is swapped in.
+pub async fn run_migrations(conn: &Connection) -> Result<(), DbError> {
+    apply_migrations(conn).await
+}
+
 /// Apply only the migrations up to and including `max_version`, leaving later
 /// ones pending. Used by tests to reconstruct a pre-upgrade database and then
 /// exercise the newer migration against it.

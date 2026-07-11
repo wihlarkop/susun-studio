@@ -11,6 +11,7 @@
     ShieldCheck,
   } from "@lucide/svelte";
   import { invoke, isTauri } from "@tauri-apps/api/core";
+  import { setDaemonConnection } from "$lib/daemon/client";
   import { checkForUpdate, type UpdateCheckResult } from "$lib/tauri/updater";
 
   type UpdateUiState = "idle" | "checking" | "none" | "available" | "installing" | "failed";
@@ -37,7 +38,22 @@
 
   type RestorePreviewOutcome =
     | { outcome: "cancelled" }
-    | { outcome: "previewed"; preview: RestorePreview };
+    | { outcome: "previewed"; preview: RestorePreview; archive_path: string };
+
+  type DaemonConnectionPayload = { base_url: string; token: string };
+
+  type RestoreSummary = {
+    app_version: string;
+    schema_migration_version: number;
+    current_schema_migration_version: number;
+    project_count: number;
+    runtime_profile_count: number;
+    job_count: number;
+  };
+
+  type RestoreOutcome =
+    | { outcome: "restored"; summary: RestoreSummary; connection: DaemonConnectionPayload }
+    | { outcome: "rolled_back"; reason: string; connection: DaemonConnectionPayload };
 
   const backupIncludes = [
     "Projects, preferences, and runtime profile bindings",
@@ -58,7 +74,10 @@
   let backupError = $state<string | null>(null);
   let restoreState = $state<"idle" | "validating" | "previewed" | "cancelled" | "failed">("idle");
   let restorePreview = $state<RestorePreview | null>(null);
+  let restoreArchivePath = $state<string | null>(null);
   let restoreError = $state<string | null>(null);
+  let applyState = $state<"idle" | "applying" | "restored" | "rolled_back" | "failed">("idle");
+  let applyMessage = $state<string | null>(null);
 
   const canUseDesktopFeatures = $derived(isTauri());
 
@@ -78,6 +97,9 @@
     restoreState = "validating";
     restoreError = null;
     restorePreview = null;
+    restoreArchivePath = null;
+    applyState = "idle";
+    applyMessage = null;
     try {
       const outcome = await invoke<RestorePreviewOutcome>("preview_restore_studio_data");
       if (outcome.outcome === "cancelled") {
@@ -85,10 +107,38 @@
         return;
       }
       restorePreview = outcome.preview;
+      restoreArchivePath = outcome.archive_path;
       restoreState = "previewed";
     } catch (error) {
       restoreState = "failed";
       restoreError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  async function applyRestore() {
+    if (!restoreArchivePath || !restorePreview?.compatible) return;
+    applyState = "applying";
+    applyMessage = null;
+    try {
+      const outcome = await invoke<RestoreOutcome>("apply_restore_studio_data", {
+        archivePath: restoreArchivePath,
+      });
+      // The daemon restarted on a new port/token — re-point the client at it.
+      setDaemonConnection({
+        baseUrl: outcome.connection.base_url,
+        token: outcome.connection.token,
+      });
+      if (outcome.outcome === "restored") {
+        applyState = "restored";
+        applyMessage = `Restored ${outcome.summary.project_count} projects. Reloading…`;
+        setTimeout(() => location.reload(), 1200);
+      } else {
+        applyState = "rolled_back";
+        applyMessage = `Restore failed and your previous data was kept: ${outcome.reason}`;
+      }
+    } catch (error) {
+      applyState = "failed";
+      applyMessage = error instanceof Error ? error.message : String(error);
     }
   }
 
@@ -342,13 +392,14 @@
               {/if}
             </div>
             <p class="mt-1 max-w-2xl text-sm text-muted-foreground">
-              Check a backup archive before restoring it. Applying a restore lands in a later update.
+              Check a backup archive, then restore it. Restoring replaces all Studio data and
+              restarts the daemon; your current data is backed up first and kept if anything fails.
             </p>
           </div>
         </div>
         <Button
           variant="outline"
-          disabled={!canUseDesktopFeatures || restoreState === "validating"}
+          disabled={!canUseDesktopFeatures || restoreState === "validating" || applyState === "applying"}
           onclick={previewRestore}
         >
           <ArchiveRestore />
@@ -404,6 +455,29 @@
             {/each}
           </ul>
         </div>
+
+        {#if applyMessage}
+          <div
+            class="rounded-md border p-3 text-sm {applyState === 'failed' || applyState === 'rolled_back'
+              ? 'border-destructive/30 bg-destructive/5 text-destructive'
+              : 'text-muted-foreground'}"
+          >
+            {applyMessage}
+          </div>
+        {/if}
+
+        {#if preview.compatible && applyState !== "restored"}
+          <div class="flex flex-wrap items-center justify-between gap-3 rounded-md border border-destructive/30 bg-destructive/5 p-3">
+            <p class="text-sm text-destructive">
+              This replaces all current Studio data and restarts the daemon. This can't be undone
+              except from your automatic pre-restore backup.
+            </p>
+            <Button variant="destructive" disabled={applyState === "applying"} onclick={applyRestore}>
+              <ArchiveRestore />
+              {applyState === "applying" ? "Restoring…" : "Restore now"}
+            </Button>
+          </div>
+        {/if}
       </div>
     {/if}
   </Card.Root>

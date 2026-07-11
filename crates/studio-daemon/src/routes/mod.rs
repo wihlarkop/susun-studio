@@ -11,6 +11,7 @@ mod service_actions;
 mod settings;
 mod watch;
 
+use axum::extract::State;
 use axum::{
     Router,
     body::Body,
@@ -20,7 +21,7 @@ use axum::{
         header::{AUTHORIZATION, CONTENT_TYPE},
     },
     middleware,
-    response::Response,
+    response::{IntoResponse, Response},
     routing::delete,
     routing::get,
     routing::post,
@@ -28,7 +29,7 @@ use axum::{
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use crate::{auth, logging, state::AppState};
+use crate::{auth, error::ApiError, logging, restore::DaemonAvailability, state::AppState};
 
 pub fn app(state: AppState) -> Router {
     let protected_routes = Router::new()
@@ -42,6 +43,17 @@ pub fn app(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(
                     crate::backup::MAX_ARCHIVE_BYTES as usize,
                 )),
+        )
+        .route(
+            "/v1/restore/prepare",
+            post(backup::prepare_restore).layer(DefaultBodyLimit::max(
+                crate::backup::MAX_ARCHIVE_BYTES as usize,
+            )),
+        )
+        .route("/v1/restore/shutdown", post(backup::begin_restore_shutdown))
+        .route(
+            "/v1/restore/availability",
+            get(backup::restore_availability),
         )
         .route(
             "/v1/projects",
@@ -156,6 +168,10 @@ pub fn app(state: AppState) -> Router {
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
+            reject_mutations_during_restore,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
             auth::require_auth,
         ));
 
@@ -180,6 +196,28 @@ pub fn app(state: AppState) -> Router {
         .with_state(state)
         .layer(middleware::from_fn(log_request))
         .layer(local_cors_layer())
+}
+
+/// Once a restore swap is imminent, refuse new mutating requests with a stable
+/// `restore_in_progress` error so nothing writes to a database about to be
+/// replaced. Restore's own endpoints are exempt.
+async fn reject_mutations_during_restore(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: middleware::Next,
+) -> Response {
+    let is_mutating = matches!(
+        *request.method(),
+        Method::POST | Method::PUT | Method::DELETE | Method::PATCH
+    );
+    let is_restore_endpoint = request.uri().path().starts_with("/v1/restore/");
+    if is_mutating
+        && !is_restore_endpoint
+        && state.restore.availability() == DaemonAvailability::RestoreShutdownPending
+    {
+        return ApiError::RestoreInProgress.into_response();
+    }
+    next.run(request).await
 }
 
 async fn log_request(request: Request<Body>, next: middleware::Next) -> Response {

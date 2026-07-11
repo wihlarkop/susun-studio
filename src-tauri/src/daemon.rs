@@ -60,6 +60,16 @@ impl DaemonSupervisor {
             .clone()
     }
 
+    /// Whether Studio manages the daemon as a sidecar child (packaged app). In
+    /// the dev workflow the daemon runs externally and has no child here, so
+    /// restore's stop/swap/restart cannot be performed.
+    pub fn manages_child(&self) -> bool {
+        self.child
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+    }
+
     fn set_connection(&self, connection: DaemonConnection) {
         *self
             .connection
@@ -138,6 +148,29 @@ async fn detect_external_dev_daemon() -> Option<DaemonConnection> {
         base_url: DEV_DAEMON_BASE_URL.to_owned(),
         token,
     })
+}
+
+/// Spawn a fresh daemon sidecar and publish its connection. Used to bring the
+/// daemon back after a restore file swap (and to roll back to a restart on a
+/// restored database that fails to come up).
+pub async fn respawn(app: &AppHandle) -> Result<DaemonConnection, DaemonSupervisorError> {
+    let connection = spawn_and_wait(app).await?;
+    app.state::<DaemonSupervisor>()
+        .set_connection(connection.clone());
+    Ok(connection)
+}
+
+/// Polls the daemon health endpoint until it stops responding or the deadline
+/// passes. Returns true if the daemon became unreachable (released the database).
+pub async fn wait_until_unreachable(base_url: &str, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !probe_health(base_url).await {
+            return true;
+        }
+        tokio::time::sleep(HEALTH_CHECK_INTERVAL).await;
+    }
+    false
 }
 
 async fn spawn_and_wait(app: &AppHandle) -> Result<DaemonConnection, DaemonSupervisorError> {

@@ -4,6 +4,7 @@ use turso::Database;
 
 use crate::{
     jobs::{registry::JobRegistry, tickets::StreamTickets},
+    restore::RestoreCoordinator,
     watch::registry::WatchRegistry,
 };
 
@@ -15,4 +16,5 @@ pub struct AppState {
     pub jobs: Arc<JobRegistry>,
     pub stream_tickets: Arc<StreamTickets>,
     pub watch: Arc<WatchRegistry>,
+    pub restore: Arc<RestoreCoordinator>,
 }
