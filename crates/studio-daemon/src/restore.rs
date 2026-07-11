@@ -316,10 +316,14 @@ pub fn recover_incomplete_swap(db_path: &Path) {
     }
 }
 
-/// Delete abandoned staged databases and pre-restore backups from a previous
-/// run so restore artifacts do not accumulate. Rollback copies are intentionally
-/// left alone — only the restore orchestration removes them, so a failed restart
-/// can still roll back. Best-effort; called at startup.
+/// Delete abandoned restore artifacts from a previous run so they do not
+/// accumulate. Staged databases are always disposable. Pre-restore backups are
+/// swept except for the newest one, which is kept as a durable "undo the last
+/// restore" safety net — a successful restore always restarts the daemon, so
+/// sweeping every pre-restore backup here would destroy that net immediately.
+/// Rollback copies are left entirely alone — only the restore orchestration
+/// removes them, so a failed restart can still roll back. Best-effort; called
+/// at startup.
 pub fn sweep_stale_artifacts(db_path: &Path) {
     let Some(directory) = db_path.parent() else {
         return;
@@ -327,11 +331,30 @@ pub fn sweep_stale_artifacts(db_path: &Path) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
+
+    let mut pre_restore_backups = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with(STAGED_PREFIX) || name.starts_with(PRE_RESTORE_PREFIX) {
+        if name.starts_with(STAGED_PREFIX) {
             let _ = std::fs::remove_file(entry.path());
+        } else if name.starts_with(PRE_RESTORE_PREFIX) {
+            pre_restore_backups.push(entry.path());
+        }
+    }
+
+    // Keep the most recent pre-restore backup; sweep only the older ones.
+    let newest = pre_restore_backups
+        .iter()
+        .max_by_key(|path| {
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .unwrap_or(UNIX_EPOCH)
+        })
+        .cloned();
+    for path in pre_restore_backups {
+        if Some(&path) != newest.as_ref() {
+            let _ = std::fs::remove_file(path);
         }
     }
 }

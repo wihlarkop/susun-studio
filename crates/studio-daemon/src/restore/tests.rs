@@ -22,6 +22,16 @@ fn unique_dir() -> std::path::PathBuf {
     dir
 }
 
+/// Sets a file's modified time to a fixed epoch offset so ordering by mtime is
+/// deterministic in tests. Opens with write access — Windows needs it to touch
+/// file attributes.
+fn set_mtime_secs(path: &std::path::Path, secs: u64) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+}
+
 async fn seeded_db(path: &std::path::Path) -> TestResult<turso::Database> {
     let db = db::open_database(path.to_path_buf()).await?;
     let conn = db.connect()?;
@@ -160,21 +170,32 @@ async fn begin_restore_shutdown_flips_state_and_wakes_waiter() -> TestResult {
 }
 
 #[test]
-fn sweep_removes_staged_and_pre_restore_but_keeps_rollback() -> TestResult {
+fn sweep_removes_staged_keeps_rollback_and_newest_pre_restore() -> TestResult {
     let dir = unique_dir();
     let active = dir.join("studio.db");
     std::fs::write(&active, b"db")?;
     std::fs::write(dir.join(".studio-restore-staged-abc.db"), b"staged")?;
-    std::fs::write(dir.join(".studio-pre-restore-abc.tar"), b"backup")?;
     std::fs::write(dir.join("studio.db.rollback-abc"), b"rollback")?;
+
+    // Two pre-restore backups; the newer one must survive as the "undo the last
+    // restore" net, the older one is swept. Set explicit, distinct mtimes so
+    // newest selection is deterministic regardless of write timing.
+    let older = dir.join(".studio-pre-restore-old.tar");
+    let newer = dir.join(".studio-pre-restore-new.tar");
+    std::fs::write(&older, b"old-backup")?;
+    std::fs::write(&newer, b"new-backup")?;
+    set_mtime_secs(&older, 1_000)?;
+    set_mtime_secs(&newer, 2_000)?;
 
     sweep_stale_artifacts(&active);
 
     assert!(active.exists());
     assert!(!dir.join(".studio-restore-staged-abc.db").exists());
-    assert!(!dir.join(".studio-pre-restore-abc.tar").exists());
     // Rollback copies survive so a failed restart can still roll back.
     assert!(dir.join("studio.db.rollback-abc").exists());
+    // Newest pre-restore backup kept; older one swept.
+    assert!(newer.exists());
+    assert!(!older.exists());
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
