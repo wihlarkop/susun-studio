@@ -63,6 +63,14 @@ pub fn app(state: AppState) -> Router {
             post(runtime::select_runtime_profile),
         )
         .route(
+            "/v1/runtime/profiles/{id}/forget",
+            post(runtime::forget_runtime_profile),
+        )
+        .route(
+            "/v1/runtime/profiles/{id}/adopt",
+            post(runtime::adopt_runtime_profile),
+        )
+        .route(
             "/v1/runtime/providers/{provider_id}/actions/{action}",
             post(runtime::runtime_action),
         )

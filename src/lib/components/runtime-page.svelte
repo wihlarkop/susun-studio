@@ -1,8 +1,11 @@
 <script lang="ts">
   import * as Card from "$lib/components/ui/card/index.js";
+  import * as Dialog from "$lib/components/ui/dialog/index.js";
   import { Badge } from "$lib/components/ui/badge/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
   import {
+    adoptRuntimeProfile,
+    forgetRuntimeProfile,
     readRuntimeLogs,
     readRuntimeStatus,
     runRuntimeAction,
@@ -36,6 +39,10 @@
   let actionResult = $state<RuntimeActionResult | null>(null);
   let errorMessage = $state<string | null>(null);
   let expandedProviders = $state<Set<string>>(new Set());
+  let ownershipDialogOpen = $state(false);
+  let ownershipDialogBusy = $state(false);
+  let pendingOwnershipProfile = $state<RuntimeProfile | null>(null);
+  let pendingOwnershipAction = $state<"adopt" | "forget" | null>(null);
 
   const actionIcons = {
     install: Wrench,
@@ -92,6 +99,72 @@
   async function handleSelect(profile: RuntimeProfile) {
     await selectRuntimeProfile(profile.id);
     await refresh();
+  }
+
+  async function handleForget(profile: RuntimeProfile) {
+    try {
+      await forgetRuntimeProfile(profile.id);
+      errorMessage = null;
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+    }
+    await refresh();
+  }
+
+  async function handleAdopt(profile: RuntimeProfile) {
+    try {
+      await adoptRuntimeProfile(profile.id);
+      errorMessage = null;
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+    }
+    await refresh();
+  }
+
+  function requestOwnershipAction(profile: RuntimeProfile, action: "adopt" | "forget") {
+    pendingOwnershipProfile = profile;
+    pendingOwnershipAction = action;
+    ownershipDialogOpen = true;
+  }
+
+  async function confirmOwnershipAction() {
+    if (!pendingOwnershipProfile || !pendingOwnershipAction) return;
+    ownershipDialogBusy = true;
+    try {
+      if (pendingOwnershipAction === "adopt") {
+        await handleAdopt(pendingOwnershipProfile);
+      } else {
+        await handleForget(pendingOwnershipProfile);
+      }
+      ownershipDialogOpen = false;
+    } finally {
+      ownershipDialogBusy = false;
+    }
+  }
+
+  // Identity/ownership/availability are surfaced as their own concepts, kept
+  // separate from the install/process/connection health chips.
+  function ownershipBadges(
+    profile: RuntimeProfile,
+  ): { label: string; variant: "default" | "secondary" | "outline" | "destructive" }[] {
+    const badges: {
+      label: string;
+      variant: "default" | "secondary" | "outline" | "destructive";
+    }[] = [];
+    badges.push(
+      profile.runtime_class === "built_in"
+        ? { label: "Built-in", variant: "default" }
+        : { label: "External", variant: "secondary" },
+    );
+    if (profile.ownership_state === "ownership_conflict") {
+      badges.push({ label: "Ownership conflict", variant: "destructive" });
+    } else if (profile.ownership_state === "studio_managed") {
+      badges.push({ label: "Studio-managed", variant: "outline" });
+    }
+    if (profile.availability_state === "missing") {
+      badges.push({ label: "Missing", variant: "destructive" });
+    }
+    return badges;
   }
 
   function stateLabel(value: string): string {
@@ -377,7 +450,7 @@
             <ul class="divide-y rounded-md border">
               {#each provider.profiles as profile (profile.id)}
                 {@const endpoint = endpointLabel(profile.endpoint_summary)}
-                <li class="grid gap-3 p-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
+                <li class="grid gap-3 p-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-start">
                   <div class="min-w-0">
                     <div class="flex flex-wrap items-center gap-2">
                       <span class="min-w-0 truncate text-sm font-medium">
@@ -389,6 +462,9 @@
                           Active
                         </Badge>
                       {/if}
+                      {#each ownershipBadges(profile) as badge (badge.label)}
+                        <Badge variant={badge.variant} class="text-xs">{badge.label}</Badge>
+                      {/each}
                       <Badge variant="secondary" class="text-xs">{profileStatus(profile)}</Badge>
                     </div>
                     <div class="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
@@ -398,15 +474,44 @@
                         <span>{endpoint}</span>
                       {/if}
                     </div>
+                    {#if profile.management.requires_recovery}
+                      <p class="mt-2 text-xs text-destructive">
+                        Studio can't prove it manages this built-in runtime. Lifecycle actions are
+                        blocked until you recover it (adopt with no machine changes) or forget it.
+                      </p>
+                    {/if}
                   </div>
-                  <Button
-                    size="sm"
-                    variant={profile.is_selected ? "secondary" : "outline"}
-                    disabled={profile.is_selected}
-                    onclick={() => handleSelect(profile)}
-                  >
-                    {profile.is_selected ? "Active" : "Make active"}
-                  </Button>
+                  <div class="flex flex-wrap items-center gap-2 md:justify-end">
+                    {#if profile.management.can_adopt}
+                      <Button
+                        size="sm"
+                        variant="default"
+                        onclick={() => requestOwnershipAction(profile, "adopt")}
+                      >
+                        Recover built-in
+                      </Button>
+                    {/if}
+                    {#if profile.management.can_forget}
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onclick={() => requestOwnershipAction(profile, "forget")}
+                      >
+                        Forget
+                      </Button>
+                    {/if}
+                    <Button
+                      size="sm"
+                      variant={profile.is_selected ? "secondary" : "outline"}
+                      disabled={profile.is_selected || !profile.management.can_select}
+                      title={profile.management.can_select
+                        ? undefined
+                        : "This runtime is missing, so it can't be made active."}
+                      onclick={() => handleSelect(profile)}
+                    >
+                      {profile.is_selected ? "Active" : "Make active"}
+                    </Button>
+                  </div>
                 </li>
               {/each}
             </ul>
@@ -439,4 +544,47 @@
       </ul>
     {/if}
   </Card.Root>
+
+  <Dialog.Root bind:open={ownershipDialogOpen}>
+    <Dialog.Content class="sm:max-w-lg">
+      <Dialog.Header>
+        <Dialog.Title>
+          {pendingOwnershipAction === "adopt"
+            ? `Recover ${pendingOwnershipProfile?.display_name ?? "built-in runtime"}?`
+            : `Forget ${pendingOwnershipProfile?.display_name ?? "external runtime"}?`}
+        </Dialog.Title>
+        <Dialog.Description>
+          {#if pendingOwnershipAction === "adopt"}
+            Studio will record this existing runtime as Studio-managed and allow lifecycle,
+            resource, and destructive runtime actions. This confirmation does not change the
+            machine itself. Continue only if you trust this runtime and intend Studio to manage it.
+          {:else}
+            Studio will remove only its saved profile metadata. The external runtime will not be
+            stopped, reset, or deleted. Project bindings remain recorded, and the profile may
+            reappear after the next provider scan if the runtime still exists.
+          {/if}
+        </Dialog.Description>
+      </Dialog.Header>
+      <Dialog.Footer>
+        <Button
+          type="button"
+          variant="outline"
+          disabled={ownershipDialogBusy}
+          onclick={() => (ownershipDialogOpen = false)}>Cancel</Button
+        >
+        <Button
+          type="button"
+          variant={pendingOwnershipAction === "forget" ? "destructive" : "default"}
+          disabled={ownershipDialogBusy}
+          onclick={confirmOwnershipAction}
+        >
+          {ownershipDialogBusy
+            ? "Working..."
+            : pendingOwnershipAction === "adopt"
+              ? "Record as Studio-managed"
+              : "Forget metadata"}
+        </Button>
+      </Dialog.Footer>
+    </Dialog.Content>
+  </Dialog.Root>
 </div>

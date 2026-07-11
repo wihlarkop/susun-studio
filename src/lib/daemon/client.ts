@@ -203,6 +203,36 @@ export type RuntimeAction = {
   reason: string;
 };
 
+export type RuntimeClass = "built_in" | "external_local" | "external_remote";
+
+export type RuntimeOwnershipState =
+  | "studio_managed"
+  | "external"
+  | "ownership_conflict"
+  | "ownership_unknown";
+
+export type RuntimeSource =
+  | "studio_setup"
+  | "provider_discovery"
+  | "user_remote"
+  | "restored_metadata";
+
+export type RuntimeAvailabilityState = "available" | "missing" | "unknown";
+
+export type RuntimeProfileError = {
+  code: string;
+  detail: string | null;
+  at_ms: number;
+};
+
+export type RuntimeManagementCapabilities = {
+  can_select: boolean;
+  can_forget: boolean;
+  can_adopt: boolean;
+  requires_recovery: boolean;
+  blocks_destructive_actions: boolean;
+};
+
 export type RuntimeProfile = {
   id: string;
   provider_id: string;
@@ -210,12 +240,21 @@ export type RuntimeProfile = {
   display_name: string;
   product: string;
   platform: string;
+  runtime_class: RuntimeClass;
+  ownership_state: RuntimeOwnershipState;
+  source: RuntimeSource;
   installation: RuntimeDimension;
   process: RuntimeDimension;
   connection: RuntimeDimension;
   endpoint_summary: string | RuntimeEndpointSummary | null;
+  availability_state: RuntimeAvailabilityState;
+  last_seen_at_ms: number | null;
+  missing_since_ms: number | null;
+  last_error: RuntimeProfileError | null;
   is_selected: boolean;
+  observation_revision: number;
   observed_at_ms: number;
+  management: RuntimeManagementCapabilities;
   freshness: string;
 };
 
@@ -557,6 +596,26 @@ export async function selectRuntimeProfile(
   options: DaemonRequestOptions = {},
 ): Promise<{ selected: boolean }> {
   return readJson(`/v1/runtime/profiles/${encodeURIComponent(profileId)}/select`, {
+    ...options,
+    method: "POST",
+  });
+}
+
+export async function forgetRuntimeProfile(
+  profileId: string,
+  options: DaemonRequestOptions = {},
+): Promise<{ forgotten: boolean }> {
+  return readJson(`/v1/runtime/profiles/${encodeURIComponent(profileId)}/forget`, {
+    ...options,
+    method: "POST",
+  });
+}
+
+export async function adoptRuntimeProfile(
+  profileId: string,
+  options: DaemonRequestOptions = {},
+): Promise<{ adopted: boolean }> {
+  return readJson(`/v1/runtime/profiles/${encodeURIComponent(profileId)}/adopt`, {
     ...options,
     method: "POST",
   });
