@@ -21,5 +21,13 @@ unwrap_used = "deny"
 [dependencies]
 thiserror = "2.0.18"
 
-# The `windows` crate (Win32/WinRT FFI) is added with the FFI increment that
-# actually uses it, as a `[target.'cfg(windows)'.dependencies]` entry.
+# Win32 FFI, Windows-only. Features are kept to exactly what the Authenticode
+# and (later) MSIX verification calls need — no umbrella features.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security_Cryptography",
+  "Win32_Security_Cryptography_Catalog",
+  "Win32_Security_WinTrust",
+  "Win32_Storage_FileSystem",
+] }

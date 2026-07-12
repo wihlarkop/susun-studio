@@ -26,3 +26,20 @@ pub use model::{
     PackageFamilyName, PackageFullName, PackageVersion, PublisherIdentity, SignatureStatus,
     VerifiedExecutableIdentity, VerifiedFileIdentity, VerifiedMsixProgram, any_publisher_accepts,
 };
+
+#[cfg(windows)]
+mod authenticode;
+#[cfg(windows)]
+mod ffi;
+
+#[cfg(windows)]
+pub use authenticode::verify_authenticode_executable;
+
+/// Non-Windows stub: verification is only meaningful on Windows. Callers must
+/// treat this as "cannot verify" — never as "verified".
+#[cfg(not(windows))]
+pub fn verify_authenticode_executable(
+    _path: &std::path::Path,
+) -> Result<VerifiedExecutableIdentity, WindowsTrustError> {
+    Err(WindowsTrustError::UnsupportedPlatform)
+}
