@@ -1,11 +1,6 @@
 mod command;
 mod provider;
-// The trusted-resolution layer that follows wires these into execution; the
-// policy types and matching logic land first so they can be reviewed and tested
-// on their own. Remove this allow once `evaluate_trust` is called from the
-// execution path.
-#[allow(dead_code)]
-mod trust;
+mod trusted_exec;
 mod windows_docker_desktop;
 mod windows_podman;
 
@@ -617,27 +612,36 @@ pub(crate) fn command_output(program: &str, args: &[&str]) -> Result<String, Str
 /// attempt fails. This is a one-shot elevation per action (no persistent
 /// privileged helper), matching the Phase 9 design's
 /// `2026-07-06-privileged-helper-design.md`.
+///
+/// Before launching, the program is resolved to its trusted absolute path and
+/// its identity re-verified (Authenticode or MSIX) against the daemon's policy —
+/// so a swapped or untrusted binary is rejected at the last moment, and the
+/// process is launched by verified absolute path, never a `PATH` lookup.
 async fn run_command(command: &ExecutableCommand) -> Result<String, String> {
-    match run_once(command).await {
+    let target =
+        trusted_exec::verify_trusted_program(command.program).map_err(|error| error.to_string())?;
+    match run_once(&target.path, command).await {
         Ok(output) => Ok(output),
         Err(error) if matches!(command.elevation, ProcessElevation::OneShotOsMediated) => {
-            run_elevated(command).await.map_err(|elevated_error| {
-                format!("{error}; elevated retry also failed: {elevated_error}")
-            })
+            run_elevated(&target.path, command)
+                .await
+                .map_err(|elevated_error| {
+                    format!("{error}; elevated retry also failed: {elevated_error}")
+                })
         }
         Err(error) => Err(error),
     }
 }
 
-async fn run_once(command: &ExecutableCommand) -> Result<String, String> {
-    let program = command.program.name();
-    let mut process = tokio::process::Command::new(program);
+async fn run_once(program_path: &std::path::Path, command: &ExecutableCommand) -> Result<String, String> {
+    let mut process = tokio::process::Command::new(program_path);
     process.args(&command.args);
     forward_allowed_environment(&mut process, &command.env_allowlist);
     if let Some(dir) = &command.working_dir {
         process.current_dir(dir);
     }
 
+    let program = program_path.display();
     let output = timeout(command.timeout, process.output())
         .await
         .map_err(|_| format!("{program} timed out"))?
@@ -665,14 +669,18 @@ fn forward_allowed_environment(process: &mut tokio::process::Command, allowlist:
     }
 }
 
-async fn run_elevated(command: &ExecutableCommand) -> Result<String, String> {
-    let program = command.program.name();
+async fn run_elevated(
+    program_path: &std::path::Path,
+    command: &ExecutableCommand,
+) -> Result<String, String> {
+    let program = program_path.to_string_lossy().replace('\'', "''");
     // NOTE: legacy elevation path — this joins args into a PowerShell command
     // string and is a known temporary violation of the "no concatenated command
     // string" rule. It is removed in the one-shot-elevation redesign (Task 8)
     // and must not be reused by the new trusted verifier. `to_string_lossy` is
     // acceptable here only because every command that sets OneShotOsMediated
-    // uses ASCII winget arguments.
+    // uses ASCII winget arguments. The launched path is the verified absolute
+    // path resolved by `verify_trusted_program`, not a `PATH` lookup.
     let argument_list = command
         .args
         .iter()

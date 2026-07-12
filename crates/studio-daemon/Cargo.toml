@@ -13,6 +13,7 @@ workspace = true
 axum = "0.8.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+studio-windows-trust = { path = "../studio-windows-trust" }
 susun = { path = "../../../susun/crates/susun", features = [
   "bollard",
   "watch",
