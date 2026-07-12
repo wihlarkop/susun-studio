@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
 use command::TrustedProgram;
 use command::{ExecutableCommand, ProcessElevation};
-use provider::{ObservedProfile, RuntimeClass, RuntimeProvider};
+use provider::{ObservedProfile, RESERVED_BUILT_IN_MACHINE, RuntimeClass, RuntimeProvider};
 use serde::Serialize;
 use susun::EngineEndpoint;
 use tokio::{
@@ -101,10 +101,10 @@ pub enum SelectOutcome {
 
 /// Outcome of the guarded built-in adoption/recovery flow.
 pub enum AdoptOutcome {
-    Adopted,
     NotFound,
     NotBuiltIn,
     AlreadyManaged,
+    OwnershipUnproven,
 }
 
 /// The full set of runtime providers Studio knows how to detect and manage.
@@ -272,7 +272,7 @@ pub async fn forget_profile(
 /// This assigns `studio_managed` ownership, records a fresh opaque owner token,
 /// and logs the transition — but never mutates the underlying machine.
 pub async fn adopt_profile(db: &Database, profile_id: &str) -> Result<AdoptOutcome, turso::Error> {
-    let mut conn = db.connect()?;
+    let conn = db.connect()?;
     let existing = {
         let mut rows = conn
             .query(
@@ -292,7 +292,7 @@ pub async fn adopt_profile(db: &Database, profile_id: &str) -> Result<AdoptOutco
             None => None,
         }
     };
-    let Some((provider_id, key, runtime_class, ownership_state)) = existing else {
+    let Some((_provider_id, _key, runtime_class, ownership_state)) = existing else {
         return Ok(AdoptOutcome::NotFound);
     };
     if runtime_class != "built_in" {
@@ -302,30 +302,7 @@ pub async fn adopt_profile(db: &Database, profile_id: &str) -> Result<AdoptOutco
         return Ok(AdoptOutcome::AlreadyManaged);
     }
 
-    let owner_token = format!("own_{}", uuid::Uuid::new_v4().simple());
-    let tx = conn.transaction().await?;
-    tx.execute(
-        "UPDATE runtime_profiles
-         SET ownership_state = 'studio_managed', source = 'studio_setup',
-             owner_token = ?1, updated_at_ms = ?2
-         WHERE id = ?3",
-        params![owner_token.clone(), now_ms(), profile_id.to_owned()],
-    )
-    .await?;
-    record_ownership_event(
-        &tx,
-        profile_id,
-        &provider_id,
-        &key,
-        "adopted",
-        Some(&ownership_state),
-        Some("studio_managed"),
-        Some(&owner_token),
-        Some("deliberate built-in adoption/recovery"),
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(AdoptOutcome::Adopted)
+    Ok(AdoptOutcome::OwnershipUnproven)
 }
 
 /// The runtime profile Studio attributes a new job to: the project's own bound
@@ -598,16 +575,57 @@ pub async fn execute_trusted_action(
     let mut next_steps = resolved.2;
     let result = match run_command(&claimed.command).await {
         Ok(output) => {
-            next_steps.push("Recheck runtime status to refresh observed state.".to_owned());
-            RuntimeActionResult {
-                action: claimed.action,
-                status: "executed".to_owned(),
-                message: if output.trim().is_empty() {
-                    claimed.command.success_message
-                } else {
-                    format!("{} {}", claimed.command.success_message, output.trim())
-                },
-                next_steps,
+            let ownership_failure = if claimed.provider_id == "windows-podman"
+                && claimed.action == "setup"
+            {
+                match establish_setup_ownership(db).await {
+                    Ok(true) => {
+                        crate::logging::info(
+                            "runtime_setup_ownership_recorded",
+                            &[("provider_id", claimed.provider_id.clone())],
+                        );
+                        None
+                    }
+                    Ok(false) => Some((
+                        "Susun Runtime was created, but Studio could not prove and record ownership. It remains blocked from management.",
+                        "Remove the conflicting susun-runtime-default machine, then run setup again.",
+                    )),
+                    Err(error) => {
+                        crate::logging::error(
+                            "runtime_setup_ownership_failed",
+                            &[
+                                ("provider_id", claimed.provider_id.clone()),
+                                ("error", error.to_string()),
+                            ],
+                        );
+                        Some((
+                            "Susun Runtime was created, but its ownership record could not be saved. It remains blocked from management.",
+                            "Review daemon logs before removing the unowned machine and retrying setup.",
+                        ))
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some((message, next_step)) = ownership_failure {
+                RuntimeActionResult {
+                    action: claimed.action,
+                    status: "failed".to_owned(),
+                    message: message.to_owned(),
+                    next_steps: vec![next_step.to_owned()],
+                }
+            } else {
+                next_steps.push("Recheck runtime status to refresh observed state.".to_owned());
+                RuntimeActionResult {
+                    action: claimed.action,
+                    status: "executed".to_owned(),
+                    message: if output.trim().is_empty() {
+                        claimed.command.success_message
+                    } else {
+                        format!("{} {}", claimed.command.success_message, output.trim())
+                    },
+                    next_steps,
+                }
             }
         }
         Err(CommandRunError::Cancelled) => RuntimeActionResult {
@@ -630,6 +648,97 @@ pub async fn execute_trusted_action(
     };
     store.finish(&claimed.plan_id, terminal_state);
     result
+}
+
+async fn establish_setup_ownership(db: &Database) -> Result<bool, turso::Error> {
+    let provider = WindowsPodmanProvider;
+    let observation = provider.detect();
+    reconcile_provider(
+        db,
+        provider.id(),
+        &observation.profiles,
+        &observation.scanned_keys,
+    )
+    .await?;
+
+    let key = format!("machine/{RESERVED_BUILT_IN_MACHINE}");
+    let profile_id = provider::profile_id(provider.id(), &key);
+    claim_setup_profile(db, provider.id(), &key, &profile_id).await
+}
+
+async fn claim_setup_profile(
+    db: &Database,
+    provider_id: &str,
+    key: &str,
+    profile_id: &str,
+) -> Result<bool, turso::Error> {
+    let mut conn = db.connect()?;
+    let current = {
+        let mut rows = conn
+            .query(
+                "SELECT runtime_class, ownership_state, source
+                 FROM runtime_profiles
+                 WHERE id = ?1 AND provider_id = ?2 AND provider_runtime_key = ?3
+                 LIMIT 1",
+                params![
+                    profile_id.to_owned(),
+                    provider_id.to_owned(),
+                    key.to_owned()
+                ],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Some((
+                row.get::<String>(0)?,
+                row.get::<String>(1)?,
+                row.get::<String>(2)?,
+            )),
+            None => None,
+        }
+    };
+    let Some((runtime_class, ownership_state, source)) = current else {
+        return Ok(false);
+    };
+    if runtime_class != "built_in"
+        || ownership_state != "ownership_conflict"
+        || source != "provider_discovery"
+    {
+        return Ok(false);
+    }
+
+    let owner_token = format!("own_{}", uuid::Uuid::new_v4().simple());
+    let tx = conn.transaction().await?;
+    let updated = tx
+        .execute(
+            "UPDATE runtime_profiles
+         SET ownership_state = 'studio_managed', source = 'studio_setup',
+             owner_token = ?1, is_selected = 1, updated_at_ms = ?2
+         WHERE id = ?3 AND ownership_state = 'ownership_conflict'",
+            params![owner_token.clone(), now_ms(), profile_id.to_owned()],
+        )
+        .await?;
+    if updated != 1 {
+        return Ok(false);
+    }
+    tx.execute(
+        "UPDATE runtime_profiles SET is_selected = 0 WHERE id <> ?1",
+        params![profile_id.to_owned()],
+    )
+    .await?;
+    record_ownership_event(
+        &tx,
+        profile_id,
+        provider_id,
+        key,
+        "setup_created",
+        Some("ownership_conflict"),
+        Some("studio_managed"),
+        Some(&owner_token),
+        Some("ownership recorded after successful trusted setup"),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 pub fn cancel_trusted_action(

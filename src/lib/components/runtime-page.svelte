@@ -4,7 +4,6 @@
   import { Badge } from "$lib/components/ui/badge/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
   import {
-    adoptRuntimeProfile,
     cancelRuntimePlan,
     executeRuntimePlan,
     forgetRuntimeProfile,
@@ -45,14 +44,14 @@
   let ownershipDialogOpen = $state(false);
   let ownershipDialogBusy = $state(false);
   let pendingOwnershipProfile = $state<RuntimeProfile | null>(null);
-  let pendingOwnershipAction = $state<"adopt" | "forget" | null>(null);
+  let pendingOwnershipAction = $state<"forget" | null>(null);
   let trustedPlan = $state<TrustedRuntimePlan | null>(null);
   let trustedPlanDialogOpen = $state(false);
   let trustedPlanBusy = $state(false);
 
   const actionIcons = {
     install: Wrench,
-    init: HardDrive,
+    setup: HardDrive,
     start: Play,
     stop: Square,
     restart: RotateCw,
@@ -71,6 +70,18 @@
       0,
     ),
   );
+  const managedBuiltIn = $derived(
+    providers
+      .flatMap((provider) => provider.profiles)
+      .find(
+        (profile) =>
+          profile.runtime_class === "built_in" && profile.ownership_state === "studio_managed",
+      ),
+  );
+  const podmanProvider = $derived(
+    providers.find((provider) => provider.provider_id === "windows-podman"),
+  );
+  const setupAction = $derived(podmanProvider?.actions.find((action) => action.id === "setup"));
 
   $effect(() => {
     const controller = new AbortController();
@@ -167,17 +178,7 @@
     await refresh();
   }
 
-  async function handleAdopt(profile: RuntimeProfile) {
-    try {
-      await adoptRuntimeProfile(profile.id);
-      errorMessage = null;
-    } catch (error) {
-      errorMessage = error instanceof Error ? error.message : String(error);
-    }
-    await refresh();
-  }
-
-  function requestOwnershipAction(profile: RuntimeProfile, action: "adopt" | "forget") {
+  function requestOwnershipAction(profile: RuntimeProfile, action: "forget") {
     pendingOwnershipProfile = profile;
     pendingOwnershipAction = action;
     ownershipDialogOpen = true;
@@ -187,11 +188,7 @@
     if (!pendingOwnershipProfile || !pendingOwnershipAction) return;
     ownershipDialogBusy = true;
     try {
-      if (pendingOwnershipAction === "adopt") {
-        await handleAdopt(pendingOwnershipProfile);
-      } else {
-        await handleForget(pendingOwnershipProfile);
-      }
+      await handleForget(pendingOwnershipProfile);
       ownershipDialogOpen = false;
     } finally {
       ownershipDialogBusy = false;
@@ -305,6 +302,10 @@
   function providerOpen(providerId: string): boolean {
     return expandedProviders.has(providerId);
   }
+
+  function showExistingRuntimes() {
+    expandedProviders = new Set(providers.map((provider) => provider.provider_id));
+  }
 </script>
 
 <div class="flex flex-col gap-4">
@@ -372,6 +373,37 @@
       {#if actionResult.next_steps.length > 0}
         <p class="mt-1 text-xs text-muted-foreground">{actionResult.next_steps.join(" ")}</p>
       {/if}
+    </div>
+  {/if}
+
+  {#if status && !managedBuiltIn && podmanProvider}
+    <div class="grid gap-4 border-y py-4 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
+      <div class="min-w-0">
+        <div class="flex flex-wrap items-center gap-2">
+          <Server class="size-4 text-primary" />
+          <h4 class="text-sm font-semibold">Susun Runtime</h4>
+          <Badge variant="secondary">Recommended</Badge>
+        </div>
+        <p class="mt-1 text-sm text-muted-foreground">
+          A dedicated local runtime managed by Studio. Powered by Podman.
+        </p>
+      </div>
+      <div class="flex flex-wrap gap-2 md:justify-end">
+        <Button size="sm" variant="outline" onclick={showExistingRuntimes}>
+          Use existing runtime
+        </Button>
+        {#if setupAction}
+          <Button
+            size="sm"
+            disabled={!setupAction.enabled}
+            title={setupAction.reason}
+            onclick={() => handleAction(podmanProvider.provider_id, setupAction)}
+          >
+            <HardDrive />
+            Set up Susun Runtime
+          </Button>
+        {/if}
+      </div>
     </div>
   {/if}
 
@@ -512,6 +544,9 @@
                       <span class="min-w-0 truncate text-sm font-medium">
                         {profile.display_name}
                       </span>
+                      {#if profile.runtime_class === "built_in"}
+                        <span class="text-xs text-muted-foreground">Powered by Podman</span>
+                      {/if}
                       {#if profile.is_selected}
                         <Badge variant="default" class="text-xs">
                           <CheckCircle2 />
@@ -533,20 +568,12 @@
                     {#if profile.management.requires_recovery}
                       <p class="mt-2 text-xs text-destructive">
                         Studio can't prove it manages this built-in runtime. Lifecycle actions are
-                        blocked until you recover it (adopt with no machine changes) or forget it.
+                        blocked. Remove the conflicting susun-runtime-default machine before using
+                        Set up Susun Runtime.
                       </p>
                     {/if}
                   </div>
                   <div class="flex flex-wrap items-center gap-2 md:justify-end">
-                    {#if profile.management.can_adopt}
-                      <Button
-                        size="sm"
-                        variant="default"
-                        onclick={() => requestOwnershipAction(profile, "adopt")}
-                      >
-                        Recover built-in
-                      </Button>
-                    {/if}
                     {#if profile.management.can_forget}
                       <Button
                         size="sm"
@@ -656,20 +683,12 @@
     <Dialog.Content class="sm:max-w-lg">
       <Dialog.Header>
         <Dialog.Title>
-          {pendingOwnershipAction === "adopt"
-            ? `Recover ${pendingOwnershipProfile?.display_name ?? "built-in runtime"}?`
-            : `Forget ${pendingOwnershipProfile?.display_name ?? "external runtime"}?`}
+          {`Forget ${pendingOwnershipProfile?.display_name ?? "external runtime"}?`}
         </Dialog.Title>
         <Dialog.Description>
-          {#if pendingOwnershipAction === "adopt"}
-            Studio will record this existing runtime as Studio-managed and allow lifecycle,
-            resource, and destructive runtime actions. This confirmation does not change the
-            machine itself. Continue only if you trust this runtime and intend Studio to manage it.
-          {:else}
-            Studio will remove only its saved profile metadata. The external runtime will not be
-            stopped, reset, or deleted. Project bindings remain recorded, and the profile may
-            reappear after the next provider scan if the runtime still exists.
-          {/if}
+          Studio will remove only its saved profile metadata. The external runtime will not be
+          stopped, reset, or deleted. Project bindings remain recorded, and the profile may
+          reappear after the next provider scan if the runtime still exists.
         </Dialog.Description>
       </Dialog.Header>
       <Dialog.Footer>
@@ -681,15 +700,11 @@
         >
         <Button
           type="button"
-          variant={pendingOwnershipAction === "forget" ? "destructive" : "default"}
+          variant="destructive"
           disabled={ownershipDialogBusy}
           onclick={confirmOwnershipAction}
         >
-          {ownershipDialogBusy
-            ? "Working..."
-            : pendingOwnershipAction === "adopt"
-              ? "Record as Studio-managed"
-              : "Forget metadata"}
+          {ownershipDialogBusy ? "Working..." : "Forget metadata"}
         </Button>
       </Dialog.Footer>
     </Dialog.Content>
