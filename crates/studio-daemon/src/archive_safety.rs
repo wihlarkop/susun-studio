@@ -71,6 +71,11 @@ pub fn extract_safely(archive_bytes: &[u8], destination: &Path) -> Result<(), Ex
         }
     }
 
+    // Reject conflicting entries before touching the filesystem, so a hostile
+    // archive whose entries collide cannot cause a partial write partway through
+    // phase 2 (e.g. a file `node` plus a `node/child`, or file `a` plus `a/b`).
+    reject_conflicting_entries(&directories, &files)?;
+
     // Phase 2 — write into the destination, never following a link/junction.
     ensure_real_dir(destination)?;
     for directory in &directories {
@@ -157,6 +162,54 @@ fn is_reserved_windows_name(name: &str) -> bool {
             .is_some_and(|digit| (b'1'..=b'9').contains(digit));
     }
     false
+}
+
+/// The normalized component key for a path: its `Normal` components, lowercased.
+/// Comparison is case-insensitive because the extraction target may be a
+/// case-insensitive filesystem (Windows/macOS), where `Node` and `node` collide.
+fn path_key(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Rejects archives whose entries conflict, so extraction cannot get partway
+/// through before hitting a collision. Guarantees, before any write, that:
+/// every entry path is unique; no path is declared as both a file and a
+/// directory; and no regular file is an ancestor (parent directory) of another
+/// entry.
+fn reject_conflicting_entries(
+    directories: &[PathBuf],
+    files: &[(PathBuf, Vec<u8>)],
+) -> Result<(), ExtractionError> {
+    use std::collections::HashSet;
+
+    let dir_keys: Vec<Vec<String>> = directories.iter().map(|path| path_key(path)).collect();
+    let file_keys: Vec<Vec<String>> = files.iter().map(|(path, _)| path_key(path)).collect();
+
+    // Every entry path must be unique across files and directories. A path that
+    // appears twice — or as both a file and a directory — is a conflict.
+    let mut seen: HashSet<Vec<String>> = HashSet::new();
+    for key in dir_keys.iter().chain(file_keys.iter()) {
+        if !seen.insert(key.clone()) {
+            return Err(ExtractionError::UnsafePath(key.join("/")));
+        }
+    }
+
+    // No regular file may be an ancestor directory of another entry: no entry
+    // key may have a file key as a strict path prefix.
+    let file_key_set: HashSet<Vec<String>> = file_keys.iter().cloned().collect();
+    for key in dir_keys.iter().chain(file_keys.iter()) {
+        for len in 1..key.len() {
+            if file_key_set.contains(&key[..len].to_vec()) {
+                return Err(ExtractionError::UnsafePath(key.join("/")));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Ensures `path` is a real directory, creating it if missing. An existing
@@ -382,6 +435,36 @@ mod tests {
         assert!(
             !dir_exists,
             "the destination must not be created on failure"
+        );
+    }
+
+    #[test]
+    fn a_regular_file_that_is_an_ancestor_of_another_entry_is_rejected() {
+        let dir = unique_dir("ancestor");
+        // File `a`, then a file `a/b` under it: `a` cannot be both a file and a
+        // parent directory. Must fail before anything is written.
+        let archive = raw_tar(&[("a", b"file"), ("a/b", b"child")]);
+        let result = extract_safely(&archive, &dir);
+        let dir_exists = dir.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(result, Err(ExtractionError::UnsafePath(_))));
+        assert!(
+            !dir_exists,
+            "conflict must fail before creating the destination"
+        );
+    }
+
+    #[test]
+    fn duplicate_entry_paths_are_rejected() {
+        let dir = unique_dir("dup");
+        let archive = raw_tar(&[("dup.txt", b"first"), ("dup.txt", b"second")]);
+        let result = extract_safely(&archive, &dir);
+        let dir_exists = dir.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(result, Err(ExtractionError::UnsafePath(_))));
+        assert!(
+            !dir_exists,
+            "conflict must fail before creating the destination"
         );
     }
 
