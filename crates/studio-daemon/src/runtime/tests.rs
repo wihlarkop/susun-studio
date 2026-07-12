@@ -263,7 +263,7 @@ async fn missing_only_after_authoritative_scan() -> TestResult {
 }
 
 #[tokio::test]
-async fn reserved_name_conflicts_and_adoption_recovers() -> TestResult {
+async fn reserved_name_conflicts_cannot_be_adopted() -> TestResult {
     let (db, path) = fresh_db().await?;
     let key = format!("machine/{RESERVED_BUILT_IN_MACHINE}");
     super::persist_observed(
@@ -288,7 +288,7 @@ async fn reserved_name_conflicts_and_adoption_recovers() -> TestResult {
     assert!(!profile.management.can_select);
     assert!(!profile.management.can_forget);
     assert!(profile.management.blocks_destructive_actions);
-    assert!(profile.management.can_adopt);
+    assert!(!profile.management.can_adopt);
     assert!(matches!(
         super::select_profile(&db, &profile.id).await?,
         super::SelectOutcome::Unavailable
@@ -317,15 +317,21 @@ async fn reserved_name_conflicts_and_adoption_recovers() -> TestResult {
         (Some(profile.id.clone()), Some("built_in".to_owned()))
     );
 
-    // Deliberate recovery/adoption assigns Studio ownership + an owner token.
+    // A discovered reserved-name machine cannot manufacture ownership evidence.
     assert!(matches!(
         super::adopt_profile(&db, &profile.id).await?,
-        AdoptOutcome::Adopted
+        AdoptOutcome::OwnershipUnproven
     ));
-    let adopted = by_key(&db, &key).await?;
-    assert_eq!(adopted.ownership_state, "studio_managed");
-    assert_eq!(adopted.source, "studio_setup");
-    assert!(!adopted.management.blocks_destructive_actions);
+    let conflict = by_key(&db, &key).await?;
+    assert_eq!(conflict.ownership_state, "ownership_conflict");
+
+    // Only the successful trusted setup path may claim the exact profile.
+    assert!(super::claim_setup_profile(&db, "windows-podman", &key, &profile.id).await?);
+    let managed = by_key(&db, &key).await?;
+    assert_eq!(managed.ownership_state, "studio_managed");
+    assert_eq!(managed.source, "studio_setup");
+    assert!(managed.is_selected);
+    assert!(!managed.management.blocks_destructive_actions);
 
     let _ = std::fs::remove_file(&path);
     Ok(())
@@ -413,13 +419,15 @@ fn podman_lifecycle_without_a_selected_profile_has_no_command() {
 }
 
 #[test]
-fn podman_init_runs_as_current_user_runtime_cli() -> TestResult {
+fn podman_setup_uses_reserved_name_as_current_user_runtime_cli() -> TestResult {
     let command = WindowsPodmanProvider
-        .build_command("init", &[])
-        .ok_or("podman init command should exist")?;
+        .build_command("setup", &[])
+        .ok_or("podman setup command should exist")?;
     assert_eq!(command.program, TrustedProgram::Podman);
     assert_eq!(command.kind, CommandKind::RuntimeCli);
     assert_eq!(command.elevation, ProcessElevation::CurrentUser);
+    let args: Vec<&str> = command.args.iter().filter_map(|arg| arg.to_str()).collect();
+    assert_eq!(args, ["machine", "init", RESERVED_BUILT_IN_MACHINE]);
     Ok(())
 }
 

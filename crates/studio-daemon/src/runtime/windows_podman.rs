@@ -80,12 +80,20 @@ impl RuntimeProvider for WindowsPodmanProvider {
         let supported = self.supported();
         let installed = observation.installation.state == "installed";
         let missing = observation.installation.state == "not_installed";
-        let not_created = observation.process.state == "not_created";
+        let built_in = profiles.iter().find(|profile| {
+            profile.provider_id == self.id()
+                && profile.provider_runtime_key == format!("machine/{RESERVED_BUILT_IN_MACHINE}")
+        });
         let selected = profiles
             .iter()
             .find(|profile| profile.is_selected && profile.provider_id == self.id());
-        let selected_running = selected.is_some_and(|profile| profile.process.state == "running");
-        let selected_stopped = selected.is_some_and(|profile| profile.process.state == "stopped");
+        let selected_managed = selected.is_some_and(|profile| {
+            profile.runtime_class == "built_in" && profile.ownership_state == "studio_managed"
+        });
+        let selected_running =
+            selected_managed && selected.is_some_and(|profile| profile.process.state == "running");
+        let selected_stopped =
+            selected_managed && selected.is_some_and(|profile| profile.process.state == "stopped");
         let winget_check = supported
             .then(|| command_output("winget", &["--version"]))
             .transpose();
@@ -112,16 +120,16 @@ impl RuntimeProvider for WindowsPodmanProvider {
                 .to_owned(),
             },
             RuntimeAction {
-                id: "init".to_owned(),
-                label: "Initialize".to_owned(),
+                id: "setup".to_owned(),
+                label: "Set up Susun Runtime".to_owned(),
                 destructive: false,
-                enabled: supported && installed && not_created,
-                reason: if not_created {
-                    "Create a Podman machine."
+                enabled: supported && installed && built_in.is_none(),
+                reason: if built_in.is_some() {
+                    "The reserved Susun Runtime name already exists. Studio will not adopt it."
                 } else if !installed {
                     "Install Podman first."
                 } else {
-                    "A Podman machine already exists."
+                    "Create the dedicated Susun Runtime, powered by Podman."
                 }
                 .to_owned(),
             },
@@ -133,7 +141,7 @@ impl RuntimeProvider for WindowsPodmanProvider {
                 reason: if selected_stopped {
                     "Start the selected Podman machine."
                 } else {
-                    "Select a stopped Podman machine first."
+                    "Select a stopped Studio-managed Susun Runtime first."
                 }
                 .to_owned(),
             },
@@ -145,7 +153,7 @@ impl RuntimeProvider for WindowsPodmanProvider {
                 reason: if selected_running {
                     "Stop the selected Podman machine."
                 } else {
-                    "Select a running Podman machine first."
+                    "Select a running Studio-managed Susun Runtime first."
                 }
                 .to_owned(),
             },
@@ -157,7 +165,7 @@ impl RuntimeProvider for WindowsPodmanProvider {
                 reason: if selected_running {
                     "Restart the selected Podman machine."
                 } else {
-                    "Select a running Podman machine first."
+                    "Select a running Studio-managed Susun Runtime first."
                 }
                 .to_owned(),
             },
@@ -210,20 +218,27 @@ impl WindowsPodmanProvider {
                 elevation: ProcessElevation::OneShotOsMediated,
                 success_message: "Podman install command finished.".to_owned(),
             }),
-            "init" => Some(ExecutableCommand {
+            "setup" => Some(ExecutableCommand {
                 program: TrustedProgram::Podman,
-                args: vec!["machine".into(), "init".into()],
+                args: vec![
+                    "machine".into(),
+                    "init".into(),
+                    RESERVED_BUILT_IN_MACHINE.into(),
+                ],
                 env_allowlist: Vec::new(),
                 working_dir: None,
                 timeout: Duration::from_secs(10 * 60),
                 kind: CommandKind::RuntimeCli,
                 elevation: ProcessElevation::CurrentUser,
-                success_message: "Podman machine created. Use Start to bring it online.".to_owned(),
+                success_message: "Susun Runtime created. Use Start to bring it online.".to_owned(),
             }),
             "start" | "stop" | "restart" => {
-                let profile = profiles
-                    .iter()
-                    .find(|profile| profile.is_selected && profile.provider_id == self.id())?;
+                let profile = profiles.iter().find(|profile| {
+                    profile.is_selected
+                        && profile.provider_id == self.id()
+                        && profile.runtime_class == "built_in"
+                        && profile.ownership_state == "studio_managed"
+                })?;
                 let machine = profile.provider_runtime_key.strip_prefix("machine/")?;
                 Some(ExecutableCommand {
                     program: TrustedProgram::Podman,
@@ -406,7 +421,11 @@ impl WindowsPodmanProvider {
             id: profile_id(self.id(), &key),
             provider_id: self.id().to_owned(),
             provider_runtime_key: key,
-            display_name: format!("Podman machine {name}"),
+            display_name: if name == RESERVED_BUILT_IN_MACHINE {
+                "Susun Runtime".to_owned()
+            } else {
+                format!("Podman machine {name}")
+            },
             product: self.product().to_owned(),
             platform: self.platform().to_owned(),
             runtime_class,

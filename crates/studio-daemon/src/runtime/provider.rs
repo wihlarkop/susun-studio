@@ -162,8 +162,7 @@ impl ManagementCapabilities {
         Self {
             can_select: availability_state == "available" && !unproven_built_in,
             can_forget: !built_in && !studio_managed,
-            can_adopt: built_in
-                && matches!(ownership_state, "ownership_conflict" | "ownership_unknown"),
+            can_adopt: false,
             requires_recovery: unproven_built_in,
             blocks_destructive_actions: unproven_built_in,
         }

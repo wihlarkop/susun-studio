@@ -196,7 +196,7 @@ export type RuntimeDimension = {
 };
 
 export type RuntimeAction = {
-  id: "install" | "init" | "start" | "stop" | "restart";
+  id: "install" | "setup" | "start" | "stop" | "restart";
   label: string;
   destructive: boolean;
   enabled: boolean;

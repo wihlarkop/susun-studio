@@ -91,13 +91,16 @@ pub async fn adopt_runtime_profile(
         &[("profile_id", profile_id.clone())],
     );
     match runtime::adopt_profile(&state.db, &profile_id).await? {
-        runtime::AdoptOutcome::Adopted => Ok(Json(serde_json::json!({ "adopted": true }))),
         runtime::AdoptOutcome::NotFound => Err(ApiError::RuntimeProfileNotFound),
         runtime::AdoptOutcome::NotBuiltIn => Err(ApiError::ActionUnavailable(
             "Only a built-in runtime can be adopted by Studio.".to_owned(),
         )),
         runtime::AdoptOutcome::AlreadyManaged => Err(ApiError::ActionUnavailable(
             "This built-in runtime is already Studio-managed.".to_owned(),
+        )),
+        runtime::AdoptOutcome::OwnershipUnproven => Err(ApiError::ActionUnavailable(
+            "Studio cannot adopt a runtime it did not create. Remove the naming conflict and use Set up Susun Runtime."
+                .to_owned(),
         )),
     }
 }
