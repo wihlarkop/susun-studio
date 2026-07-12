@@ -31,9 +31,13 @@ pub use model::{
 mod authenticode;
 #[cfg(windows)]
 mod ffi;
+#[cfg(windows)]
+mod msix;
 
 #[cfg(windows)]
 pub use authenticode::verify_authenticode_executable;
+#[cfg(windows)]
+pub use msix::verify_msix_alias;
 
 /// Non-Windows stub: verification is only meaningful on Windows. Callers must
 /// treat this as "cannot verify" — never as "verified".
@@ -41,5 +45,13 @@ pub use authenticode::verify_authenticode_executable;
 pub fn verify_authenticode_executable(
     _path: &std::path::Path,
 ) -> Result<VerifiedExecutableIdentity, WindowsTrustError> {
+    Err(WindowsTrustError::UnsupportedPlatform)
+}
+
+/// Non-Windows stub for MSIX package verification. See above.
+#[cfg(not(windows))]
+pub fn verify_msix_alias(
+    _policy: &MsixProgramPolicy,
+) -> Result<VerifiedMsixProgram, WindowsTrustError> {
     Err(WindowsTrustError::UnsupportedPlatform)
 }
