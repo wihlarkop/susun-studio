@@ -244,6 +244,9 @@ pub async fn connect_engine(
             ));
         }
     };
+    // Fail closed on any endpoint Studio is not allowed to reach (e.g. a
+    // remote/TCP endpoint): built-in engine access stays OS-scoped and local.
+    runtime::validate_engine_endpoint(&endpoint).map_err(|error| error.to_string())?;
     BollardEngine::connect_to(endpoint).map_err(|error| error.to_string())
 }
 

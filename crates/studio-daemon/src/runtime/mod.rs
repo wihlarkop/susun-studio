@@ -1,4 +1,5 @@
 mod command;
+mod endpoint_policy;
 mod provider;
 mod trusted_exec;
 pub mod trusted_plans;
@@ -22,6 +23,7 @@ use turso::{Connection, Database, params};
 use windows_docker_desktop::WindowsDockerDesktopProvider;
 use windows_podman::WindowsPodmanProvider;
 
+pub use endpoint_policy::validate_engine_endpoint;
 pub use provider::{
     ManagementCapabilities, RuntimeAction, RuntimeDimension, RuntimeError, RuntimeProfile,
 };

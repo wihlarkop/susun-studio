@@ -542,3 +542,17 @@ fn provider_commands_inherit_no_environment_by_default() -> TestResult {
     }
     Ok(())
 }
+
+// --- Endpoint redaction (Runtime Security 2) ------------------------------
+
+#[test]
+fn engine_endpoint_summary_is_redacted_not_a_raw_pipe_path() {
+    // The endpoint summary is the only endpoint form that reaches DTOs, the DB,
+    // logs, backups, and diagnostics. It must never carry a real pipe path.
+    let summary = super::provider::EndpointSummary::windows_named_pipe();
+    assert!(!summary.redacted.contains('\\'));
+    assert!(summary.redacted.contains("<local-pipe>"));
+    let json = summary.to_json_string().unwrap_or_default();
+    assert!(!json.contains('\\'));
+    assert!(json.contains("<local-pipe>"));
+}
