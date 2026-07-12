@@ -26,6 +26,7 @@ pub enum TrustedProgram {
     Winget,
     Podman,
     PowerShell,
+    #[cfg(windows)]
     Taskkill,
 }
 
@@ -38,6 +39,7 @@ impl TrustedProgram {
             TrustedProgram::Winget => "winget",
             TrustedProgram::Podman => "podman",
             TrustedProgram::PowerShell => "powershell",
+            #[cfg(windows)]
             TrustedProgram::Taskkill => "taskkill",
         }
     }

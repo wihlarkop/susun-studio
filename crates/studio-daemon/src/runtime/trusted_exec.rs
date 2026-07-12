@@ -124,6 +124,7 @@ pub fn policy_for(program: TrustedProgram) -> ExecutableIdentityPolicy {
             }],
             allowed_publishers: vec![MICROSOFT_WINDOWS],
         },
+        #[cfg(windows)]
         TrustedProgram::Taskkill => ExecutableIdentityPolicy::Authenticode {
             allowed_paths: vec![TrustedPathRule {
                 directory: windows_dir().join("System32"),
@@ -242,6 +243,7 @@ mod tests {
             policy_for(TrustedProgram::Podman),
             ExecutableIdentityPolicy::Authenticode { .. }
         ));
+        #[cfg(windows)]
         assert!(matches!(
             policy_for(TrustedProgram::Taskkill),
             ExecutableIdentityPolicy::Authenticode { .. }

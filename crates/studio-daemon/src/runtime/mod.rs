@@ -7,7 +7,9 @@ mod windows_podman;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use command::{ExecutableCommand, ProcessElevation, TrustedProgram};
+#[cfg(windows)]
+use command::TrustedProgram;
+use command::{ExecutableCommand, ProcessElevation};
 use provider::{ObservedProfile, RuntimeClass, RuntimeProvider};
 use serde::Serialize;
 use susun::EngineEndpoint;
