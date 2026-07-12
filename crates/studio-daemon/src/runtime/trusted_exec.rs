@@ -217,6 +217,7 @@ pub fn verify_trusted_program(program: TrustedProgram) -> Result<VerifiedTarget,
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn path_rule_matches_case_insensitively_and_rejects_other_dirs() {
         let rule = TrustedPathRule {
