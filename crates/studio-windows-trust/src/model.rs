@@ -308,6 +308,7 @@ mod tests {
         assert!(!policy.publisher_allowed(&bad));
     }
 
+    #[cfg(windows)]
     #[test]
     fn execution_alias_rejects_a_planted_copy_elsewhere() {
         let alias = AppExecutionAlias {
