@@ -64,7 +64,7 @@ fn sanitize_value(value: &str) -> String {
     }
 }
 
-fn redact_sensitive_text(text: &str) -> String {
+pub(crate) fn redact_sensitive_text(text: &str) -> String {
     text.split_inclusive(char::is_whitespace)
         .map(redact_token_segment)
         .collect::<String>()

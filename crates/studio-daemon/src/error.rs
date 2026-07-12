@@ -83,6 +83,9 @@ pub enum ApiError {
     #[error("action unavailable: {0}")]
     ActionUnavailable(String),
 
+    #[error("trusted runtime plan endpoints do not accept executable content")]
+    TrustedPlanContentRejected,
+
     #[error("backup failed: {0}")]
     BackupFailed(String),
 
@@ -121,9 +124,10 @@ impl IntoResponse for ApiError {
         let error = self.to_string();
         let status = match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::MissingName | Self::MissingPath | Self::MissingComposeFiles => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::MissingName
+            | Self::MissingPath
+            | Self::MissingComposeFiles
+            | Self::TrustedPlanContentRejected => StatusCode::BAD_REQUEST,
             Self::ProjectNotFound
             | Self::PlanNotFound
             | Self::JobNotFound

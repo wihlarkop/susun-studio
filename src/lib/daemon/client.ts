@@ -290,6 +290,24 @@ export type RuntimeActionResult = {
   next_steps: string[];
 };
 
+export type TrustedRuntimePlan = {
+  plan_id: string;
+  provider_id: string;
+  action: string;
+  label: string;
+  destructive: boolean;
+  consequence: string;
+  elevation: "current_user" | "os_mediated_consent";
+  command_summary: string;
+  expires_in_seconds: number;
+  state: "pending";
+};
+
+export type PrepareRuntimeActionResponse = {
+  plan?: TrustedRuntimePlan;
+  result?: RuntimeActionResult;
+};
+
 export type RuntimeLogLine = {
   level: string;
   message: string;
@@ -547,18 +565,38 @@ export async function readRuntimeStatus(
   return readJson("/v1/runtime/status", options);
 }
 
-export async function runRuntimeAction(
+export async function prepareRuntimeAction(
   providerId: string,
   action: RuntimeAction["id"],
   options: DaemonRequestOptions = {},
-): Promise<RuntimeActionResult> {
+): Promise<PrepareRuntimeActionResponse> {
   return readJson(
-    `/v1/runtime/providers/${encodeURIComponent(providerId)}/actions/${encodeURIComponent(action)}`,
+    `/v1/runtime/providers/${encodeURIComponent(providerId)}/actions/${encodeURIComponent(action)}/prepare`,
     {
       ...options,
       method: "POST",
     },
   );
+}
+
+export async function executeRuntimePlan(
+  planId: string,
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeActionResult> {
+  return readJson(`/v1/runtime/plans/${encodeURIComponent(planId)}/execute`, {
+    ...options,
+    method: "POST",
+  });
+}
+
+export async function cancelRuntimePlan(
+  planId: string,
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeActionResult> {
+  return readJson(`/v1/runtime/plans/${encodeURIComponent(planId)}/cancel`, {
+    ...options,
+    method: "POST",
+  });
 }
 
 export async function readRuntimeLogs(

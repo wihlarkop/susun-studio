@@ -5,10 +5,12 @@
   import { Button } from "$lib/components/ui/button/index.js";
   import {
     adoptRuntimeProfile,
+    cancelRuntimePlan,
+    executeRuntimePlan,
     forgetRuntimeProfile,
     readRuntimeLogs,
     readRuntimeStatus,
-    runRuntimeAction,
+    prepareRuntimeAction,
     selectRuntimeProfile,
     type RuntimeAction,
     type RuntimeActionResult,
@@ -18,6 +20,7 @@
     type RuntimeProfile,
     type RuntimeProviderStatus,
     type RuntimeStatus,
+    type TrustedRuntimePlan,
   } from "$lib/daemon/client";
   import {
     AlertCircle,
@@ -43,6 +46,9 @@
   let ownershipDialogBusy = $state(false);
   let pendingOwnershipProfile = $state<RuntimeProfile | null>(null);
   let pendingOwnershipAction = $state<"adopt" | "forget" | null>(null);
+  let trustedPlan = $state<TrustedRuntimePlan | null>(null);
+  let trustedPlanDialogOpen = $state(false);
+  let trustedPlanBusy = $state(false);
 
   const actionIcons = {
     install: Wrench,
@@ -72,6 +78,12 @@
     return () => controller.abort();
   });
 
+  $effect(() => {
+    if (!trustedPlanDialogOpen && trustedPlan && !trustedPlanBusy) {
+      void cancelPreparedPlan();
+    }
+  });
+
   async function refresh(signal?: AbortSignal) {
     loading = true;
     try {
@@ -92,8 +104,52 @@
   }
 
   async function handleAction(providerId: string, action: RuntimeAction) {
-    actionResult = await runRuntimeAction(providerId, action.id);
-    await refresh();
+    try {
+      const prepared = await prepareRuntimeAction(providerId, action.id);
+      if (prepared.result) {
+        actionResult = prepared.result;
+        await refresh();
+        return;
+      }
+      if (prepared.plan) {
+        trustedPlan = prepared.plan;
+        trustedPlanDialogOpen = true;
+      }
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  async function executePreparedPlan() {
+    if (!trustedPlan) return;
+    trustedPlanBusy = true;
+    try {
+      actionResult = await executeRuntimePlan(trustedPlan.plan_id);
+      trustedPlanDialogOpen = false;
+      trustedPlan = null;
+      await refresh();
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+    } finally {
+      trustedPlanBusy = false;
+    }
+  }
+
+  async function cancelPreparedPlan() {
+    if (!trustedPlan) {
+      trustedPlanDialogOpen = false;
+      return;
+    }
+    trustedPlanBusy = true;
+    try {
+      actionResult = await cancelRuntimePlan(trustedPlan.plan_id);
+      trustedPlanDialogOpen = false;
+      trustedPlan = null;
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+    } finally {
+      trustedPlanBusy = false;
+    }
   }
 
   async function handleSelect(profile: RuntimeProfile) {
@@ -544,6 +600,57 @@
       </ul>
     {/if}
   </Card.Root>
+
+  <Dialog.Root bind:open={trustedPlanDialogOpen}>
+    <Dialog.Content class="sm:max-w-lg">
+      <Dialog.Header>
+        <Dialog.Title>{trustedPlan?.label ?? "Approve runtime action"}</Dialog.Title>
+        <Dialog.Description>
+          Review the exact consequence before allowing this single-use runtime plan.
+        </Dialog.Description>
+      </Dialog.Header>
+      {#if trustedPlan}
+        <div class="grid gap-3 text-sm">
+          <div class="grid gap-1">
+            <span class="font-medium">Consequence</span>
+            <span class="text-muted-foreground">{trustedPlan.consequence}</span>
+          </div>
+          <div class="grid gap-1">
+            <span class="font-medium">Verified operation</span>
+            <span class="text-muted-foreground">{trustedPlan.command_summary}</span>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <Badge variant={trustedPlan.destructive ? "destructive" : "secondary"}>
+              {trustedPlan.destructive ? "Destructive" : "Runtime mutation"}
+            </Badge>
+            <Badge variant="outline">
+              {trustedPlan.elevation === "os_mediated_consent"
+                ? "Administrator consent expected"
+                : "Current user"}
+            </Badge>
+            <Badge variant="outline">Expires in {trustedPlan.expires_in_seconds}s</Badge>
+          </div>
+          <p class="text-xs text-muted-foreground">
+            Executable paths, arguments, environment values, and credentials are intentionally
+            hidden. They are fixed by Studio and cannot be changed from this dialog.
+          </p>
+        </div>
+      {/if}
+      <Dialog.Footer>
+        <Button type="button" variant="outline" disabled={trustedPlanBusy} onclick={cancelPreparedPlan}>
+          Cancel
+        </Button>
+        <Button
+          type="button"
+          variant={trustedPlan?.destructive ? "destructive" : "default"}
+          disabled={trustedPlanBusy || !trustedPlan}
+          onclick={executePreparedPlan}
+        >
+          {trustedPlanBusy ? "Working..." : "Approve and run"}
+        </Button>
+      </Dialog.Footer>
+    </Dialog.Content>
+  </Dialog.Root>
 
   <Dialog.Root bind:open={ownershipDialogOpen}>
     <Dialog.Content class="sm:max-w-lg">

@@ -95,8 +95,16 @@ pub fn app(state: AppState) -> Router {
             post(runtime::adopt_runtime_profile),
         )
         .route(
-            "/v1/runtime/providers/{provider_id}/actions/{action}",
-            post(runtime::runtime_action),
+            "/v1/runtime/providers/{provider_id}/actions/{action}/prepare",
+            post(runtime::prepare_runtime_action),
+        )
+        .route(
+            "/v1/runtime/plans/{plan_id}/execute",
+            post(runtime::execute_runtime_plan),
+        )
+        .route(
+            "/v1/runtime/plans/{plan_id}/cancel",
+            post(runtime::cancel_runtime_plan),
         )
         .route("/v1/projects/{id}/actions/up", post(jobs::action_up))
         .route("/v1/projects/{id}/actions/down", post(jobs::action_down))

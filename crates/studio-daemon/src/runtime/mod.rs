@@ -1,13 +1,23 @@
+mod command;
 mod provider;
+mod trusted_exec;
+pub mod trusted_plans;
 mod windows_docker_desktop;
 mod windows_podman;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use provider::{ObservedProfile, RuntimeClass, RuntimeCommand, RuntimeProvider};
+#[cfg(windows)]
+use command::TrustedProgram;
+use command::{ExecutableCommand, ProcessElevation};
+use provider::{ObservedProfile, RuntimeClass, RuntimeProvider};
 use serde::Serialize;
 use susun::EngineEndpoint;
-use tokio::time::{Duration, timeout};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command,
+    time::timeout,
+};
 use turso::{Connection, Database, params};
 use windows_docker_desktop::WindowsDockerDesktopProvider;
 use windows_podman::WindowsPodmanProvider;
@@ -456,104 +466,6 @@ async fn endpoint_for_profile(
         .and_then(|provider| provider.endpoint_for_runtime_key(&provider_runtime_key)))
 }
 
-pub async fn action(
-    db: &Database,
-    provider_id: &str,
-    action: &str,
-) -> Result<RuntimeActionResult, turso::Error> {
-    let Some(provider) = find_provider(provider_id) else {
-        return Ok(RuntimeActionResult {
-            action: action.to_owned(),
-            status: "not_executed".to_owned(),
-            message: format!("Unknown runtime provider `{provider_id}`."),
-            next_steps: vec!["Recheck runtime status to see available providers.".to_owned()],
-        });
-    };
-
-    let observation = provider.detect();
-    reconcile_provider(
-        db,
-        provider_id,
-        &observation.profiles,
-        &observation.scanned_keys,
-    )
-    .await?;
-    let profiles = list_profiles_for_provider(db, provider_id).await?;
-    let actions = provider.planned_actions(&observation, &profiles);
-    let Some(action_state) = actions.iter().find(|candidate| candidate.id == action) else {
-        return Ok(RuntimeActionResult {
-            action: action.to_owned(),
-            status: "not_executed".to_owned(),
-            message: "Unknown runtime action.".to_owned(),
-            next_steps: vec!["Recheck runtime status to see available actions.".to_owned()],
-        });
-    };
-
-    let mut next_steps = observation.remediation.clone();
-    if next_steps.is_empty() {
-        next_steps.push("Use the Runtime panel to review the current provider state.".to_owned());
-    }
-    if !action_state.enabled {
-        return Ok(RuntimeActionResult {
-            action: action.to_owned(),
-            status: "not_executed".to_owned(),
-            message: action_state.reason.clone(),
-            next_steps,
-        });
-    }
-
-    // Ownership gate: never run a mutating lifecycle action against a built-in
-    // runtime Studio cannot prove it manages. Every destructive built-in action
-    // must be able to point at studio_managed ownership evidence.
-    if let Some(target) = profiles
-        .iter()
-        .find(|profile| profile.is_selected && profile.provider_id == provider_id)
-        && target.management.blocks_destructive_actions
-    {
-        return Ok(RuntimeActionResult {
-            action: action.to_owned(),
-            status: "not_executed".to_owned(),
-            message: "Studio can't prove it manages this built-in runtime, so lifecycle actions are blocked."
-                .to_owned(),
-            next_steps: vec![
-                "Run built-in recovery to adopt this runtime, or forget it and start fresh."
-                    .to_owned(),
-            ],
-        });
-    }
-
-    let Some(command) = provider.command_for_action(action, &profiles) else {
-        return Ok(RuntimeActionResult {
-            action: action.to_owned(),
-            status: "not_executed".to_owned(),
-            message: "No supported runtime profile is selected for this action.".to_owned(),
-            next_steps,
-        });
-    };
-
-    match run_command(&command).await {
-        Ok(output) => {
-            next_steps.push("Recheck runtime status to refresh observed state.".to_owned());
-            Ok(RuntimeActionResult {
-                action: action.to_owned(),
-                status: "executed".to_owned(),
-                message: if output.trim().is_empty() {
-                    command.success_message
-                } else {
-                    format!("{} {}", command.success_message, output.trim())
-                },
-                next_steps,
-            })
-        }
-        Err(error) => Ok(RuntimeActionResult {
-            action: action.to_owned(),
-            status: "failed".to_owned(),
-            message: error,
-            next_steps,
-        }),
-    }
-}
-
 pub fn logs() -> Vec<RuntimeLogLine> {
     let mut lines = Vec::new();
     for provider in registered_providers() {
@@ -604,81 +516,356 @@ pub(crate) fn command_output(program: &str, args: &[&str]) -> Result<String, Str
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Runs a runtime command, retrying once via the OS's own UAC consent prompt
-/// when the command is marked `elevate_if_needed` and the unelevated attempt
-/// fails. This is a one-shot elevation per action (no persistent privileged
-/// helper), matching the Phase 9 design's `2026-07-06-privileged-helper-design.md`.
-async fn run_command(command: &RuntimeCommand) -> Result<String, String> {
-    match run_once(command.program, &command.args, command.timeout_secs).await {
-        Ok(output) => Ok(output),
-        Err(error) if command.elevate_if_needed => {
-            run_elevated(command.program, &command.args, command.timeout_secs)
-                .await
-                .map_err(|elevated_error| {
-                    format!("{error}; elevated retry also failed: {elevated_error}")
-                })
+/// Runs exactly one trusted runtime command at its pre-approved elevation.
+/// Current-user failures never retry with broader privileges. Commands marked
+/// for one-shot OS-mediated elevation launch directly through the UAC path,
+/// with no persistent privileged helper.
+///
+/// Before launching, the program is resolved to its trusted absolute path and
+/// its identity re-verified (Authenticode or MSIX) against the daemon's policy —
+/// so a swapped or untrusted binary is rejected at the last moment, and the
+/// process is launched by verified absolute path, never a `PATH` lookup.
+#[derive(Debug)]
+enum CommandRunError {
+    Cancelled,
+    Failed(String),
+}
+
+pub async fn prepare_trusted_action(
+    db: &Database,
+    store: &trusted_plans::TrustedPlanStore,
+    owner: &str,
+    provider_id: &str,
+    action: &str,
+) -> Result<Result<trusted_plans::TrustedPlanPreview, RuntimeActionResult>, turso::Error> {
+    let Some((action_state, command, _next_steps)) =
+        resolve_trusted_action(db, provider_id, action).await?
+    else {
+        return Ok(Err(not_executed(
+            action,
+            "Runtime action is unavailable. Recheck provider state.",
+        )));
+    };
+    if let Err(error) = trusted_exec::verify_trusted_program(command.program) {
+        return Ok(Err(not_executed(action, &error.to_string())));
+    }
+    Ok(Ok(store.prepare(
+        owner,
+        trusted_plans::TrustedPlanMetadata {
+            provider_id,
+            action,
+            label: &action_state.label,
+            destructive: action_state.destructive,
+            consequence: &action_state.reason,
+        },
+        command,
+    )))
+}
+
+pub async fn execute_trusted_action(
+    db: &Database,
+    store: &trusted_plans::TrustedPlanStore,
+    owner: &str,
+    plan_id: &str,
+) -> RuntimeActionResult {
+    let claimed = match store.claim(plan_id, owner) {
+        Ok(claimed) => claimed,
+        Err(error) => return not_executed("trusted_plan", &error.to_string()),
+    };
+    let resolved = match resolve_trusted_action(db, &claimed.provider_id, &claimed.action).await {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            store.finish(&claimed.plan_id, trusted_plans::TrustedPlanState::Failed);
+            return not_executed(
+                &claimed.action,
+                "Provider state changed; prepare a new plan.",
+            );
         }
-        Err(error) => Err(error),
+        Err(_) => {
+            store.finish(&claimed.plan_id, trusted_plans::TrustedPlanState::Failed);
+            return not_executed(&claimed.action, "Provider revalidation failed.");
+        }
+    };
+    if resolved.1 != claimed.command {
+        store.finish(&claimed.plan_id, trusted_plans::TrustedPlanState::Failed);
+        return not_executed(
+            &claimed.action,
+            "Approved command changed; prepare a new plan.",
+        );
+    }
+    let mut next_steps = resolved.2;
+    let result = match run_command(&claimed.command).await {
+        Ok(output) => {
+            next_steps.push("Recheck runtime status to refresh observed state.".to_owned());
+            RuntimeActionResult {
+                action: claimed.action,
+                status: "executed".to_owned(),
+                message: if output.trim().is_empty() {
+                    claimed.command.success_message
+                } else {
+                    format!("{} {}", claimed.command.success_message, output.trim())
+                },
+                next_steps,
+            }
+        }
+        Err(CommandRunError::Cancelled) => RuntimeActionResult {
+            action: claimed.action,
+            status: "cancelled".to_owned(),
+            message: "The elevation request was cancelled. No fallback was attempted.".to_owned(),
+            next_steps,
+        },
+        Err(CommandRunError::Failed(error)) => RuntimeActionResult {
+            action: claimed.action,
+            status: "failed".to_owned(),
+            message: error,
+            next_steps,
+        },
+    };
+    let terminal_state = match result.status.as_str() {
+        "executed" => trusted_plans::TrustedPlanState::Succeeded,
+        "cancelled" => trusted_plans::TrustedPlanState::Cancelled,
+        _ => trusted_plans::TrustedPlanState::Failed,
+    };
+    store.finish(&claimed.plan_id, terminal_state);
+    result
+}
+
+pub fn cancel_trusted_action(
+    store: &trusted_plans::TrustedPlanStore,
+    owner: &str,
+    plan_id: &str,
+) -> RuntimeActionResult {
+    match store.cancel(plan_id, owner) {
+        Ok(()) => RuntimeActionResult {
+            action: "trusted_plan".to_owned(),
+            status: "cancelled".to_owned(),
+            message: "The trusted runtime plan was cancelled.".to_owned(),
+            next_steps: Vec::new(),
+        },
+        Err(error) => not_executed("trusted_plan", &error.to_string()),
     }
 }
 
-async fn run_once(program: &str, args: &[String], timeout_secs: u64) -> Result<String, String> {
-    let output = timeout(
-        Duration::from_secs(timeout_secs),
-        tokio::process::Command::new(program).args(args).output(),
+fn not_executed(action: &str, message: &str) -> RuntimeActionResult {
+    RuntimeActionResult {
+        action: action.to_owned(),
+        status: "not_executed".to_owned(),
+        message: message.to_owned(),
+        next_steps: vec![
+            "Prepare a fresh runtime plan after rechecking provider state.".to_owned(),
+        ],
+    }
+}
+
+async fn resolve_trusted_action(
+    db: &Database,
+    provider_id: &str,
+    action: &str,
+) -> Result<Option<(RuntimeAction, ExecutableCommand, Vec<String>)>, turso::Error> {
+    let Some(provider) = find_provider(provider_id) else {
+        return Ok(None);
+    };
+    let observation = provider.detect();
+    reconcile_provider(
+        db,
+        provider_id,
+        &observation.profiles,
+        &observation.scanned_keys,
     )
-    .await
-    .map_err(|_| format!("{program} timed out"))?
-    .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    .await?;
+    let profiles = list_profiles_for_provider(db, provider_id).await?;
+    let actions = provider.planned_actions(&observation, &profiles);
+    let Some(action_state) = actions.into_iter().find(|candidate| candidate.id == action) else {
+        return Ok(None);
+    };
+    if !action_state.enabled {
+        return Ok(None);
+    }
+    if profiles.iter().any(|profile| {
+        profile.is_selected
+            && profile.provider_id == provider_id
+            && profile.management.blocks_destructive_actions
+    }) {
+        return Ok(None);
+    }
+    let Some(command) = provider.command_for_action(action, &profiles) else {
+        return Ok(None);
+    };
+    let mut next_steps = observation.remediation;
+    if next_steps.is_empty() {
+        next_steps.push("Use the Runtime panel to review provider state.".to_owned());
+    }
+    Ok(Some((action_state, command, next_steps)))
+}
+
+async fn run_command(command: &ExecutableCommand) -> Result<String, CommandRunError> {
+    let target = trusted_exec::verify_trusted_program(command.program)
+        .map_err(|error| CommandRunError::Failed(error.to_string()))?;
+    match command.elevation {
+        ProcessElevation::CurrentUser => run_once(&target.path, command)
+            .await
+            .map_err(CommandRunError::Failed),
+        ProcessElevation::OneShotOsMediated => run_elevated(&target.path, command).await,
+    }
+}
+
+async fn run_once(
+    program_path: &std::path::Path,
+    command: &ExecutableCommand,
+) -> Result<String, String> {
+    let mut process = Command::new(program_path);
+    process.args(&command.args);
+    process.env_clear();
+    forward_allowed_environment(&mut process, &command.env_allowlist);
+    if let Some(dir) = &command.working_dir {
+        process.current_dir(dir);
+    }
+
+    process
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = process
+        .spawn()
+        .map_err(|_| "trusted command could not start".to_owned())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "trusted command stdout unavailable".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "trusted command stderr unavailable".to_owned())?;
+    let stdout_task = tokio::spawn(read_bounded_output(stdout));
+    let stderr_task = tokio::spawn(read_bounded_output(stderr));
+
+    let status = match timeout(command.timeout, child.wait()).await {
+        Ok(result) => result.map_err(|_| "trusted command wait failed".to_owned())?,
+        Err(_) => {
+            terminate_process_tree(child.id()).await;
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(
+                "trusted command timed out; external installer state may be uncertain".to_owned(),
+            );
+        }
+    };
+    let stdout = stdout_task
+        .await
+        .map_err(|_| "trusted stdout capture failed".to_owned())??;
+    let stderr = stderr_task
+        .await
+        .map_err(|_| "trusted stderr capture failed".to_owned())??;
+    if !status.success() {
+        let stderr = redact_runtime_output(&stderr);
         return Err(if stderr.is_empty() {
-            format!("{program} exited with {}", output.status)
+            format!("trusted command exited with {status}")
         } else {
             stderr
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(redact_runtime_output(&stdout))
 }
 
-async fn run_elevated(program: &str, args: &[String], timeout_secs: u64) -> Result<String, String> {
-    let argument_list = args
-        .iter()
-        .map(|arg| format!("'{}'", arg.replace('\'', "''")))
-        .collect::<Vec<_>>()
-        .join(",");
-    let start_process = if argument_list.is_empty() {
-        format!("Start-Process -FilePath '{program}' -Verb RunAs -Wait -PassThru")
-    } else {
-        format!(
-            "Start-Process -FilePath '{program}' -ArgumentList {argument_list} -Verb RunAs -Wait -PassThru"
-        )
-    };
-    let ps_command = format!("$p = {start_process}; exit $p.ExitCode");
-
-    let output = timeout(
-        Duration::from_secs(timeout_secs),
-        tokio::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-WindowStyle",
-                "Hidden",
-                "-Command",
-                &ps_command,
-            ])
-            .output(),
-    )
-    .await
-    .map_err(|_| "elevated command timed out".to_owned())?
-    .map_err(|error| error.to_string())?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "elevated command exited with {} (the UAC prompt may have been declined)",
-            output.status
-        ));
+async fn terminate_process_tree(pid: Option<u32>) {
+    #[cfg(windows)]
+    if let Some(pid) = pid
+        && let Ok(target) = trusted_exec::verify_trusted_program(TrustedProgram::Taskkill)
+    {
+        let mut command = Command::new(target.path);
+        command
+            .env_clear()
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let _ = timeout(std::time::Duration::from_secs(5), command.status()).await;
     }
-    Ok(String::new())
+    #[cfg(not(windows))]
+    let _ = pid;
+}
+
+/// Forwards only explicitly allow-listed environment variables after the child
+/// environment has been cleared. Runtime commands currently declare an empty
+/// allowlist, so daemon credentials cannot be inherited.
+fn forward_allowed_environment(process: &mut tokio::process::Command, allowlist: &[&str]) {
+    for key in allowlist {
+        if let Ok(value) = std::env::var(key) {
+            process.env(key, value);
+        }
+    }
+}
+
+const MAX_CAPTURE_BYTES: usize = 64 * 1024;
+
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn read_bounded_output(mut reader: impl AsyncRead + Unpin) -> Result<CapturedOutput, String> {
+    let mut retained = Vec::new();
+    let mut truncated = false;
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|_| "trusted output read failed".to_owned())?;
+        if read == 0 {
+            break;
+        }
+        let remaining = MAX_CAPTURE_BYTES.saturating_sub(retained.len());
+        retained.extend_from_slice(&chunk[..read.min(remaining)]);
+        truncated |= read > remaining;
+    }
+    Ok(CapturedOutput {
+        bytes: retained,
+        truncated,
+    })
+}
+
+fn redact_runtime_output(output: &CapturedOutput) -> String {
+    let text = String::from_utf8_lossy(&output.bytes);
+    let redacted = crate::logging::redact_sensitive_text(text.trim());
+    if output.truncated {
+        return format!("{redacted} ... (truncated)");
+    }
+    redacted
+}
+
+async fn run_elevated(
+    program_path: &std::path::Path,
+    command: &ExecutableCommand,
+) -> Result<String, CommandRunError> {
+    let path = program_path.to_path_buf();
+    let args = command.args.clone();
+    let working_dir = command.working_dir.clone();
+    let command_timeout = command.timeout;
+    let outcome = tokio::task::spawn_blocking(move || {
+        studio_windows_trust::run_elevated_process(
+            &path,
+            &args,
+            working_dir.as_deref(),
+            command_timeout,
+        )
+    })
+    .await
+    .map_err(|_| CommandRunError::Failed("elevation worker failed".to_owned()))?
+    .map_err(|error| CommandRunError::Failed(error.to_string()))?;
+    match outcome {
+        studio_windows_trust::ElevatedProcessOutcome::Exited(0) => Ok(String::new()),
+        studio_windows_trust::ElevatedProcessOutcome::Exited(code) => Err(CommandRunError::Failed(
+            format!("elevated command exited with code {code}"),
+        )),
+        studio_windows_trust::ElevatedProcessOutcome::Cancelled => Err(CommandRunError::Cancelled),
+        studio_windows_trust::ElevatedProcessOutcome::TimedOut => Err(CommandRunError::Failed(
+            "elevated command timed out; external installer state may be uncertain".to_owned(),
+        )),
+    }
 }
 
 /// Persist a provider's observation, then reconcile availability. Persisting

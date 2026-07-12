@@ -1,12 +1,16 @@
 use susun::EngineEndpoint;
 
 use super::{
-    RuntimeProfile, command_output, dimension, now_ms,
+    RuntimeProfile,
+    command::{CommandKind, ExecutableCommand, ProcessElevation, TrustedProgram},
+    command_output, dimension, now_ms,
     provider::{
         EndpointSummary, ObservedProfile, PLACEHOLDER_KEY, RuntimeAction, RuntimeClass,
-        RuntimeCommand, RuntimeObservation, RuntimeProvider, profile_id,
+        RuntimeObservation, RuntimeProvider, profile_id,
     },
 };
+use std::ffi::OsString;
+use std::time::Duration;
 
 const DOCKER_DESKTOP_EXE: &str = r"C:\Program Files\Docker\Docker\frontend\Docker Desktop.exe";
 const DOCKER_ENGINE_PIPE: &str = r"\\.\pipe\docker_engine";
@@ -158,73 +162,12 @@ impl RuntimeProvider for WindowsDockerDesktopProvider {
     fn command_for_action(
         &self,
         action: &str,
-        _profiles: &[RuntimeProfile],
-    ) -> Option<RuntimeCommand> {
+        profiles: &[RuntimeProfile],
+    ) -> Option<ExecutableCommand> {
         if !self.supported() {
             return None;
         }
-
-        match action {
-            "install" => Some(RuntimeCommand {
-                program: "winget",
-                args: vec![
-                    "install".to_owned(),
-                    "--id".to_owned(),
-                    "Docker.DockerDesktop".to_owned(),
-                    "--accept-package-agreements".to_owned(),
-                    "--accept-source-agreements".to_owned(),
-                    "--disable-interactivity".to_owned(),
-                ],
-                timeout_secs: 30 * 60,
-                success_message: "Docker Desktop install command finished.".to_owned(),
-                elevate_if_needed: true,
-            }),
-            "start" => Some(RuntimeCommand {
-                program: "powershell",
-                args: vec![
-                    "-NoProfile".to_owned(),
-                    "-WindowStyle".to_owned(),
-                    "Hidden".to_owned(),
-                    "-Command".to_owned(),
-                    format!("Start-Process -FilePath '{DOCKER_DESKTOP_EXE}'"),
-                ],
-                timeout_secs: 30,
-                success_message:
-                    "Docker Desktop launch requested. It may take a minute to become ready."
-                        .to_owned(),
-                elevate_if_needed: false,
-            }),
-            "stop" => Some(RuntimeCommand {
-                program: "powershell",
-                args: vec![
-                    "-NoProfile".to_owned(),
-                    "-WindowStyle".to_owned(),
-                    "Hidden".to_owned(),
-                    "-Command".to_owned(),
-                    DOCKER_STOP_SCRIPT.to_owned(),
-                ],
-                timeout_secs: 30,
-                success_message: "Docker Desktop stop requested (engine and UI processes)."
-                    .to_owned(),
-                elevate_if_needed: false,
-            }),
-            "restart" => Some(RuntimeCommand {
-                program: "powershell",
-                args: vec![
-                    "-NoProfile".to_owned(),
-                    "-WindowStyle".to_owned(),
-                    "Hidden".to_owned(),
-                    "-Command".to_owned(),
-                    format!(
-                        "{DOCKER_STOP_SCRIPT}; Start-Sleep -Seconds 2; Start-Process -FilePath '{DOCKER_DESKTOP_EXE}'"
-                    ),
-                ],
-                timeout_secs: 30,
-                success_message: "Docker Desktop restart requested.".to_owned(),
-                elevate_if_needed: false,
-            }),
-            _ => None,
-        }
+        self.build_command(action, profiles)
     }
 
     fn endpoint_for_runtime_key(&self, _provider_runtime_key: &str) -> Option<EngineEndpoint> {
@@ -233,6 +176,91 @@ impl RuntimeProvider for WindowsDockerDesktopProvider {
 }
 
 impl WindowsDockerDesktopProvider {
+    /// Builds the trusted command for an action, independent of the platform
+    /// gate in [`command_for_action`]. Kept separate so it is unit-testable on
+    /// any host. The lifecycle commands drive fixed, daemon-owned PowerShell
+    /// scripts with no interpolated user-controlled data (only compile-time
+    /// constants), so they are modelled as [`CommandKind::OsConfigTool`].
+    pub(crate) fn build_command(
+        &self,
+        action: &str,
+        _profiles: &[RuntimeProfile],
+    ) -> Option<ExecutableCommand> {
+        match action {
+            "install" => Some(ExecutableCommand {
+                program: TrustedProgram::Winget,
+                args: vec![
+                    "install".into(),
+                    "--id".into(),
+                    "Docker.DockerDesktop".into(),
+                    "--accept-package-agreements".into(),
+                    "--accept-source-agreements".into(),
+                    "--disable-interactivity".into(),
+                ],
+                env_allowlist: Vec::new(),
+                working_dir: None,
+                timeout: Duration::from_secs(30 * 60),
+                kind: CommandKind::PackageManager,
+                elevation: ProcessElevation::OneShotOsMediated,
+                success_message: "Docker Desktop install command finished.".to_owned(),
+            }),
+            "start" => Some(ExecutableCommand {
+                program: TrustedProgram::PowerShell,
+                args: vec![
+                    "-NoProfile".into(),
+                    "-WindowStyle".into(),
+                    "Hidden".into(),
+                    "-Command".into(),
+                    OsString::from(format!("Start-Process -FilePath '{DOCKER_DESKTOP_EXE}'")),
+                ],
+                env_allowlist: Vec::new(),
+                working_dir: None,
+                timeout: Duration::from_secs(30),
+                kind: CommandKind::OsConfigTool,
+                elevation: ProcessElevation::CurrentUser,
+                success_message:
+                    "Docker Desktop launch requested. It may take a minute to become ready."
+                        .to_owned(),
+            }),
+            "stop" => Some(ExecutableCommand {
+                program: TrustedProgram::PowerShell,
+                args: vec![
+                    "-NoProfile".into(),
+                    "-WindowStyle".into(),
+                    "Hidden".into(),
+                    "-Command".into(),
+                    OsString::from(DOCKER_STOP_SCRIPT),
+                ],
+                env_allowlist: Vec::new(),
+                working_dir: None,
+                timeout: Duration::from_secs(30),
+                kind: CommandKind::OsConfigTool,
+                elevation: ProcessElevation::CurrentUser,
+                success_message: "Docker Desktop stop requested (engine and UI processes)."
+                    .to_owned(),
+            }),
+            "restart" => Some(ExecutableCommand {
+                program: TrustedProgram::PowerShell,
+                args: vec![
+                    "-NoProfile".into(),
+                    "-WindowStyle".into(),
+                    "Hidden".into(),
+                    "-Command".into(),
+                    OsString::from(format!(
+                        "{DOCKER_STOP_SCRIPT}; Start-Sleep -Seconds 2; Start-Process -FilePath '{DOCKER_DESKTOP_EXE}'"
+                    )),
+                ],
+                env_allowlist: Vec::new(),
+                working_dir: None,
+                timeout: Duration::from_secs(30),
+                kind: CommandKind::OsConfigTool,
+                elevation: ProcessElevation::CurrentUser,
+                success_message: "Docker Desktop restart requested.".to_owned(),
+            }),
+            _ => None,
+        }
+    }
+
     fn detect_installed(&self, version: &str) -> RuntimeObservation {
         let running =
             command_output("docker", &["info", "--format", "{{json .ServerVersion}}"]).is_ok();

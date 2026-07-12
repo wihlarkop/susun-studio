@@ -4,7 +4,10 @@
 
 use turso::{Connection, Database, params};
 
+use super::command::{CommandKind, ProcessElevation, TrustedProgram};
 use super::provider::{ObservedProfile, RESERVED_BUILT_IN_MACHINE, RuntimeClass, profile_id};
+use super::windows_docker_desktop::WindowsDockerDesktopProvider;
+use super::windows_podman::WindowsPodmanProvider;
 use super::{AdoptOutcome, ForgetOutcome, RuntimeProfile, dimension, now_ms};
 use crate::db;
 
@@ -370,5 +373,172 @@ async fn forget_removes_metadata_but_keeps_binding() -> TestResult {
     );
 
     let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+// --- Trusted command model (Runtime Security 1) ---------------------------
+//
+// These exercise `build_command` directly (not `command_for_action`, which is
+// platform-gated) so command content is verified on any host, including the
+// ubuntu CI runner where the Windows providers report `supported() == false`.
+
+#[test]
+fn podman_install_is_a_one_shot_elevated_package_manager_command() -> TestResult {
+    let command = WindowsPodmanProvider
+        .build_command("install", &[])
+        .ok_or("podman install command should exist")?;
+    assert_eq!(command.program, TrustedProgram::Winget);
+    assert_eq!(command.kind, CommandKind::PackageManager);
+    assert_eq!(command.elevation, ProcessElevation::OneShotOsMediated);
+    assert!(
+        command
+            .args
+            .iter()
+            .any(|arg| arg.to_str() == Some("RedHat.Podman"))
+    );
+    Ok(())
+}
+
+#[test]
+fn podman_lifecycle_without_a_selected_profile_has_no_command() {
+    // start/stop/restart require a selected machine profile; with none, the
+    // provider produces no command rather than guessing a target.
+    assert!(WindowsPodmanProvider.build_command("start", &[]).is_none());
+    assert!(WindowsPodmanProvider.build_command("stop", &[]).is_none());
+    assert!(
+        WindowsPodmanProvider
+            .build_command("restart", &[])
+            .is_none()
+    );
+}
+
+#[test]
+fn podman_init_runs_as_current_user_runtime_cli() -> TestResult {
+    let command = WindowsPodmanProvider
+        .build_command("init", &[])
+        .ok_or("podman init command should exist")?;
+    assert_eq!(command.program, TrustedProgram::Podman);
+    assert_eq!(command.kind, CommandKind::RuntimeCli);
+    assert_eq!(command.elevation, ProcessElevation::CurrentUser);
+    Ok(())
+}
+
+#[test]
+fn docker_desktop_install_is_a_one_shot_elevated_package_manager_command() -> TestResult {
+    let command = WindowsDockerDesktopProvider
+        .build_command("install", &[])
+        .ok_or("docker desktop install command should exist")?;
+    assert_eq!(command.program, TrustedProgram::Winget);
+    assert_eq!(command.kind, CommandKind::PackageManager);
+    assert_eq!(command.elevation, ProcessElevation::OneShotOsMediated);
+    assert!(
+        command
+            .args
+            .iter()
+            .any(|arg| arg.to_str() == Some("Docker.DockerDesktop"))
+    );
+    Ok(())
+}
+
+#[test]
+fn docker_desktop_lifecycle_is_a_current_user_os_config_command() -> TestResult {
+    // Fixed daemon-owned PowerShell scripts, no interpolated user data, no
+    // elevation: modelled as a current-user OS-config command.
+    for action in ["start", "stop", "restart"] {
+        let command = WindowsDockerDesktopProvider
+            .build_command(action, &[])
+            .ok_or("docker desktop lifecycle command should exist")?;
+        assert_eq!(command.program, TrustedProgram::PowerShell);
+        assert_eq!(command.kind, CommandKind::OsConfigTool);
+        assert_eq!(command.elevation, ProcessElevation::CurrentUser);
+    }
+    Ok(())
+}
+
+#[test]
+fn unknown_action_has_no_command() {
+    assert!(
+        WindowsPodmanProvider
+            .build_command("frobnicate", &[])
+            .is_none()
+    );
+    assert!(
+        WindowsDockerDesktopProvider
+            .build_command("frobnicate", &[])
+            .is_none()
+    );
+}
+
+#[test]
+fn provider_built_arguments_preserve_order() -> TestResult {
+    // The exact argv order is part of the command's meaning; a reorder would
+    // change what winget installs. Assert the full, ordered vector.
+    let command = WindowsPodmanProvider
+        .build_command("install", &[])
+        .ok_or("podman install command should exist")?;
+    let args: Vec<&str> = command.args.iter().filter_map(|arg| arg.to_str()).collect();
+    assert_eq!(
+        args,
+        vec![
+            "install",
+            "--id",
+            "RedHat.Podman",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+            "--disable-interactivity",
+        ]
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn native_non_utf8_arguments_are_preserved() {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    // A lone UTF-16 surrogate (0xD800) is a valid OS string but not valid
+    // UTF-8/UTF-16 — exactly the case `String` would lose. The trusted command
+    // model must carry it through unchanged.
+    let native = OsString::from_wide(&[0x0075, 0xD800, 0x0076]); // 'u' <surrogate> 'v'
+    assert!(native.to_str().is_none(), "fixture must not be valid UTF-8");
+
+    let command = super::command::ExecutableCommand {
+        program: super::command::TrustedProgram::Podman,
+        args: vec![native.clone()],
+        env_allowlist: Vec::new(),
+        working_dir: None,
+        timeout: std::time::Duration::from_secs(1),
+        kind: super::command::CommandKind::RuntimeCli,
+        elevation: super::command::ProcessElevation::CurrentUser,
+        success_message: String::new(),
+    };
+
+    // Preserved byte-for-byte (compare the raw UTF-16 units).
+    let round_tripped: Vec<u16> = command.args[0].encode_wide().collect();
+    assert_eq!(round_tripped, vec![0x0075, 0xD800, 0x0076]);
+}
+
+#[test]
+fn captured_output_is_redacted_and_truthfully_marked_truncated() {
+    let output = super::CapturedOutput {
+        bytes: b"token=private-value completed".to_vec(),
+        truncated: true,
+    };
+    let displayed = super::redact_runtime_output(&output);
+    assert!(!displayed.contains("private-value"));
+    assert!(displayed.contains("token=<redacted>"));
+    assert!(displayed.ends_with("... (truncated)"));
+}
+
+#[test]
+fn provider_commands_inherit_no_environment_by_default() -> TestResult {
+    for command in [
+        WindowsPodmanProvider.build_command("install", &[]),
+        WindowsDockerDesktopProvider.build_command("install", &[]),
+    ] {
+        let command = command.ok_or("expected provider install command")?;
+        assert!(command.env_allowlist.is_empty());
+    }
     Ok(())
 }
