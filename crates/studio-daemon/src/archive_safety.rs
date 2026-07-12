@@ -204,7 +204,7 @@ fn reject_conflicting_entries(
     let file_key_set: HashSet<Vec<String>> = file_keys.iter().cloned().collect();
     for key in dir_keys.iter().chain(file_keys.iter()) {
         for len in 1..key.len() {
-            if file_key_set.contains(&key[..len].to_vec()) {
+            if file_key_set.contains(&key[..len]) {
                 return Err(ExtractionError::UnsafePath(key.join("/")));
             }
         }
