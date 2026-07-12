@@ -22,7 +22,9 @@ pub async fn runtime_logs(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize(&state, &headers)?;
     logging::info("runtime_logs_requested", &[]);
-    Ok(Json(serde_json::json!({ "lines": runtime::logs() })))
+    Ok(Json(
+        serde_json::json!({ "lines": runtime::logs(&state.db).await? }),
+    ))
 }
 
 pub async fn list_runtime_profiles(

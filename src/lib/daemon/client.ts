@@ -617,6 +617,136 @@ export async function listRuntimeProfiles(
   return response.profiles;
 }
 
+export type RuntimeMigrationProject = {
+  id: string;
+  name: string;
+  currently_bound_to_source: boolean;
+};
+
+export type RuntimeArtifactPolicy = {
+  category: string;
+  disposition: string;
+  exactness: string;
+};
+
+export type RuntimeMigrationPreview = {
+  source: RuntimeProfile;
+  target: RuntimeProfile;
+  projects: RuntimeMigrationProject[];
+  can_migrate: boolean;
+  blockers: string[];
+  unavailable_capabilities: string[];
+  artifact_policy: RuntimeArtifactPolicy[];
+  rollback_available: boolean;
+};
+
+export type RuntimeMigrationResult = {
+  migration_id: string;
+  status: "completed" | "failed";
+  source_profile_id: string;
+  target_profile_id: string;
+  project_count: number;
+  skipped_items: string[];
+  failures: string[];
+  rollback_available: boolean;
+};
+
+export type RuntimeMigrationRollbackResult = {
+  migration_id: string;
+  status: "rolled_back" | "failed" | "unavailable";
+  restored_project_count: number;
+};
+
+export type RuntimeMigrationRequest = {
+  source_profile_id: string;
+  target_profile_id: string;
+  project_ids: string[];
+};
+
+export async function previewRuntimeMigration(
+  request: RuntimeMigrationRequest,
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeMigrationPreview> {
+  return readJson("/v1/runtime/migrations/preview", {
+    ...options,
+    method: "POST",
+    body: request,
+  });
+}
+
+export async function executeRuntimeMigration(
+  request: RuntimeMigrationRequest,
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeMigrationResult> {
+  return readJson("/v1/runtime/migrations/execute", {
+    ...options,
+    method: "POST",
+    body: request,
+  });
+}
+
+export async function rollbackRuntimeMigration(
+  migrationId: string,
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeMigrationRollbackResult> {
+  return readJson(`/v1/runtime/migrations/${encodeURIComponent(migrationId)}/rollback`, {
+    ...options,
+    method: "POST",
+  });
+}
+
+export type RuntimeDestructiveAction =
+  | "repair"
+  | "reset_engine_data"
+  | "remove_built_in_runtime";
+
+export type RuntimeAffectedCategory = {
+  category: string;
+  count: number | null;
+  exactness: string;
+  effect: string;
+};
+
+export type RuntimeDestructivePreview = {
+  operation_id: string;
+  profile_id: string;
+  action: RuntimeDestructiveAction;
+  allowed: boolean;
+  blocker: string | null;
+  affected: RuntimeAffectedCategory[];
+  preserved: string[];
+  requires_fresh_preview: boolean;
+};
+
+export async function previewRuntimeDestructiveOperation(
+  profileId: string,
+  action: RuntimeDestructiveAction,
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeDestructivePreview> {
+  return readJson(
+    `/v1/runtime/profiles/${encodeURIComponent(profileId)}/destructive-preview`,
+    { ...options, method: "POST", body: { action } },
+  );
+}
+
+export type RuntimeUninstallPolicy = {
+  default_choice: string;
+  choices: {
+    id: string;
+    label: string;
+    mutates_external_runtimes: boolean;
+    selected_by_default: boolean;
+  }[];
+  unattended_behavior: string;
+  reinstall_rule: string;
+};
+
+export async function readRuntimeUninstallPolicy(
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeUninstallPolicy> {
+  return readJson("/v1/runtime/uninstall-policy", options);
+}
+
 export async function setProjectEngine(
   projectId: string,
   runtimeProfileId: string | null,

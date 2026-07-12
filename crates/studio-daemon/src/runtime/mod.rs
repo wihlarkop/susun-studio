@@ -1,6 +1,7 @@
 mod command;
 mod endpoint_policy;
 mod provider;
+pub mod transitions;
 mod trusted_exec;
 pub mod trusted_plans;
 mod windows_docker_desktop;
@@ -445,7 +446,7 @@ async fn endpoint_for_profile(
         .and_then(|provider| provider.endpoint_for_runtime_key(&provider_runtime_key)))
 }
 
-pub fn logs() -> Vec<RuntimeLogLine> {
+pub async fn logs(db: &Database) -> Result<Vec<RuntimeLogLine>, turso::Error> {
     let mut lines = Vec::new();
     for provider in registered_providers() {
         let observation = provider.detect();
@@ -469,7 +470,55 @@ pub fn logs() -> Vec<RuntimeLogLine> {
         }
     }
 
-    lines
+    let conn = db.connect()?;
+    let mut migration_rows = conn
+        .query(
+            "SELECT id, status, project_count FROM runtime_migrations
+             ORDER BY created_at_ms DESC LIMIT 10",
+            (),
+        )
+        .await?;
+    while let Some(row) = migration_rows.next().await? {
+        let id: String = row.get(0)?;
+        let status: String = row.get(1)?;
+        let project_count: i64 = row.get(2)?;
+        lines.push(RuntimeLogLine {
+            level: if status == "failed" { "warn" } else { "info" }.to_owned(),
+            message: format!("Runtime migration {id}: {status} ({project_count} project bindings)"),
+        });
+    }
+    let mut operation_rows = conn
+        .query(
+            "SELECT id, action, status, recovery_guidance
+             FROM runtime_destructive_operations
+             ORDER BY created_at_ms DESC LIMIT 10",
+            (),
+        )
+        .await?;
+    while let Some(row) = operation_rows.next().await? {
+        let id: String = row.get(0)?;
+        let action: String = row.get(1)?;
+        let status: String = row.get(2)?;
+        let recovery: Option<String> = row.get(3)?;
+        lines.push(RuntimeLogLine {
+            level: if matches!(status.as_str(), "failed" | "partial_failure") {
+                "warn"
+            } else {
+                "info"
+            }
+            .to_owned(),
+            message: format!(
+                "Runtime operation {id}: {} {status}{}",
+                action.replace('_', " "),
+                recovery
+                    .as_deref()
+                    .map(|value| format!("; recovery: {value}"))
+                    .unwrap_or_default()
+            ),
+        });
+    }
+
+    Ok(lines)
 }
 
 pub(crate) fn dimension(state: &str, detail: Option<&str>) -> provider::RuntimeDimension {
