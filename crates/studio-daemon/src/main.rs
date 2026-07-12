@@ -1,3 +1,4 @@
+mod archive_safety;
 mod auth;
 mod backup;
 mod config;

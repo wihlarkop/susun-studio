@@ -585,10 +585,10 @@ pub async fn copy_service(
                     ));
                 }
             }
-            std::fs::create_dir_all(&request.host_path)
-                .map_err(|e| ApiError::ActionUnavailable(e.to_string()))?;
-            tar::Archive::new(bytes.as_slice())
-                .unpack(&request.host_path)
+            // The archive is engine/container-controlled and therefore
+            // untrusted: validate every entry (no traversal, absolute paths,
+            // symlinks, devices, or reserved names) before writing to the host.
+            crate::archive_safety::extract_safely(&bytes, std::path::Path::new(&request.host_path))
                 .map_err(|e| ApiError::ActionUnavailable(e.to_string()))?;
         }
         other => {
