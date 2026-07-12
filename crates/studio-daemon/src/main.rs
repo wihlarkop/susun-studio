@@ -80,6 +80,7 @@ async fn run() -> Result<(), DaemonError> {
         stream_tickets: Arc::new(jobs::tickets::StreamTickets::new()),
         watch: Arc::new(watch::registry::WatchRegistry::new()),
         restore: restore.clone(),
+        trusted_plans: Arc::new(runtime::trusted_plans::TrustedPlanStore::default()),
     };
 
     let listener = TcpListener::bind(bind_addr)

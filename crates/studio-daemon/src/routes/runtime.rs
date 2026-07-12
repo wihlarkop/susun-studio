@@ -1,5 +1,6 @@
 use axum::{
     Json,
+    body::Bytes,
     extract::{Path, State},
     http::HeaderMap,
 };
@@ -101,20 +102,104 @@ pub async fn adopt_runtime_profile(
     }
 }
 
-pub async fn runtime_action(
+pub async fn prepare_runtime_action(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((provider_id, action)): Path<(String, String)>,
-) -> Result<Json<runtime::RuntimeActionResult>, ApiError> {
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
     authorize(&state, &headers)?;
+    reject_trusted_plan_content(&body)?;
     logging::warn(
-        "runtime_action_requested",
+        "runtime_trusted_plan_prepare_requested",
         &[
             ("provider_id", provider_id.clone()),
             ("action", action.clone()),
         ],
     );
-    Ok(Json(
-        runtime::action(&state.db, &provider_id, &action).await?,
-    ))
+    let owner = runtime::stable_suffix(&state.auth_token);
+    match runtime::prepare_trusted_action(
+        &state.db,
+        &state.trusted_plans,
+        &owner,
+        &provider_id,
+        &action,
+    )
+    .await?
+    {
+        Ok(preview) => Ok(Json(serde_json::json!({ "plan": preview }))),
+        Err(result) => Ok(Json(serde_json::json!({ "result": result }))),
+    }
+}
+
+pub async fn execute_runtime_plan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(plan_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<runtime::RuntimeActionResult>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_trusted_plan_content(&body)?;
+    logging::warn(
+        "runtime_trusted_plan_execute_requested",
+        &[("plan_id", plan_id.clone())],
+    );
+    let owner = runtime::stable_suffix(&state.auth_token);
+    let result =
+        runtime::execute_trusted_action(&state.db, &state.trusted_plans, &owner, &plan_id).await;
+    logging::info(
+        "runtime_trusted_plan_execute_completed",
+        &[
+            ("plan_id", plan_id),
+            ("action", result.action.clone()),
+            ("status", result.status.clone()),
+        ],
+    );
+    Ok(Json(result))
+}
+
+pub async fn cancel_runtime_plan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(plan_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<runtime::RuntimeActionResult>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_trusted_plan_content(&body)?;
+    logging::info(
+        "runtime_trusted_plan_cancel_requested",
+        &[("plan_id", plan_id.clone())],
+    );
+    let owner = runtime::stable_suffix(&state.auth_token);
+    let result = runtime::cancel_trusted_action(&state.trusted_plans, &owner, &plan_id);
+    logging::info(
+        "runtime_trusted_plan_cancel_completed",
+        &[("plan_id", plan_id), ("status", result.status.clone())],
+    );
+    Ok(Json(result))
+}
+
+fn reject_trusted_plan_content(body: &Bytes) -> Result<(), ApiError> {
+    if body.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::TrustedPlanContentRejected)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trusted_plan_endpoints_reject_frontend_executable_content() {
+        let body = Bytes::from_static(
+            br#"{"executable":"evil.exe","args":["& calc"],"env":{"TOKEN":"secret"},"elevation":"admin"}"#,
+        );
+        assert!(matches!(
+            reject_trusted_plan_content(&body),
+            Err(ApiError::TrustedPlanContentRejected)
+        ));
+        assert!(reject_trusted_plan_content(&Bytes::new()).is_ok());
+    }
 }

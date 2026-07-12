@@ -518,3 +518,27 @@ fn native_non_utf8_arguments_are_preserved() {
     let round_tripped: Vec<u16> = command.args[0].encode_wide().collect();
     assert_eq!(round_tripped, vec![0x0075, 0xD800, 0x0076]);
 }
+
+#[test]
+fn captured_output_is_redacted_and_truthfully_marked_truncated() {
+    let output = super::CapturedOutput {
+        bytes: b"token=private-value completed".to_vec(),
+        truncated: true,
+    };
+    let displayed = super::redact_runtime_output(&output);
+    assert!(!displayed.contains("private-value"));
+    assert!(displayed.contains("token=<redacted>"));
+    assert!(displayed.ends_with("... (truncated)"));
+}
+
+#[test]
+fn provider_commands_inherit_no_environment_by_default() -> TestResult {
+    for command in [
+        WindowsPodmanProvider.build_command("install", &[]),
+        WindowsDockerDesktopProvider.build_command("install", &[]),
+    ] {
+        let command = command.ok_or("expected provider install command")?;
+        assert!(command.env_allowlist.is_empty());
+    }
+    Ok(())
+}

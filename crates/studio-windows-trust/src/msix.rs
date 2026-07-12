@@ -65,7 +65,8 @@ pub fn verify_msix_alias(
     // policy; never a substring test.
     let publisher_dn = id.Publisher().map_err(winrt_err)?.to_string();
     let publisher = PublisherIdentity {
-        subject_common_name: attr_from_dn(&publisher_dn, "CN").unwrap_or_else(|| publisher_dn.clone()),
+        subject_common_name: attr_from_dn(&publisher_dn, "CN")
+            .unwrap_or_else(|| publisher_dn.clone()),
         organization: attr_from_dn(&publisher_dn, "O"),
     };
     if !policy.publisher_allowed(&publisher) {
@@ -145,8 +146,14 @@ mod tests {
     #[test]
     fn attr_from_dn_extracts_cn_and_org() {
         let dn = "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US";
-        assert_eq!(attr_from_dn(dn, "CN").as_deref(), Some("Microsoft Corporation"));
-        assert_eq!(attr_from_dn(dn, "O").as_deref(), Some("Microsoft Corporation"));
+        assert_eq!(
+            attr_from_dn(dn, "CN").as_deref(),
+            Some("Microsoft Corporation")
+        );
+        assert_eq!(
+            attr_from_dn(dn, "O").as_deref(),
+            Some("Microsoft Corporation")
+        );
         assert_eq!(attr_from_dn(dn, "X"), None);
     }
 

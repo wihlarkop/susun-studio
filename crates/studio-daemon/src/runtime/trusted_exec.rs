@@ -89,7 +89,10 @@ pub enum TrustFailure {
     #[error("{0} resolved to an untrusted path")]
     UntrustedPath(&'static str),
     #[error("{program} could not be verified: {detail}")]
-    Verification { program: &'static str, detail: String },
+    Verification {
+        program: &'static str,
+        detail: String,
+    },
     #[error("{0} is signed by an unapproved publisher")]
     UntrustedPublisher(&'static str),
 }
@@ -118,6 +121,13 @@ pub fn policy_for(program: TrustedProgram) -> ExecutableIdentityPolicy {
             allowed_paths: vec![TrustedPathRule {
                 directory: windows_dir().join(r"System32\WindowsPowerShell\v1.0"),
                 file_name: "powershell.exe",
+            }],
+            allowed_publishers: vec![MICROSOFT_WINDOWS],
+        },
+        TrustedProgram::Taskkill => ExecutableIdentityPolicy::Authenticode {
+            allowed_paths: vec![TrustedPathRule {
+                directory: windows_dir().join("System32"),
+                file_name: "taskkill.exe",
             }],
             allowed_publishers: vec![MICROSOFT_WINDOWS],
         },
@@ -190,10 +200,11 @@ pub fn verify_trusted_program(program: TrustedProgram) -> Result<VerifiedTarget,
             Ok(VerifiedTarget { path })
         }
         ExecutableIdentityPolicy::Msix(policy) => {
-            let verified = verify_msix_alias(&policy).map_err(|error| TrustFailure::Verification {
-                program: name,
-                detail: error.to_string(),
-            })?;
+            let verified =
+                verify_msix_alias(&policy).map_err(|error| TrustFailure::Verification {
+                    program: name,
+                    detail: error.to_string(),
+                })?;
             Ok(VerifiedTarget {
                 path: verified.alias_path,
             })
@@ -229,6 +240,10 @@ mod tests {
         ));
         assert!(matches!(
             policy_for(TrustedProgram::Podman),
+            ExecutableIdentityPolicy::Authenticode { .. }
+        ));
+        assert!(matches!(
+            policy_for(TrustedProgram::Taskkill),
             ExecutableIdentityPolicy::Authenticode { .. }
         ));
     }

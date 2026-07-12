@@ -17,4 +17,5 @@ pub struct AppState {
     pub stream_tickets: Arc<StreamTickets>,
     pub watch: Arc<WatchRegistry>,
     pub restore: Arc<RestoreCoordinator>,
+    pub trusted_plans: Arc<crate::runtime::trusted_plans::TrustedPlanStore>,
 }

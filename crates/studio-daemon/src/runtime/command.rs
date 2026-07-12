@@ -26,6 +26,7 @@ pub enum TrustedProgram {
     Winget,
     Podman,
     PowerShell,
+    Taskkill,
 }
 
 impl TrustedProgram {
@@ -37,6 +38,7 @@ impl TrustedProgram {
             TrustedProgram::Winget => "winget",
             TrustedProgram::Podman => "podman",
             TrustedProgram::PowerShell => "powershell",
+            TrustedProgram::Taskkill => "taskkill",
         }
     }
 }
@@ -77,6 +79,7 @@ pub enum ProcessElevation {
 /// Every field is constructed inside trusted provider code. The only values
 /// derived from outside are ones providers read from already-validated
 /// persisted profile state (e.g. a machine name), never raw frontend/API input.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExecutableCommand {
     pub program: TrustedProgram,
     /// Arguments passed structurally to the process API as OS-native strings.

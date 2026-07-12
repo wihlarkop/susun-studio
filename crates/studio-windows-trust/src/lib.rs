@@ -17,9 +17,11 @@
 //! Unsafe is denied crate-wide and re-enabled only inside the documented `ffi`
 //! modules that will hold the FFI.
 
+pub mod elevation;
 pub mod error;
 pub mod model;
 
+pub use elevation::{ElevatedProcessOutcome, ElevationError, run_elevated_process};
 pub use error::WindowsTrustError;
 pub use model::{
     AllowedPublisher, AppExecutionAlias, CertificateThumbprint, MsixProgramPolicy,
