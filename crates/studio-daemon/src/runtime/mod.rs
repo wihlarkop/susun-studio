@@ -13,8 +13,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
 use command::TrustedProgram;
 use command::{ExecutableCommand, ProcessElevation};
-use provider::{ObservedProfile, RESERVED_BUILT_IN_MACHINE, RuntimeClass, RuntimeProvider};
-use serde::Serialize;
+use provider::{
+    ObservedProfile, RESERVED_BUILT_IN_MACHINE, RuntimeClass, RuntimeProvider,
+    RuntimeResourceUpdate,
+};
+use serde::{Deserialize, Serialize};
 use susun::EngineEndpoint;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -114,6 +117,19 @@ pub enum ResourceSnapshotOutcome {
     Found(Box<RuntimeResourceSnapshot>),
     NotFound,
     ProviderUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeNetworkMode {
+    Wsl,
+    UserMode,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeResourceUpdateRequest {
+    pub network_mode: RuntimeNetworkMode,
 }
 
 /// The full set of runtime providers Studio knows how to detect and manage.
@@ -646,6 +662,43 @@ pub async fn prepare_trusted_action(
     )))
 }
 
+pub async fn prepare_resource_update(
+    db: &Database,
+    store: &trusted_plans::TrustedPlanStore,
+    owner: &str,
+    profile_id: &str,
+    request: RuntimeResourceUpdateRequest,
+) -> Result<Result<trusted_plans::TrustedPlanPreview, RuntimeActionResult>, turso::Error> {
+    let action = resource_update_action(profile_id, request.network_mode);
+    let Some((provider_id, action_state, command, _next_steps)) =
+        resolve_resource_update(db, profile_id, request.network_mode).await?
+    else {
+        return Ok(Err(not_executed(
+            &action,
+            "This resource update is unavailable for the selected runtime.",
+        )));
+    };
+    let target = match trusted_exec::verify_trusted_program(command.program) {
+        Ok(target) => target,
+        Err(error) => return Ok(Err(not_executed(&action, &error.to_string()))),
+    };
+    if let Err(reason) = command.validate_policy() {
+        return Ok(Err(not_executed(&action, reason)));
+    }
+    drop(target);
+    Ok(Ok(store.prepare(
+        owner,
+        trusted_plans::TrustedPlanMetadata {
+            provider_id: &provider_id,
+            action: &action,
+            label: &action_state.label,
+            destructive: false,
+            consequence: &action_state.reason,
+        },
+        command,
+    )))
+}
+
 pub async fn execute_trusted_action(
     db: &Database,
     store: &trusted_plans::TrustedPlanStore,
@@ -656,7 +709,15 @@ pub async fn execute_trusted_action(
         Ok(claimed) => claimed,
         Err(error) => return not_executed("trusted_plan", &error.to_string()),
     };
-    let resolved = match resolve_trusted_action(db, &claimed.provider_id, &claimed.action).await {
+    let resource_update = parse_resource_update_action(&claimed.action);
+    let is_resource_update = resource_update.is_some();
+    let resolved = match if let Some((profile_id, mode)) = resource_update {
+        resolve_resource_update(db, profile_id, mode)
+            .await
+            .map(|resolved| resolved.map(|(_, action, command, steps)| (action, command, steps)))
+    } else {
+        resolve_trusted_action(db, &claimed.provider_id, &claimed.action).await
+    } {
         Ok(Some(value)) => value,
         Ok(None) => {
             store.finish(&claimed.plan_id, trusted_plans::TrustedPlanState::Failed);
@@ -720,7 +781,17 @@ pub async fn execute_trusted_action(
                     next_steps: vec![next_step.to_owned()],
                 }
             } else {
-                next_steps.push("Recheck runtime status to refresh observed state.".to_owned());
+                if is_resource_update {
+                    match status(db).await {
+                        Ok(_) => next_steps.push("Observed runtime state was refreshed.".to_owned()),
+                        Err(_) => next_steps.push(
+                            "The setting changed, but observation refresh failed. Recheck runtime status."
+                                .to_owned(),
+                        ),
+                    }
+                } else {
+                    next_steps.push("Recheck runtime status to refresh observed state.".to_owned());
+                }
                 RuntimeActionResult {
                     action: claimed.action,
                     status: "executed".to_owned(),
@@ -912,6 +983,70 @@ async fn resolve_trusted_action(
         next_steps.push("Use the Runtime panel to review provider state.".to_owned());
     }
     Ok(Some((action_state, command, next_steps)))
+}
+
+fn resource_update_action(profile_id: &str, mode: RuntimeNetworkMode) -> String {
+    let mode = match mode {
+        RuntimeNetworkMode::Wsl => "wsl",
+        RuntimeNetworkMode::UserMode => "user_mode",
+    };
+    format!("resource_network_{mode}:{profile_id}")
+}
+
+fn parse_resource_update_action(action: &str) -> Option<(&str, RuntimeNetworkMode)> {
+    if let Some(profile_id) = action.strip_prefix("resource_network_wsl:") {
+        return Some((profile_id, RuntimeNetworkMode::Wsl));
+    }
+    action
+        .strip_prefix("resource_network_user_mode:")
+        .map(|profile_id| (profile_id, RuntimeNetworkMode::UserMode))
+}
+
+async fn resolve_resource_update(
+    db: &Database,
+    profile_id: &str,
+    mode: RuntimeNetworkMode,
+) -> Result<Option<(String, RuntimeAction, ExecutableCommand, Vec<String>)>, turso::Error> {
+    let Some(profile) = list_all_profiles(db)
+        .await?
+        .into_iter()
+        .find(|profile| profile.id == profile_id)
+    else {
+        return Ok(None);
+    };
+    if profile.runtime_class != "built_in"
+        || profile.ownership_state != "studio_managed"
+        || profile.availability_state != "available"
+        || profile.management.blocks_destructive_actions
+    {
+        return Ok(None);
+    }
+    let Some(provider) = find_provider(&profile.provider_id) else {
+        return Ok(None);
+    };
+    let update =
+        RuntimeResourceUpdate::NetworkUserMode(matches!(mode, RuntimeNetworkMode::UserMode));
+    let Some(command) = provider.command_for_resource_update(&profile, update) else {
+        return Ok(None);
+    };
+    let (label, mode_label) = match mode {
+        RuntimeNetworkMode::Wsl => ("Use WSL networking", "WSL networking"),
+        RuntimeNetworkMode::UserMode => ("Use user-mode networking", "user-mode networking"),
+    };
+    Ok(Some((
+        profile.provider_id,
+        RuntimeAction {
+            id: resource_update_action(profile_id, mode),
+            label: label.to_owned(),
+            destructive: false,
+            enabled: true,
+            reason: format!(
+                "Change Susun Runtime to {mode_label}. A running machine must be restarted before the new mode is active."
+            ),
+        },
+        command,
+        vec!["Restart Susun Runtime if it is currently running.".to_owned()],
+    )))
 }
 
 async fn run_command(command: &ExecutableCommand) -> Result<String, CommandRunError> {

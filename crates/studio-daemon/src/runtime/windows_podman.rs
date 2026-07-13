@@ -10,7 +10,8 @@ use super::{
     provider::{
         EndpointSummary, ObservedProfile, PLACEHOLDER_KEY, RESERVED_BUILT_IN_MACHINE,
         RuntimeAction, RuntimeClass, RuntimeObservation, RuntimeProvider, RuntimeResourceMetric,
-        RuntimeResourceSnapshot, RuntimeResourceText, profile_id,
+        RuntimeResourceSnapshot, RuntimeResourceText, RuntimeResourceUpdate,
+        RuntimeResourceUpdateCapabilities, RuntimeResourceUpdateCapability, profile_id,
     },
     trusted_exec, trusted_read_output,
 };
@@ -212,6 +213,57 @@ impl RuntimeProvider for WindowsPodmanProvider {
             });
         podman_resource_snapshot(profile, machine.as_ref())
     }
+
+    fn command_for_resource_update(
+        &self,
+        profile: &RuntimeProfile,
+        update: RuntimeResourceUpdate,
+    ) -> Option<ExecutableCommand> {
+        if profile.runtime_class != "built_in"
+            || profile.ownership_state != "studio_managed"
+            || profile.availability_state != "available"
+        {
+            return None;
+        }
+        let machine_name = profile.provider_runtime_key.strip_prefix("machine/")?;
+        if machine_name != RESERVED_BUILT_IN_MACHINE {
+            return None;
+        }
+        let machine = trusted_machine(machine_name)?;
+        podman_resource_update_command(profile, update, &machine)
+    }
+}
+
+fn podman_resource_update_command(
+    profile: &RuntimeProfile,
+    update: RuntimeResourceUpdate,
+    machine: &PodmanMachine,
+) -> Option<ExecutableCommand> {
+    if profile.runtime_class != "built_in"
+        || profile.ownership_state != "studio_managed"
+        || profile.availability_state != "available"
+        || machine.name.as_deref() != Some(RESERVED_BUILT_IN_MACHINE)
+        || machine.vm_type.as_deref() != Some("wsl")
+    {
+        return None;
+    }
+    let RuntimeResourceUpdate::NetworkUserMode(enabled) = update;
+    Some(ExecutableCommand {
+        program: TrustedProgram::Podman,
+        args: vec![
+            "machine".into(),
+            "set".into(),
+            format!("--user-mode-networking={enabled}").into(),
+            RESERVED_BUILT_IN_MACHINE.into(),
+        ],
+        env_allowlist: Vec::new(),
+        working_dir: None,
+        timeout: Duration::from_secs(5 * 60),
+        kind: CommandKind::RuntimeCli,
+        elevation: ProcessElevation::CurrentUser,
+        software_provenance: None,
+        success_message: "Susun Runtime network mode updated.".to_owned(),
+    })
 }
 
 impl WindowsPodmanProvider {
@@ -565,6 +617,16 @@ fn parse_machines(output: &str) -> Result<Vec<PodmanMachine>, serde_json::Error>
     serde_json::from_str(output)
 }
 
+fn trusted_machine(machine_name: &str) -> Option<PodmanMachine> {
+    let target = trusted_exec::verify_trusted_program(TrustedProgram::Podman).ok()?;
+    let output =
+        trusted_read_output(&target.path, &["machine", "list", "--format", "json"]).ok()?;
+    parse_machines(&output)
+        .ok()?
+        .into_iter()
+        .find(|machine| machine.name.as_deref() == Some(machine_name))
+}
+
 fn podman_resource_snapshot(
     profile: &RuntimeProfile,
     machine: Option<&PodmanMachine>,
@@ -619,6 +681,13 @@ fn podman_resource_snapshot(
                 ),
             },
             volumes: unavailable_metric("count"),
+            updates: RuntimeResourceUpdateCapabilities {
+                network_mode: RuntimeResourceUpdateCapability {
+                    supported: false,
+                    restart_required: false,
+                    reason: "The machine is unavailable.".to_owned(),
+                },
+            },
         };
     };
     let network_mode = machine
@@ -673,6 +742,22 @@ fn podman_resource_snapshot(
             "count",
             "Engine-wide volume inventory is not available through the current SDK contract.",
         ),
+        updates: RuntimeResourceUpdateCapabilities {
+            network_mode: RuntimeResourceUpdateCapability {
+                supported: managed && machine.vm_type.as_deref() == Some("wsl"),
+                restart_required: machine.running.unwrap_or(false),
+                reason: if !managed {
+                    "Only a Studio-owned Susun Runtime can be reconfigured."
+                } else if machine.vm_type.as_deref() != Some("wsl") {
+                    "Network-mode updates are supported only by Podman's Windows WSL provider."
+                } else if machine.running.unwrap_or(false) {
+                    "Restart Susun Runtime after applying this change."
+                } else {
+                    "The new mode is used the next time Susun Runtime starts."
+                }
+                .to_owned(),
+            },
+        },
     }
 }
 
@@ -745,10 +830,37 @@ mod resource_tests {
         assert_eq!(snapshot.network.value.as_deref(), Some("wsl"));
         assert_eq!(snapshot.disk_usage.support, "unsupported");
         assert_eq!(snapshot.volumes.support, "unsupported");
+        assert!(snapshot.updates.network_mode.supported);
+        assert!(snapshot.updates.network_mode.restart_required);
         assert_eq!(
             snapshot.data_location.value.as_deref(),
             Some("provider_managed_user_scope")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn wsl_network_update_builds_an_exact_provider_owned_command()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let machines =
+            parse_machines(r#"[{"Name":"susun-runtime-default","Running":false,"VMType":"wsl"}]"#)?;
+        let machine = machines.first().ok_or("missing machine")?;
+        let command = podman_resource_update_command(
+            &managed_profile(),
+            RuntimeResourceUpdate::NetworkUserMode(true),
+            machine,
+        )
+        .ok_or("missing command")?;
+        assert_eq!(
+            command.args,
+            vec![
+                "machine",
+                "set",
+                "--user-mode-networking=true",
+                "susun-runtime-default"
+            ]
+        );
+        assert_eq!(command.elevation, ProcessElevation::CurrentUser);
         Ok(())
     }
 

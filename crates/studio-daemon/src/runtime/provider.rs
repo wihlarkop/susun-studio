@@ -35,6 +35,18 @@ pub trait RuntimeProvider: Send + Sync {
     fn resource_snapshot(&self, profile: &RuntimeProfile) -> RuntimeResourceSnapshot {
         RuntimeResourceSnapshot::unsupported(profile, self.id())
     }
+    fn command_for_resource_update(
+        &self,
+        _profile: &RuntimeProfile,
+        _update: RuntimeResourceUpdate,
+    ) -> Option<ExecutableCommand> {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeResourceUpdate {
+    NetworkUserMode(bool),
 }
 
 pub struct RuntimeObservation {
@@ -166,6 +178,19 @@ pub struct RuntimeResourceSnapshot {
     pub data_location: RuntimeResourceText,
     pub network: RuntimeResourceText,
     pub volumes: RuntimeResourceMetric,
+    pub updates: RuntimeResourceUpdateCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeResourceUpdateCapability {
+    pub supported: bool,
+    pub restart_required: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeResourceUpdateCapabilities {
+    pub network_mode: RuntimeResourceUpdateCapability,
 }
 
 impl RuntimeResourceSnapshot {
@@ -199,6 +224,13 @@ impl RuntimeResourceSnapshot {
                 detail: Some("This provider does not expose its network mode.".to_owned()),
             },
             volumes: metric("count", "Engine-wide volume inventory is unavailable."),
+            updates: RuntimeResourceUpdateCapabilities {
+                network_mode: RuntimeResourceUpdateCapability {
+                    supported: false,
+                    restart_required: false,
+                    reason: "This provider does not support network-mode updates.".to_owned(),
+                },
+            },
         }
     }
 }

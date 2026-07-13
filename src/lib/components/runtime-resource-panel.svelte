@@ -15,11 +15,13 @@
     loading = false,
     error = null,
     onrefresh,
+    onnetworkchange,
   }: {
     snapshot: RuntimeResourceSnapshot | null;
     loading?: boolean;
     error?: string | null;
     onrefresh: () => void;
+    onnetworkchange: (mode: "wsl" | "user_mode") => void;
   } = $props();
 
   function supportVariant(
@@ -133,5 +135,31 @@
         </div>
       {/each}
     </dl>
+    <div class="mt-4 flex flex-wrap items-end justify-between gap-3 border-t pt-3">
+      <div>
+        <div class="text-xs font-medium">Network mode</div>
+        <p class="mt-1 max-w-xl text-xs leading-5 text-muted-foreground">
+          {snapshot.updates.network_mode.reason}
+        </p>
+      </div>
+      <div class="flex items-center gap-1 rounded-md border p-1">
+        <Button
+          size="sm"
+          variant={snapshot.network.value === "wsl" ? "secondary" : "ghost"}
+          disabled={!snapshot.updates.network_mode.supported || snapshot.network.value === "wsl"}
+          onclick={() => onnetworkchange("wsl")}
+        >
+          WSL
+        </Button>
+        <Button
+          size="sm"
+          variant={snapshot.network.value === "user_mode" ? "secondary" : "ghost"}
+          disabled={!snapshot.updates.network_mode.supported || snapshot.network.value === "user_mode"}
+          onclick={() => onnetworkchange("user_mode")}
+        >
+          User mode
+        </Button>
+      </div>
+    </div>
   {/if}
 </div>

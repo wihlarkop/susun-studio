@@ -549,6 +549,35 @@ fn native_non_utf8_arguments_are_preserved() {
 }
 
 #[test]
+fn resource_update_action_roundtrips_only_closed_network_modes() {
+    let wsl = super::resource_update_action("runtime-a", super::RuntimeNetworkMode::Wsl);
+    let user_mode = super::resource_update_action("runtime-a", super::RuntimeNetworkMode::UserMode);
+    assert!(matches!(
+        super::parse_resource_update_action(&wsl),
+        Some(("runtime-a", super::RuntimeNetworkMode::Wsl))
+    ));
+    assert!(matches!(
+        super::parse_resource_update_action(&user_mode),
+        Some(("runtime-a", super::RuntimeNetworkMode::UserMode))
+    ));
+    assert!(super::parse_resource_update_action("resource_network_tcp:runtime-a").is_none());
+}
+
+#[test]
+fn resource_update_request_rejects_unknown_or_executable_content() {
+    assert!(
+        serde_json::from_str::<super::RuntimeResourceUpdateRequest>(
+            r#"{"network_mode":"wsl","executable":"evil.exe"}"#
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_str::<super::RuntimeResourceUpdateRequest>(r#"{"network_mode":"tcp"}"#)
+            .is_err()
+    );
+}
+
+#[test]
 fn captured_output_is_redacted_and_truthfully_marked_truncated() {
     let output = super::CapturedOutput {
         bytes: b"token=private-value completed".to_vec(),
