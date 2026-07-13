@@ -695,10 +695,7 @@ export async function rollbackRuntimeMigration(
   });
 }
 
-export type RuntimeDestructiveAction =
-  | "repair"
-  | "reset_engine_data"
-  | "remove_built_in_runtime";
+export type RuntimeDestructiveAction = "repair" | "reset_engine_data" | "remove_built_in_runtime";
 
 export type RuntimeAffectedCategory = {
   category: string;
@@ -723,10 +720,11 @@ export async function previewRuntimeDestructiveOperation(
   action: RuntimeDestructiveAction,
   options: DaemonRequestOptions = {},
 ): Promise<RuntimeDestructivePreview> {
-  return readJson(
-    `/v1/runtime/profiles/${encodeURIComponent(profileId)}/destructive-preview`,
-    { ...options, method: "POST", body: { action } },
-  );
+  return readJson(`/v1/runtime/profiles/${encodeURIComponent(profileId)}/destructive-preview`, {
+    ...options,
+    method: "POST",
+    body: { action },
+  });
 }
 
 export type RuntimeUninstallPolicy = {
