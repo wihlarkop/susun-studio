@@ -15,13 +15,13 @@
 //!    fresh preview.
 //!
 //! Migration commit/rollback are fully executed here (pure metadata moves).
-//! Runtime reset/remove/repair go through the same gate but their engine work is
-//! a Phase 14b provider command; commit revalidates and returns an explicit
-//! `deferred_to_phase_14b` terminal result without mutating any engine.
+//! Runtime reset/remove/repair go through the same gate before a trusted,
+//! provider-owned recovery plan is executed.
 
 use serde::{Deserialize, Serialize};
 use turso::{Connection, Database, params};
 
+use super::provider::{RuntimeRecoveryAction, RuntimeRecoveryPlan};
 use super::{RuntimeProfile, list_all_profiles, now_ms, stable_suffix};
 use crate::action_audit::{self, AffectedCount, AuditEntry};
 use crate::action_plans::{
@@ -129,16 +129,6 @@ impl DestructiveAction {
             Self::RemoveBuiltInRuntime => ActionKind::DestructiveRemoveBuiltInRuntime,
         }
     }
-
-    /// The safe command kind recorded in audit — describes the *class* of the
-    /// deferred Phase 14b provider operation, never a command line.
-    fn deferred_command_kind(self) -> &'static str {
-        match self {
-            Self::Repair => "deferred_provider_repair",
-            Self::ResetEngineData => "deferred_provider_reset",
-            Self::RemoveBuiltInRuntime => "deferred_provider_remove",
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,9 +159,7 @@ pub struct AffectedCategory {
     pub effect: &'static str,
 }
 
-/// Outcome of a destructive commit. Because the engine-mutating provider command
-/// is Phase 14b, a successful gate returns `deferred_to_phase_14b` — it never
-/// reports `executed`, `completed`, or any mutation success.
+/// Outcome of a destructive commit after provider execution.
 #[derive(Debug, Serialize)]
 pub struct DestructiveCommitResult {
     pub profile_id: String,
@@ -853,6 +841,7 @@ pub async fn preview_destructive_operation(
             owner,
             request.action.action_kind(),
             ActionPlanPayload::Destructive(DestructivePlan {
+                operation_id: operation_id.clone(),
                 profile_id: profile_id.to_owned(),
                 action: request.action.as_str().to_owned(),
                 fingerprint,
@@ -884,15 +873,49 @@ pub async fn preview_destructive_operation(
 }
 
 /// Commit a destructive runtime action by its opaque plan id. Fully revalidates
-/// ownership, runtime identity, provider/binding state, and active work, then —
-/// because the engine-mutating provider command is Phase 14b — records the
-/// attempt and returns `deferred_to_phase_14b`. It never mutates any engine and
-/// never reports success.
+/// ownership, runtime identity, provider/binding state, and active work, then
+/// records the attempt and executes the provider-owned recovery plan.
 pub async fn commit_destructive_operation(
     db: &Database,
     store: &ActionPlanStore,
     owner: &str,
     plan_id: &str,
+) -> Result<DestructiveCommitResult, CommitRejected> {
+    commit_destructive_operation_with(db, store, owner, plan_id, &TrustedRecoveryExecutor).await
+}
+
+trait RecoveryExecutor {
+    fn plan(
+        &self,
+        profile: &RuntimeProfile,
+        action: RuntimeRecoveryAction,
+    ) -> Option<RuntimeRecoveryPlan>;
+
+    async fn execute(&self, command: &super::command::ExecutableCommand) -> Result<(), String>;
+}
+
+struct TrustedRecoveryExecutor;
+
+impl RecoveryExecutor for TrustedRecoveryExecutor {
+    fn plan(
+        &self,
+        profile: &RuntimeProfile,
+        action: RuntimeRecoveryAction,
+    ) -> Option<RuntimeRecoveryPlan> {
+        super::find_provider(&profile.provider_id)?.recovery_plan(profile, action)
+    }
+
+    async fn execute(&self, command: &super::command::ExecutableCommand) -> Result<(), String> {
+        super::execute_recovery_command(command).await.map(|_| ())
+    }
+}
+
+async fn commit_destructive_operation_with<E: RecoveryExecutor>(
+    db: &Database,
+    store: &ActionPlanStore,
+    owner: &str,
+    plan_id: &str,
+    executor: &E,
 ) -> Result<DestructiveCommitResult, CommitRejected> {
     // Destructive plans have three action kinds; claim without a single expected
     // kind, then confirm the domain.
@@ -1019,9 +1042,95 @@ pub async fn commit_destructive_operation(
         .await;
     }
 
-    // Gate passed. The engine-mutating provider command is Phase 14b, so nothing
-    // is executed here. Record the deferral and return a non-success terminal.
-    store.finish(&claimed.plan_id, crate::action_plans::PlanState::Succeeded);
+    let recovery_action = match action {
+        DestructiveAction::Repair => RuntimeRecoveryAction::Repair,
+        DestructiveAction::ResetEngineData => RuntimeRecoveryAction::Reset,
+        DestructiveAction::RemoveBuiltInRuntime => RuntimeRecoveryAction::Remove,
+    };
+    let Some(recovery) = executor.plan(&profile, recovery_action) else {
+        return reject_destructive(
+            db,
+            kind,
+            &plan.profile_id,
+            store,
+            &claimed.plan_id,
+            CommitRejected::new(
+                "The provider cannot execute this recovery action in its current state.",
+                "rejected_provider",
+                "recovery_unsupported",
+            ),
+        )
+        .await;
+    };
+
+    let execution = execute_recovery_plan(executor, &recovery).await;
+    let (status, terminal_status, failure_code, message, mut next_steps) = match execution {
+        Ok(()) => {
+            if matches!(action, DestructiveAction::RemoveBuiltInRuntime) {
+                let _ = mark_profile_missing(db, &plan.profile_id).await;
+            } else {
+                let _ = super::status(db).await;
+            }
+            (
+                "completed",
+                action_audit::STATUS_COMPLETED,
+                None,
+                recovery.success_message.to_owned(),
+                recovery.next_steps,
+            )
+        }
+        Err(failed_step) => {
+            let partial = failed_step > 0;
+            let (message, guidance) = match (action, partial) {
+                (DestructiveAction::ResetEngineData, true) => {
+                    let _ = mark_profile_missing(db, &plan.profile_id).await;
+                    (
+                        "The previous runtime was removed, but its replacement could not be created.",
+                        "Use Set up Susun Runtime to recreate the missing built-in runtime.",
+                    )
+                }
+                (DestructiveAction::Repair, true) => {
+                    let _ = super::status(db).await;
+                    (
+                        "The runtime stopped, but it could not be started again.",
+                        "Recheck the runtime state, then prepare a fresh repair preview.",
+                    )
+                }
+                _ => (
+                    "The runtime recovery command failed without reporting success.",
+                    "Recheck provider state and prepare a fresh recovery preview.",
+                ),
+            };
+            (
+                if partial { "partial_failure" } else { "failed" },
+                action_audit::STATUS_FAILED,
+                Some(if partial {
+                    "provider_partial_failure"
+                } else {
+                    "provider_command_failed"
+                }),
+                message.to_owned(),
+                vec![guidance.to_owned()],
+            )
+        }
+    };
+    let recovery_guidance = next_steps.join(" ");
+    let _ = finish_destructive_record(
+        db,
+        &plan.operation_id,
+        status,
+        failure_code,
+        &recovery_guidance,
+    )
+    .await;
+    store.finish(
+        &claimed.plan_id,
+        if status == "completed" {
+            crate::action_plans::PlanState::Succeeded
+        } else {
+            crate::action_plans::PlanState::Failed
+        },
+    );
     let _ = action_audit::record(
         db,
         AuditEntry {
@@ -1029,14 +1138,14 @@ pub async fn commit_destructive_operation(
             profile_id: Some(plan.profile_id.clone()),
             runtime_class: Some(profile.runtime_class.clone()),
             ownership_result: "authorized".to_owned(),
-            command_kind: Some(action.deferred_command_kind().to_owned()),
-            elevation_mode: Some("os_mediated_consent".to_owned()),
-            terminal_status: action_audit::STATUS_DEFERRED_14B.to_owned(),
+            command_kind: Some(recovery.command_kind.to_owned()),
+            elevation_mode: Some("current_user".to_owned()),
+            terminal_status: terminal_status.to_owned(),
             affected: vec![AffectedCount {
                 category: "project_bindings".to_owned(),
                 count: project_count.max(0),
             }],
-            failure_code: None,
+            failure_code: failure_code.map(str::to_owned),
             correlation_token: None,
             started_at_ms: started,
             completed_at_ms: Some(now_ms()),
@@ -1046,13 +1155,67 @@ pub async fn commit_destructive_operation(
     Ok(DestructiveCommitResult {
         profile_id: plan.profile_id,
         action: plan.action,
-        status: "deferred_to_phase_14b",
+        status,
         revalidated: true,
-        message: "Ownership and state verified. Engine execution arrives in a later phase; nothing was changed.".to_owned(),
-        next_steps: vec![
-            "The built-in runtime engine operation is not enabled in this build.".to_owned(),
-        ],
+        message,
+        next_steps: std::mem::take(&mut next_steps),
     })
+}
+
+async fn execute_recovery_plan<E: RecoveryExecutor>(
+    executor: &E,
+    plan: &RuntimeRecoveryPlan,
+) -> Result<(), usize> {
+    for (index, command) in plan.commands.iter().enumerate() {
+        if executor.execute(command).await.is_err() {
+            return Err(index);
+        }
+    }
+    Ok(())
+}
+
+async fn mark_profile_missing(db: &Database, profile_id: &str) -> Result<(), turso::Error> {
+    let conn = db.connect()?;
+    conn.execute(
+        "UPDATE runtime_profiles
+         SET availability_state = 'missing', process_state = 'removed',
+             process_detail = 'Studio-owned runtime removed',
+             connection_state = 'not_applicable', connection_detail = NULL,
+             endpoint_summary = NULL, missing_since_ms = COALESCE(missing_since_ms, ?1),
+             updated_at_ms = ?1
+         WHERE id = ?2 AND runtime_class = 'built_in' AND ownership_state = 'studio_managed'",
+        params![now_ms(), profile_id.to_owned()],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn finish_destructive_record(
+    db: &Database,
+    operation_id: &str,
+    status: &str,
+    failure_code: Option<&str>,
+    recovery_guidance: &str,
+) -> Result<(), turso::Error> {
+    let result_json = serde_json::json!({
+        "failure_code": failure_code,
+    })
+    .to_string();
+    let conn = db.connect()?;
+    conn.execute(
+        "UPDATE runtime_destructive_operations
+         SET status = ?1, result_json = ?2, recovery_guidance = ?3, completed_at_ms = ?4
+         WHERE id = ?5 AND status = 'prepared'",
+        params![
+            status.to_owned(),
+            result_json,
+            recovery_guidance.to_owned(),
+            now_ms(),
+            operation_id.to_owned()
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 async fn reject_destructive(

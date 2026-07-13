@@ -12,10 +12,14 @@
 
   let {
     engineId,
+    runtimeName = "the active runtime",
     open = $bindable(false),
+    oncompleted,
   }: {
     engineId: string;
+    runtimeName?: string;
     open?: boolean;
+    oncompleted?: () => void | Promise<void>;
   } = $props();
 
   let includeContainers = $state(true);
@@ -63,6 +67,7 @@
       report = await commitEnginePrune(preview.plan_id);
       confirmText = "";
       preview = null;
+      await oncompleted?.();
     } catch (error) {
       errorMessage = error instanceof Error ? error.message : String(error);
     } finally {
@@ -107,11 +112,11 @@
 <Dialog.Root bind:open>
   <Dialog.Content class="sm:max-w-lg">
     <Dialog.Header>
-      <Dialog.Title>Prune Docker system</Dialog.Title>
+      <Dialog.Title>Prune engine resources</Dialog.Title>
       <Dialog.Description>
-        Removes unused resources across the <b>whole Docker engine</b> — not just projects
-        tracked by Studio. This can affect other tools and projects. Volumes may contain data
-        (e.g. database contents) and are excluded by default.
+        Removes unused resources from <b>{runtimeName}</b> across the whole engine, not only
+        projects tracked by Studio. This can affect other tools and projects. Volumes may contain
+        data and are excluded by default.
       </Dialog.Description>
     </Dialog.Header>
 

@@ -42,6 +42,27 @@ pub trait RuntimeProvider: Send + Sync {
     ) -> Option<ExecutableCommand> {
         None
     }
+    fn recovery_plan(
+        &self,
+        _profile: &RuntimeProfile,
+        _action: RuntimeRecoveryAction,
+    ) -> Option<RuntimeRecoveryPlan> {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeRecoveryAction {
+    Repair,
+    Reset,
+    Remove,
+}
+
+pub struct RuntimeRecoveryPlan {
+    pub commands: Vec<ExecutableCommand>,
+    pub command_kind: &'static str,
+    pub success_message: &'static str,
+    pub next_steps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

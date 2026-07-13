@@ -7,6 +7,7 @@
   import RuntimeDataScopeDialog from "$lib/components/runtime-data-scope-dialog.svelte";
   import RuntimeActionAudit from "$lib/components/runtime-action-audit.svelte";
   import RuntimeResourcePanel from "$lib/components/runtime-resource-panel.svelte";
+  import PruneDialog from "$lib/components/prune-dialog.svelte";
   import {
     cancelRuntimePlan,
     executeRuntimePlan,
@@ -41,6 +42,7 @@
     SlidersHorizontal,
     Square,
     TerminalSquare,
+    Trash2,
     Wrench,
   } from "@lucide/svelte";
 
@@ -60,6 +62,8 @@
   let migrationDialogOpen = $state(false);
   let dataScopeDialogOpen = $state(false);
   let dataScopeProfile = $state<RuntimeProfile | null>(null);
+  let pruneDialogOpen = $state(false);
+  let pruneProfile = $state<RuntimeProfile | null>(null);
   let resourceSnapshots = $state<Record<string, RuntimeResourceSnapshot>>({});
   let resourceLoading = $state<Record<string, boolean>>({});
   let resourceErrors = $state<Record<string, string>>({});
@@ -380,6 +384,11 @@
     dataScopeProfile = profile;
     dataScopeDialogOpen = true;
   }
+
+  function reviewPrune(profile: RuntimeProfile) {
+    pruneProfile = profile;
+    pruneDialogOpen = true;
+  }
 </script>
 
 <div class="flex flex-col gap-4">
@@ -664,7 +673,19 @@
                     {#if profile.runtime_class === "built_in"}
                       <Button size="sm" variant="outline" onclick={() => reviewDataScope(profile)}>
                         <SlidersHorizontal />
-                        Data scope
+                        Recovery
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={!profile.is_selected || profile.connection.state !== "summarized"}
+                        title={profile.is_selected
+                          ? "Preview unused resources on this runtime."
+                          : "Make this runtime active before pruning it."}
+                        onclick={() => reviewPrune(profile)}
+                      >
+                        <Trash2 />
+                        Prune
                       </Button>
                     {/if}
                     {#if profile.management.can_forget}
@@ -828,5 +849,17 @@
     bind:open={migrationDialogOpen}
     oncompleted={() => refresh()}
   />
-  <RuntimeDataScopeDialog profile={dataScopeProfile} bind:open={dataScopeDialogOpen} />
+  <RuntimeDataScopeDialog
+    profile={dataScopeProfile}
+    bind:open={dataScopeDialogOpen}
+    oncompleted={() => refresh()}
+  />
+  <PruneDialog
+    engineId="engine-docker-local"
+    runtimeName={pruneProfile
+      ? `${pruneProfile.display_name} (${pruneProfile.provider_runtime_key})`
+      : undefined}
+    bind:open={pruneDialogOpen}
+    oncompleted={() => refresh()}
+  />
 </div>

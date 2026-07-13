@@ -153,4 +153,11 @@
   {/if}
 </Card.Root>
 
-<PruneDialog engineId={LEGACY_ENGINE_ID} bind:open={pruneDialogOpen} />
+<PruneDialog
+  engineId={LEGACY_ENGINE_ID}
+  runtimeName={selected
+    ? `${selected.display_name} (${selected.provider_runtime_key})`
+    : undefined}
+  bind:open={pruneDialogOpen}
+  oncompleted={recheck}
+/>

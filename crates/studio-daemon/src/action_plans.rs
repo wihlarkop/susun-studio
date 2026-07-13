@@ -99,6 +99,7 @@ pub struct MigrationRollbackPlan {
 
 #[derive(Debug, Clone)]
 pub struct DestructivePlan {
+    pub operation_id: String,
     pub profile_id: String,
     /// Serialized destructive action kind ("repair" | "reset_engine_data" |
     /// "remove_built_in_runtime").

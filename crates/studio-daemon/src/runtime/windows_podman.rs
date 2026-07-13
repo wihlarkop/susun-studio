@@ -9,9 +9,10 @@ use super::{
     command_output, dimension, now_ms,
     provider::{
         EndpointSummary, ObservedProfile, PLACEHOLDER_KEY, RESERVED_BUILT_IN_MACHINE,
-        RuntimeAction, RuntimeClass, RuntimeObservation, RuntimeProvider, RuntimeResourceMetric,
-        RuntimeResourceSnapshot, RuntimeResourceText, RuntimeResourceUpdate,
-        RuntimeResourceUpdateCapabilities, RuntimeResourceUpdateCapability, profile_id,
+        RuntimeAction, RuntimeClass, RuntimeObservation, RuntimeProvider, RuntimeRecoveryAction,
+        RuntimeRecoveryPlan, RuntimeResourceMetric, RuntimeResourceSnapshot, RuntimeResourceText,
+        RuntimeResourceUpdate, RuntimeResourceUpdateCapabilities, RuntimeResourceUpdateCapability,
+        profile_id,
     },
     trusted_exec, trusted_read_output,
 };
@@ -232,6 +233,99 @@ impl RuntimeProvider for WindowsPodmanProvider {
         let machine = trusted_machine(machine_name)?;
         podman_resource_update_command(profile, update, &machine)
     }
+
+    fn recovery_plan(
+        &self,
+        profile: &RuntimeProfile,
+        action: RuntimeRecoveryAction,
+    ) -> Option<RuntimeRecoveryPlan> {
+        if profile.runtime_class != "built_in"
+            || profile.ownership_state != "studio_managed"
+            || profile.availability_state != "available"
+            || profile.provider_runtime_key != format!("machine/{RESERVED_BUILT_IN_MACHINE}")
+        {
+            return None;
+        }
+        let machine = trusted_machine(RESERVED_BUILT_IN_MACHINE)?;
+        podman_recovery_plan(profile, action, &machine)
+    }
+}
+
+fn podman_machine_command(args: Vec<std::ffi::OsString>, success: &str) -> ExecutableCommand {
+    ExecutableCommand {
+        program: TrustedProgram::Podman,
+        args,
+        env_allowlist: Vec::new(),
+        working_dir: None,
+        timeout: Duration::from_secs(10 * 60),
+        kind: CommandKind::RuntimeCli,
+        elevation: ProcessElevation::CurrentUser,
+        software_provenance: None,
+        success_message: success.to_owned(),
+    }
+}
+
+fn podman_recovery_plan(
+    profile: &RuntimeProfile,
+    action: RuntimeRecoveryAction,
+    machine: &PodmanMachine,
+) -> Option<RuntimeRecoveryPlan> {
+    if profile.runtime_class != "built_in"
+        || profile.ownership_state != "studio_managed"
+        || machine.name.as_deref() != Some(RESERVED_BUILT_IN_MACHINE)
+    {
+        return None;
+    }
+    let name = RESERVED_BUILT_IN_MACHINE;
+    let plan = match action {
+        RuntimeRecoveryAction::Repair => {
+            let mut commands = Vec::new();
+            if machine.running.unwrap_or(false) {
+                commands.push(podman_machine_command(
+                    vec!["machine".into(), "stop".into(), name.into()],
+                    "Susun Runtime stopped for repair.",
+                ));
+            }
+            commands.push(podman_machine_command(
+                vec!["machine".into(), "start".into(), name.into()],
+                "Susun Runtime started.",
+            ));
+            RuntimeRecoveryPlan {
+                commands,
+                command_kind: "provider_repair",
+                success_message: "Susun Runtime lifecycle repair completed.",
+                next_steps: vec!["Recheck project connectivity before resuming work.".to_owned()],
+            }
+        }
+        RuntimeRecoveryAction::Reset => RuntimeRecoveryPlan {
+            commands: vec![
+                podman_machine_command(
+                    vec!["machine".into(), "rm".into(), "--force".into(), name.into()],
+                    "Previous Susun Runtime removed.",
+                ),
+                podman_machine_command(
+                    vec!["machine".into(), "init".into(), name.into()],
+                    "Fresh Susun Runtime created.",
+                ),
+            ],
+            command_kind: "provider_reset",
+            success_message: "Susun Runtime engine data was reset.",
+            next_steps: vec!["Start Susun Runtime, then recreate project resources.".to_owned()],
+        },
+        RuntimeRecoveryAction::Remove => RuntimeRecoveryPlan {
+            commands: vec![podman_machine_command(
+                vec!["machine".into(), "rm".into(), "--force".into(), name.into()],
+                "Susun Runtime removed.",
+            )],
+            command_kind: "provider_remove",
+            success_message: "Susun Runtime was removed.",
+            next_steps: vec![
+                "Bound projects remain unavailable until they are reassigned or Susun Runtime is set up again."
+                    .to_owned(),
+            ],
+        },
+    };
+    Some(plan)
 }
 
 fn podman_resource_update_command(
@@ -870,5 +964,50 @@ mod resource_tests {
         assert_eq!(snapshot.cpu.support, "unavailable");
         assert_eq!(snapshot.network.support, "unavailable");
         assert!(snapshot.cpu.value.is_none());
+    }
+
+    #[test]
+    fn reset_plan_targets_only_the_reserved_machine() -> Result<(), Box<dyn std::error::Error>> {
+        let machines =
+            parse_machines(r#"[{"Name":"susun-runtime-default","Running":true,"VMType":"wsl"}]"#)?;
+        let machine = machines.first().ok_or("missing machine")?;
+        let plan = podman_recovery_plan(&managed_profile(), RuntimeRecoveryAction::Reset, machine)
+            .ok_or("missing plan")?;
+
+        assert_eq!(plan.commands.len(), 2);
+        assert_eq!(
+            plan.commands[0].args,
+            vec!["machine", "rm", "--force", "susun-runtime-default"]
+        );
+        assert_eq!(
+            plan.commands[1].args,
+            vec!["machine", "init", "susun-runtime-default"]
+        );
+        assert!(
+            plan.commands
+                .iter()
+                .all(|command| command.elevation == ProcessElevation::CurrentUser)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repair_running_machine_stops_then_starts() -> Result<(), Box<dyn std::error::Error>> {
+        let machines =
+            parse_machines(r#"[{"Name":"susun-runtime-default","Running":true,"VMType":"wsl"}]"#)?;
+        let machine = machines.first().ok_or("missing machine")?;
+        let plan = podman_recovery_plan(&managed_profile(), RuntimeRecoveryAction::Repair, machine)
+            .ok_or("missing plan")?;
+
+        assert_eq!(plan.commands.len(), 2);
+        assert_eq!(
+            plan.commands[0].args,
+            vec!["machine", "stop", "susun-runtime-default"]
+        );
+        assert_eq!(
+            plan.commands[1].args,
+            vec!["machine", "start", "susun-runtime-default"]
+        );
+        Ok(())
     }
 }

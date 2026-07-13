@@ -622,6 +622,15 @@ enum CommandRunError {
     Failed(String),
 }
 
+pub(super) async fn execute_recovery_command(
+    command: &ExecutableCommand,
+) -> Result<String, String> {
+    run_command(command).await.map_err(|error| match error {
+        CommandRunError::Cancelled => "runtime recovery was cancelled".to_owned(),
+        CommandRunError::Failed(message) => message,
+    })
+}
+
 pub async fn prepare_trusted_action(
     db: &Database,
     store: &trusted_plans::TrustedPlanStore,

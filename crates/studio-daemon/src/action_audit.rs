@@ -35,7 +35,6 @@ pub struct AffectedCount {
 pub const STATUS_COMPLETED: &str = "completed";
 pub const STATUS_FAILED: &str = "failed";
 pub const STATUS_REJECTED: &str = "rejected";
-pub const STATUS_DEFERRED_14B: &str = "deferred_to_phase_14b";
 /// Non-terminal: a restore has been staged but not yet swapped/restarted.
 pub const STATUS_STAGED: &str = "staged";
 pub const STATUS_ROLLED_BACK: &str = "rolled_back";
