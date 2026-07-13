@@ -73,7 +73,7 @@ async fn insert_built_in(db: &Database, id: &str) -> TestResult {
              installation_state, process_state, connection_state,
              availability_state, is_selected, observation_revision,
              observed_at_ms, created_at_ms, updated_at_ms)
-         VALUES (?1, 'windows-podman', 'machine/built', 'Built', 'podman', 'windows',
+         VALUES (?1, 'windows-podman', 'machine/susun-runtime-default', 'Built', 'podman', 'windows',
              'built_in', 'studio_managed', 'studio_setup', 'own_tok',
              'installed', 'running', 'summarized',
              'available', 0, 0, 1, 1, 1)",
@@ -81,6 +81,81 @@ async fn insert_built_in(db: &Database, id: &str) -> TestResult {
     )
     .await?;
     Ok(())
+}
+
+struct FakeRecoveryExecutor {
+    fail_at: Option<usize>,
+    calls: std::sync::Mutex<usize>,
+}
+
+impl FakeRecoveryExecutor {
+    fn succeeding() -> Self {
+        Self {
+            fail_at: None,
+            calls: std::sync::Mutex::new(0),
+        }
+    }
+
+    fn failing_at(step: usize) -> Self {
+        Self {
+            fail_at: Some(step),
+            calls: std::sync::Mutex::new(0),
+        }
+    }
+}
+
+impl RecoveryExecutor for FakeRecoveryExecutor {
+    fn plan(
+        &self,
+        _profile: &RuntimeProfile,
+        action: RuntimeRecoveryAction,
+    ) -> Option<RuntimeRecoveryPlan> {
+        let command_count = if action == RuntimeRecoveryAction::Reset {
+            2
+        } else {
+            1
+        };
+        Some(RuntimeRecoveryPlan {
+            commands: (0..command_count).map(|_| fake_command()).collect(),
+            command_kind: "test_runtime_recovery",
+            success_message: "Runtime recovery completed.",
+            next_steps: vec!["Recheck the runtime state.".to_owned()],
+        })
+    }
+
+    async fn execute(
+        &self,
+        _command: &super::super::command::ExecutableCommand,
+    ) -> Result<(), String> {
+        let mut calls = self.calls.lock().unwrap_or_else(|error| error.into_inner());
+        let current = *calls;
+        *calls += 1;
+        if self.fail_at == Some(current) {
+            Err("fixed provider failure".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn fake_command() -> super::super::command::ExecutableCommand {
+    use super::super::command::{CommandKind, ProcessElevation, TrustedProgram};
+
+    super::super::command::ExecutableCommand {
+        program: TrustedProgram::Podman,
+        args: vec![
+            "machine".into(),
+            "start".into(),
+            "susun-runtime-default".into(),
+        ],
+        env_allowlist: Vec::new(),
+        working_dir: None,
+        timeout: std::time::Duration::from_secs(60),
+        kind: CommandKind::RuntimeCli,
+        elevation: ProcessElevation::CurrentUser,
+        software_provenance: None,
+        success_message: "done".to_owned(),
+    }
 }
 
 async fn audit_statuses(conn: &turso::Connection) -> TestResult<Vec<String>> {
@@ -271,7 +346,66 @@ async fn destructive_preview_never_allows_external_runtime() -> TestResult {
 }
 
 #[tokio::test]
-async fn destructive_commit_gates_then_defers_to_phase_14b() -> TestResult {
+async fn destructive_remove_executes_and_preserves_project_bindings() -> TestResult {
+    let (db, path, _, _) = fixture().await?;
+    let store = ActionPlanStore::default();
+    insert_built_in(&db, "built-1").await?;
+    let conn = db.connect()?;
+    conn.execute(
+        "UPDATE projects SET runtime_profile_id = 'built-1' WHERE id = 'p1'",
+        (),
+    )
+    .await?;
+
+    let preview = preview_destructive_operation(
+        &db,
+        &store,
+        OWNER,
+        "built-1",
+        &DestructivePreviewRequest {
+            action: DestructiveAction::RemoveBuiltInRuntime,
+        },
+    )
+    .await?
+    .ok_or("preview")?;
+    assert!(preview.allowed);
+    let plan_id = preview.plan_id.clone().ok_or("plan_id")?;
+
+    let Ok(result) = commit_destructive_operation_with(
+        &db,
+        &store,
+        OWNER,
+        &plan_id,
+        &FakeRecoveryExecutor::succeeding(),
+    )
+    .await
+    else {
+        return Err("commit rejected".into());
+    };
+    assert_eq!(result.status, "completed");
+    assert!(result.revalidated);
+
+    // Removing a managed runtime keeps project intent but marks the target unavailable.
+    assert_eq!(binding(&conn, "p1").await?, "built-1");
+    assert_eq!(profile_availability(&conn, "built-1").await?, "missing");
+    assert_eq!(destructive_status(&conn).await?, "completed");
+    assert_eq!(
+        audit_statuses(&conn).await?.first().map(String::as_str),
+        Some("completed")
+    );
+
+    // The single-use plan is spent.
+    assert!(
+        commit_destructive_operation(&db, &store, OWNER, &plan_id)
+            .await
+            .is_err()
+    );
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn destructive_reset_records_partial_failure_after_removal() -> TestResult {
     let (db, path, _, _) = fixture().await?;
     let store = ActionPlanStore::default();
     insert_built_in(&db, "built-1").await?;
@@ -287,27 +421,27 @@ async fn destructive_commit_gates_then_defers_to_phase_14b() -> TestResult {
     )
     .await?
     .ok_or("preview")?;
-    assert!(preview.allowed);
     let plan_id = preview.plan_id.clone().ok_or("plan_id")?;
-
-    let Ok(result) = commit_destructive_operation(&db, &store, OWNER, &plan_id).await else {
+    let Ok(result) = commit_destructive_operation_with(
+        &db,
+        &store,
+        OWNER,
+        &plan_id,
+        &FakeRecoveryExecutor::failing_at(1),
+    )
+    .await
+    else {
         return Err("commit rejected".into());
     };
-    assert_eq!(result.status, "deferred_to_phase_14b");
-    assert!(result.revalidated);
 
-    // No engine mutation is claimed; audit records the deferral, not success.
+    assert_eq!(result.status, "partial_failure");
+    assert!(result.message.contains("replacement could not be created"));
     let conn = db.connect()?;
+    assert_eq!(profile_availability(&conn, "built-1").await?, "missing");
+    assert_eq!(destructive_status(&conn).await?, "partial_failure");
     assert_eq!(
         audit_statuses(&conn).await?.first().map(String::as_str),
-        Some("deferred_to_phase_14b")
-    );
-
-    // The single-use plan is spent.
-    assert!(
-        commit_destructive_operation(&db, &store, OWNER, &plan_id)
-            .await
-            .is_err()
+        Some("failed")
     );
     let _ = std::fs::remove_file(path);
     Ok(())
@@ -368,4 +502,25 @@ async fn migration_status(conn: &turso::Connection) -> TestResult<String> {
         )
         .await?;
     Ok(rows.next().await?.ok_or("migration")?.get(0)?)
+}
+
+async fn profile_availability(conn: &turso::Connection, profile_id: &str) -> TestResult<String> {
+    let mut rows = conn
+        .query(
+            "SELECT availability_state FROM runtime_profiles WHERE id = ?1",
+            params![profile_id.to_owned()],
+        )
+        .await?;
+    Ok(rows.next().await?.ok_or("profile")?.get(0)?)
+}
+
+async fn destructive_status(conn: &turso::Connection) -> TestResult<String> {
+    let mut rows = conn
+        .query(
+            "SELECT status FROM runtime_destructive_operations
+             ORDER BY created_at_ms DESC LIMIT 1",
+            (),
+        )
+        .await?;
+    Ok(rows.next().await?.ok_or("destructive operation")?.get(0)?)
 }

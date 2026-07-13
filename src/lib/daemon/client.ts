@@ -809,8 +809,8 @@ export type RuntimeDestructivePreview = {
 export type RuntimeDestructiveCommitResult = {
   profile_id: string;
   action: RuntimeDestructiveAction;
-  /** Ownership/state was revalidated but the engine operation is deferred. */
-  status: "deferred_to_phase_14b";
+  /** Provider recovery outcome after ownership and runtime state revalidation. */
+  status: "completed" | "partial_failure" | "failed";
   revalidated: boolean;
   message: string;
   next_steps: string[];

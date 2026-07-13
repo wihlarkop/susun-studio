@@ -10,14 +10,16 @@
     type RuntimeDestructivePreview,
     type RuntimeProfile,
   } from "$lib/daemon/client";
-  import { RefreshCw, ShieldCheck } from "@lucide/svelte";
+  import { CircleAlert, RefreshCw, ShieldCheck } from "@lucide/svelte";
 
   let {
     profile,
     open = $bindable(false),
+    oncompleted,
   }: {
     profile: RuntimeProfile | null;
     open?: boolean;
+    oncompleted?: () => void | Promise<void>;
   } = $props();
 
   let action = $state<RuntimeDestructiveAction>("repair");
@@ -48,25 +50,39 @@
       commitResult = await commitRuntimeDestructiveOperation(preview.plan_id);
       // The single-use plan is now spent; a fresh preview is required to retry.
       preview = null;
+      await oncompleted?.();
     } catch (error) {
       errorMessage = error instanceof Error ? error.message : String(error);
     } finally {
       busy = false;
     }
   }
+
+  function resetPreview() {
+    preview = null;
+    commitResult = null;
+  }
+
+  function commitLabel() {
+    if (action === "repair") return "Repair runtime";
+    if (action === "reset_engine_data") return "Reset engine data";
+    return "Remove Susun Runtime";
+  }
 </script>
 
 <Dialog.Root bind:open>
   <Dialog.Content class="max-h-[85vh] overflow-y-auto sm:max-w-xl">
     <Dialog.Header>
-      <Dialog.Title>Runtime data scope</Dialog.Title>
-      <Dialog.Description>{profile?.display_name ?? "Runtime"}</Dialog.Description>
+      <Dialog.Title>Runtime recovery</Dialog.Title>
+      <Dialog.Description>
+        {profile ? `${profile.display_name} (${profile.provider_runtime_key})` : "Runtime"}
+      </Dialog.Description>
     </Dialog.Header>
 
     <div class="grid gap-4">
       <label class="grid gap-1 text-sm font-medium">
         Operation
-        <select class="h-9 rounded-md border bg-background px-3 text-sm" bind:value={action} onchange={() => (preview = null)}>
+        <select class="h-9 rounded-md border bg-background px-3 text-sm" bind:value={action} onchange={resetPreview}>
           <option value="repair">Repair</option>
           <option value="reset_engine_data">Reset engine data</option>
           <option value="remove_built_in_runtime">Remove Susun Runtime</option>
@@ -99,10 +115,17 @@
         </div>
       {/if}
       {#if commitResult}
-        <div class="grid gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/5 p-3 text-sm">
+        <div
+          class={`grid gap-2 rounded-md border p-3 text-sm ${commitResult.status === "completed" ? "border-emerald-500/40 bg-emerald-500/5" : "border-destructive/40 bg-destructive/5"}`}
+        >
           <div class="flex items-center gap-2">
-            <ShieldCheck class="size-4 text-emerald-600" />
-            <span class="font-medium">Ownership and state verified</span>
+            {#if commitResult.status === "completed"}
+              <ShieldCheck class="size-4 text-emerald-600" />
+              <span class="font-medium">Recovery completed</span>
+            {:else}
+              <CircleAlert class="size-4 text-destructive" />
+              <span class="font-medium">Recovery needs attention</span>
+            {/if}
           </div>
           <p class="text-muted-foreground">{commitResult.message}</p>
           {#each commitResult.next_steps as step}
@@ -119,8 +142,12 @@
         <RefreshCw /> {busy ? "Inspecting" : "Preview scope"}
       </Button>
       {#if preview?.allowed && preview.plan_id}
-        <Button variant="destructive" disabled={busy} onclick={commit}>
-          Verify &amp; continue
+        <Button
+          variant={action === "repair" ? "default" : "destructive"}
+          disabled={busy}
+          onclick={commit}
+        >
+          {commitLabel()}
         </Button>
       {/if}
     </Dialog.Footer>
