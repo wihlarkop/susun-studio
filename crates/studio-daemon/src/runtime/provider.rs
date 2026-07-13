@@ -32,6 +32,9 @@ pub trait RuntimeProvider: Send + Sync {
         profiles: &[RuntimeProfile],
     ) -> Option<ExecutableCommand>;
     fn endpoint_for_runtime_key(&self, provider_runtime_key: &str) -> Option<EngineEndpoint>;
+    fn resource_snapshot(&self, profile: &RuntimeProfile) -> RuntimeResourceSnapshot {
+        RuntimeResourceSnapshot::unsupported(profile, self.id())
+    }
 }
 
 pub struct RuntimeObservation {
@@ -133,6 +136,71 @@ pub struct RuntimeProfile {
     pub observed_at_ms: i64,
     pub management: ManagementCapabilities,
     pub freshness: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeResourceMetric {
+    pub support: String,
+    pub value: Option<u64>,
+    pub unit: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeResourceText {
+    pub support: String,
+    pub value: Option<String>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeResourceSnapshot {
+    pub profile_id: String,
+    pub provider_id: String,
+    pub observed_at_ms: i64,
+    pub managed: bool,
+    pub cpu: RuntimeResourceMetric,
+    pub memory: RuntimeResourceMetric,
+    pub disk_allocation: RuntimeResourceMetric,
+    pub disk_usage: RuntimeResourceMetric,
+    pub data_location: RuntimeResourceText,
+    pub network: RuntimeResourceText,
+    pub volumes: RuntimeResourceMetric,
+}
+
+impl RuntimeResourceSnapshot {
+    fn unsupported(profile: &RuntimeProfile, provider_id: &str) -> Self {
+        let metric = |unit: &str, detail: &str| RuntimeResourceMetric {
+            support: "unsupported".to_owned(),
+            value: None,
+            unit: unit.to_owned(),
+            detail: Some(detail.to_owned()),
+        };
+        Self {
+            profile_id: profile.id.clone(),
+            provider_id: provider_id.to_owned(),
+            observed_at_ms: profile.observed_at_ms,
+            managed: profile.runtime_class == "built_in"
+                && profile.ownership_state == "studio_managed",
+            cpu: metric("cores", "This provider does not expose CPU allocation."),
+            memory: metric("bytes", "This provider does not expose memory allocation."),
+            disk_allocation: metric("bytes", "This provider does not expose disk allocation."),
+            disk_usage: metric("bytes", "This provider does not expose disk usage."),
+            data_location: RuntimeResourceText {
+                support: "unsupported".to_owned(),
+                value: None,
+                detail: Some(
+                    "This provider does not expose a safe data-location summary.".to_owned(),
+                ),
+            },
+            network: RuntimeResourceText {
+                support: "unsupported".to_owned(),
+                value: None,
+                detail: Some("This provider does not expose its network mode.".to_owned()),
+            },
+            volumes: metric("count", "Engine-wide volume inventory is unavailable."),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

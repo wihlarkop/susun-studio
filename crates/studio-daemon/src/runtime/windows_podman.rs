@@ -9,8 +9,10 @@ use super::{
     command_output, dimension, now_ms,
     provider::{
         EndpointSummary, ObservedProfile, PLACEHOLDER_KEY, RESERVED_BUILT_IN_MACHINE,
-        RuntimeAction, RuntimeClass, RuntimeObservation, RuntimeProvider, profile_id,
+        RuntimeAction, RuntimeClass, RuntimeObservation, RuntimeProvider, RuntimeResourceMetric,
+        RuntimeResourceSnapshot, RuntimeResourceText, profile_id,
     },
+    trusted_exec, trusted_read_output,
 };
 use std::time::Duration;
 
@@ -190,6 +192,25 @@ impl RuntimeProvider for WindowsPodmanProvider {
         let pipe = machine_pipe_from_inspect(machine_name)
             .unwrap_or_else(|| format!(r"\\.\pipe\podman-machine-{machine_name}"));
         Some(EngineEndpoint::WindowsNamedPipe(pipe.into()))
+    }
+
+    fn resource_snapshot(&self, profile: &RuntimeProfile) -> RuntimeResourceSnapshot {
+        let machine_name = profile
+            .provider_runtime_key
+            .strip_prefix("machine/")
+            .unwrap_or_default();
+        let machine = trusted_exec::verify_trusted_program(TrustedProgram::Podman)
+            .ok()
+            .and_then(|target| {
+                trusted_read_output(&target.path, &["machine", "list", "--format", "json"]).ok()
+            })
+            .and_then(|output| parse_machines(&output).ok())
+            .and_then(|machines| {
+                machines
+                    .into_iter()
+                    .find(|machine| machine.name.as_deref() == Some(machine_name))
+            });
+        podman_resource_snapshot(profile, machine.as_ref())
     }
 }
 
@@ -400,7 +421,7 @@ impl WindowsPodmanProvider {
         let Ok(output) = command_output("podman", &["machine", "list", "--format", "json"]) else {
             return Vec::new();
         };
-        let Ok(machines) = serde_json::from_str::<Vec<PodmanMachine>>(&output) else {
+        let Ok(machines) = parse_machines(&output) else {
             return Vec::new();
         };
         let observed_at_ms = now_ms();
@@ -479,6 +500,30 @@ struct PodmanMachine {
     vm_type: Option<String>,
     #[serde(rename = "Default")]
     default: Option<bool>,
+    #[serde(rename = "CPUs")]
+    cpus: Option<JsonU64>,
+    #[serde(rename = "Memory")]
+    memory: Option<JsonU64>,
+    #[serde(rename = "DiskSize")]
+    disk_size: Option<JsonU64>,
+    #[serde(rename = "UserModeNetworking")]
+    user_mode_networking: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum JsonU64 {
+    Number(u64),
+    String(String),
+}
+
+impl JsonU64 {
+    fn value(&self) -> Option<u64> {
+        match self {
+            Self::Number(value) => Some(*value),
+            Self::String(value) => value.parse().ok(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -516,6 +561,121 @@ fn machine_detail(machine: &PodmanMachine) -> String {
     }
 }
 
+fn parse_machines(output: &str) -> Result<Vec<PodmanMachine>, serde_json::Error> {
+    serde_json::from_str(output)
+}
+
+fn podman_resource_snapshot(
+    profile: &RuntimeProfile,
+    machine: Option<&PodmanMachine>,
+) -> RuntimeResourceSnapshot {
+    let unavailable_metric = |unit: &str| RuntimeResourceMetric {
+        support: "unavailable".to_owned(),
+        value: None,
+        unit: unit.to_owned(),
+        detail: Some("The machine is not present in the latest provider inventory.".to_owned()),
+    };
+    let unsupported_metric = |unit: &str, detail: &str| RuntimeResourceMetric {
+        support: "unsupported".to_owned(),
+        value: None,
+        unit: unit.to_owned(),
+        detail: Some(detail.to_owned()),
+    };
+    let metric = |value: Option<u64>, unit: &str, detail: &str| RuntimeResourceMetric {
+        support: if value.is_some() {
+            "supported"
+        } else {
+            "unknown"
+        }
+        .to_owned(),
+        value,
+        unit: unit.to_owned(),
+        detail: value.is_none().then(|| detail.to_owned()),
+    };
+    let managed =
+        profile.runtime_class == "built_in" && profile.ownership_state == "studio_managed";
+    let Some(machine) = machine else {
+        return RuntimeResourceSnapshot {
+            profile_id: profile.id.clone(),
+            provider_id: profile.provider_id.clone(),
+            observed_at_ms: now_ms(),
+            managed,
+            cpu: unavailable_metric("cores"),
+            memory: unavailable_metric("bytes"),
+            disk_allocation: unavailable_metric("bytes"),
+            disk_usage: unavailable_metric("bytes"),
+            data_location: RuntimeResourceText {
+                support: "unavailable".to_owned(),
+                value: None,
+                detail: Some(
+                    "The machine is not present in the latest provider inventory.".to_owned(),
+                ),
+            },
+            network: RuntimeResourceText {
+                support: "unavailable".to_owned(),
+                value: None,
+                detail: Some(
+                    "The machine is not present in the latest provider inventory.".to_owned(),
+                ),
+            },
+            volumes: unavailable_metric("count"),
+        };
+    };
+    let network_mode = machine
+        .user_mode_networking
+        .map(|enabled| if enabled { "user_mode" } else { "wsl" }.to_owned());
+    RuntimeResourceSnapshot {
+        profile_id: profile.id.clone(),
+        provider_id: profile.provider_id.clone(),
+        observed_at_ms: now_ms(),
+        managed,
+        cpu: metric(
+            machine.cpus.as_ref().and_then(JsonU64::value),
+            "cores",
+            "Podman did not report CPU allocation.",
+        ),
+        memory: metric(
+            machine.memory.as_ref().and_then(JsonU64::value),
+            "bytes",
+            "Podman did not report memory allocation.",
+        ),
+        disk_allocation: metric(
+            machine.disk_size.as_ref().and_then(JsonU64::value),
+            "bytes",
+            "Podman did not report disk allocation.",
+        ),
+        disk_usage: unsupported_metric(
+            "bytes",
+            "Podman machine inventory does not report used disk space.",
+        ),
+        data_location: RuntimeResourceText {
+            support: "supported".to_owned(),
+            value: Some("provider_managed_user_scope".to_owned()),
+            detail: Some(
+                "Stored in Podman's current-user machine data; raw paths are not exposed."
+                    .to_owned(),
+            ),
+        },
+        network: RuntimeResourceText {
+            support: if network_mode.is_some() {
+                "supported"
+            } else {
+                "unknown"
+            }
+            .to_owned(),
+            value: network_mode,
+            detail: machine
+                .user_mode_networking
+                .is_none()
+                .then(|| "Podman did not report the machine network mode.".to_owned()),
+        },
+        volumes: unsupported_metric(
+            "count",
+            "Engine-wide volume inventory is not available through the current SDK contract.",
+        ),
+    }
+}
+
 fn machine_pipe_from_inspect(machine_name: &str) -> Option<String> {
     let output = command_output("podman", &["machine", "inspect", machine_name]).ok()?;
     let inspect = serde_json::from_str::<Vec<PodmanMachineInspect>>(&output)
@@ -527,4 +687,76 @@ fn machine_pipe_from_inspect(machine_name: &str) -> Option<String> {
         .and_then(|info| info.podman_pipe.or(info.docker_pipe))
         .and_then(|pipe| pipe.path)
         .filter(|path| !path.trim().is_empty())
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+    use crate::runtime::provider::ManagementCapabilities;
+
+    fn managed_profile() -> RuntimeProfile {
+        RuntimeProfile {
+            id: "runtime-windows-podman-managed".to_owned(),
+            provider_id: "windows-podman".to_owned(),
+            provider_runtime_key: format!("machine/{RESERVED_BUILT_IN_MACHINE}"),
+            display_name: "Susun Runtime".to_owned(),
+            product: "podman".to_owned(),
+            platform: "windows".to_owned(),
+            runtime_class: "built_in".to_owned(),
+            ownership_state: "studio_managed".to_owned(),
+            source: "studio_setup".to_owned(),
+            installation: dimension("installed", None),
+            process: dimension("running", None),
+            connection: dimension("summarized", None),
+            endpoint_summary: None,
+            availability_state: "available".to_owned(),
+            last_seen_at_ms: Some(1),
+            missing_since_ms: None,
+            last_error: None,
+            is_selected: true,
+            observation_revision: 1,
+            observed_at_ms: 1,
+            management: ManagementCapabilities::derive("built_in", "studio_managed", "available"),
+            freshness: "fresh".to_owned(),
+        }
+    }
+
+    #[test]
+    fn machine_inventory_accepts_numeric_and_string_resource_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let machines = parse_machines(
+            r#"[{
+                "Name":"susun-runtime-default",
+                "Running":true,
+                "VMType":"wsl",
+                "Default":false,
+                "CPUs":4,
+                "Memory":"4294967296",
+                "DiskSize":"107374182400",
+                "UserModeNetworking":false
+            }]"#,
+        )?;
+        let snapshot = podman_resource_snapshot(&managed_profile(), machines.first());
+
+        assert!(snapshot.managed);
+        assert_eq!(snapshot.cpu.value, Some(4));
+        assert_eq!(snapshot.memory.value, Some(4_294_967_296));
+        assert_eq!(snapshot.disk_allocation.value, Some(107_374_182_400));
+        assert_eq!(snapshot.network.value.as_deref(), Some("wsl"));
+        assert_eq!(snapshot.disk_usage.support, "unsupported");
+        assert_eq!(snapshot.volumes.support, "unsupported");
+        assert_eq!(
+            snapshot.data_location.value.as_deref(),
+            Some("provider_managed_user_scope")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_machine_inventory_is_explicitly_unavailable() {
+        let snapshot = podman_resource_snapshot(&managed_profile(), None);
+        assert_eq!(snapshot.cpu.support, "unavailable");
+        assert_eq!(snapshot.network.support, "unavailable");
+        assert!(snapshot.cpu.value.is_none());
+    }
 }
