@@ -285,6 +285,13 @@ export type RuntimeResourceSnapshot = {
   data_location: RuntimeResourceText;
   network: RuntimeResourceText;
   volumes: RuntimeResourceMetric;
+  updates: {
+    network_mode: {
+      supported: boolean;
+      restart_required: boolean;
+      reason: string;
+    };
+  };
 };
 
 export type RuntimeEndpointSummary = {
@@ -660,6 +667,18 @@ export async function readRuntimeProfileResources(
   options: DaemonRequestOptions = {},
 ): Promise<RuntimeResourceSnapshot> {
   return readJson(`/v1/runtime/profiles/${encodeURIComponent(profileId)}/resources`, options);
+}
+
+export async function prepareRuntimeResourceUpdate(
+  profileId: string,
+  networkMode: "wsl" | "user_mode",
+  options: DaemonRequestOptions = {},
+): Promise<PrepareRuntimeActionResponse> {
+  return readJson(`/v1/runtime/profiles/${encodeURIComponent(profileId)}/resources/prepare`, {
+    ...options,
+    method: "POST",
+    body: JSON.stringify({ network_mode: networkMode }),
+  });
 }
 
 export type RuntimeMigrationProject = {

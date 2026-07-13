@@ -55,6 +55,32 @@ pub async fn runtime_profile_resources(
     }
 }
 
+pub async fn prepare_runtime_resource_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(profile_id): Path<String>,
+    Json(request): Json<runtime::RuntimeResourceUpdateRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &headers)?;
+    logging::warn(
+        "runtime_resource_update_prepare_requested",
+        &[("profile_id", profile_id.clone())],
+    );
+    let owner = runtime::stable_suffix(&state.auth_token);
+    match runtime::prepare_resource_update(
+        &state.db,
+        &state.trusted_plans,
+        &owner,
+        &profile_id,
+        request,
+    )
+    .await?
+    {
+        Ok(plan) => Ok(Json(serde_json::json!({ "plan": plan }))),
+        Err(result) => Ok(Json(serde_json::json!({ "result": result }))),
+    }
+}
+
 pub async fn select_runtime_profile(
     State(state): State<AppState>,
     headers: HeaderMap,

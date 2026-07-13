@@ -99,6 +99,10 @@ pub fn app(state: AppState) -> Router {
             get(runtime::runtime_profile_resources),
         )
         .route(
+            "/v1/runtime/profiles/{id}/resources/prepare",
+            post(runtime::prepare_runtime_resource_update),
+        )
+        .route(
             "/v1/runtime/migrations/preview",
             post(runtime_transitions::preview_migration),
         )

@@ -15,6 +15,7 @@
     readRuntimeProfileResources,
     readRuntimeStatus,
     prepareRuntimeAction,
+    prepareRuntimeResourceUpdate,
     selectRuntimeProfile,
     type RuntimeAction,
     type RuntimeActionResult,
@@ -159,6 +160,25 @@
       if (prepared.result) {
         actionResult = prepared.result;
         await refresh();
+        return;
+      }
+      if (prepared.plan) {
+        trustedPlan = prepared.plan;
+        trustedPlanDialogOpen = true;
+      }
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  async function handleResourceUpdate(
+    profile: RuntimeProfile,
+    networkMode: "wsl" | "user_mode",
+  ) {
+    try {
+      const prepared = await prepareRuntimeResourceUpdate(profile.id, networkMode);
+      if (prepared.result) {
+        actionResult = prepared.result;
         return;
       }
       if (prepared.plan) {
@@ -636,6 +656,7 @@
                         loading={resourceLoading[profile.id] ?? false}
                         error={resourceErrors[profile.id] ?? null}
                         onrefresh={() => loadResources(profile)}
+                        onnetworkchange={(mode) => handleResourceUpdate(profile, mode)}
                       />
                     {/if}
                   </div>
