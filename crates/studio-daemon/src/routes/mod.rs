@@ -46,12 +46,16 @@ pub fn app(state: AppState) -> Router {
                 )),
         )
         .route(
-            "/v1/restore/prepare",
+            "/v1/restore/prepare/{plan_id}",
             post(backup::prepare_restore).layer(DefaultBodyLimit::max(
                 crate::backup::MAX_ARCHIVE_BYTES as usize,
             )),
         )
         .route("/v1/restore/shutdown", post(backup::begin_restore_shutdown))
+        .route(
+            "/v1/restore/audit/{outcome}",
+            post(backup::finalize_restore_audit),
+        )
         .route(
             "/v1/restore/availability",
             get(backup::restore_availability),
@@ -79,7 +83,14 @@ pub fn app(state: AppState) -> Router {
             "/v1/engines/{id}/capabilities",
             get(engines::engine_capabilities),
         )
-        .route("/v1/engines/{id}/prune", post(engines::prune_engine))
+        .route(
+            "/v1/engines/{id}/prune/preview",
+            post(engines::preview_prune),
+        )
+        .route(
+            "/v1/engines/prune/commit/{plan_id}",
+            post(engines::commit_prune),
+        )
         .route("/v1/runtime/status", get(runtime::runtime_status))
         .route("/v1/runtime/logs", get(runtime::runtime_logs))
         .route("/v1/runtime/profiles", get(runtime::list_runtime_profiles))
@@ -88,16 +99,32 @@ pub fn app(state: AppState) -> Router {
             post(runtime_transitions::preview_migration),
         )
         .route(
-            "/v1/runtime/migrations/execute",
-            post(runtime_transitions::execute_migration),
+            "/v1/runtime/migrations/commit/{plan_id}",
+            post(runtime_transitions::commit_migration),
         )
         .route(
-            "/v1/runtime/migrations/{id}/rollback",
-            post(runtime_transitions::rollback_migration),
+            "/v1/runtime/migrations/{id}/rollback/prepare",
+            post(runtime_transitions::prepare_migration_rollback),
+        )
+        .route(
+            "/v1/runtime/migrations/rollback/commit/{plan_id}",
+            post(runtime_transitions::commit_migration_rollback),
         )
         .route(
             "/v1/runtime/profiles/{id}/destructive-preview",
             post(runtime_transitions::preview_destructive_operation),
+        )
+        .route(
+            "/v1/runtime/destructive/commit/{plan_id}",
+            post(runtime_transitions::commit_destructive_operation),
+        )
+        .route(
+            "/v1/runtime/action-audit",
+            get(runtime_transitions::list_action_audit),
+        )
+        .route(
+            "/v1/runtime/action-audit/clear",
+            post(runtime_transitions::clear_action_audit),
         )
         .route(
             "/v1/runtime/uninstall-policy",

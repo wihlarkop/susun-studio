@@ -72,6 +72,10 @@ pub struct PreparedRestore {
 pub struct RestoreCoordinator {
     availability: Mutex<DaemonAvailability>,
     shutdown: Notify,
+    /// The opaque token of the currently prepared restore. Only a matching token
+    /// may trigger the restore shutdown, so `/restore/shutdown` is no longer an
+    /// unrelated bearer-only mutation.
+    armed_restore: Mutex<Option<String>>,
 }
 
 impl Default for RestoreCoordinator {
@@ -85,7 +89,30 @@ impl RestoreCoordinator {
         Self {
             availability: Mutex::new(DaemonAvailability::Ready),
             shutdown: Notify::new(),
+            armed_restore: Mutex::new(None),
         }
+    }
+
+    /// Arm the coordinator with a prepared restore's token. Shutdown will only
+    /// proceed for this exact token until another restore is prepared.
+    pub fn arm_restore(&self, token: &str) {
+        *self
+            .armed_restore
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(token.to_owned());
+    }
+
+    /// Whether `token` matches the currently armed prepared restore.
+    pub fn consume_armed_restore(&self, token: &str) -> bool {
+        let mut armed = self
+            .armed_restore
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if armed.as_deref() != Some(token) {
+            return false;
+        }
+        armed.take();
+        true
     }
 
     pub fn availability(&self) -> DaemonAvailability {
@@ -159,7 +186,12 @@ async fn prepare_inner(
 
     // Migrate + validate the staged copy through an independent handle, then
     // close it so no live handle remains on the file the supervisor will swap.
-    migrate_and_validate_staged(&staged_database_path).await?;
+    migrate_and_validate_staged(
+        &staged_database_path,
+        &restore_id,
+        preview.manifest.project_count,
+    )
+    .await?;
 
     // Automatic pre-restore backup of the *current* data, as a safety net.
     let pre_restore_backup_path = directory.join(format!("{PRE_RESTORE_PREFIX}{restore_id}.tar"));
@@ -180,7 +212,11 @@ async fn prepare_inner(
     })
 }
 
-async fn migrate_and_validate_staged(staged_path: &Path) -> Result<(), RestoreError> {
+async fn migrate_and_validate_staged(
+    staged_path: &Path,
+    restore_id: &str,
+    project_count: i64,
+) -> Result<(), RestoreError> {
     let staged = turso::Builder::new_local(staged_path.to_string_lossy().as_ref())
         .build()
         .await?;
@@ -207,6 +243,17 @@ async fn migrate_and_validate_staged(staged_path: &Path) -> Result<(), RestoreEr
     // and mark profiles as needing fresh detection, so the daemon re-probes and
     // re-adopts through the normal flow rather than inheriting trust from a file.
     sanitize_restored_ownership(&conn).await?;
+
+    // Persist the non-terminal handoff in the database that will become active.
+    // Finalization after restart is update-only, so an arbitrary token can never
+    // manufacture a restore audit row.
+    crate::action_audit::record_staged_restore(
+        &staged,
+        restore_id,
+        project_count,
+        crate::runtime::now_ms(),
+    )
+    .await?;
 
     // Drop the handle before returning so nothing keeps the staged file open.
     drop(conn);

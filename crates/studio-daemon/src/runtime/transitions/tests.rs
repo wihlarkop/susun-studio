@@ -1,6 +1,7 @@
 use turso::{Database, params};
 
 use super::*;
+use crate::action_plans::ActionPlanStore;
 use crate::db;
 use crate::runtime::{
     dimension,
@@ -8,6 +9,8 @@ use crate::runtime::{
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+const OWNER: &str = "owner-a";
 
 async fn fixture() -> TestResult<(Database, std::path::PathBuf, String, String)> {
     let path = std::env::temp_dir().join(format!(
@@ -59,33 +62,185 @@ fn observed(key: &str, name: &str) -> ObservedProfile {
     }
 }
 
+/// Insert a Studio-managed built-in runtime directly so destructive commit paths
+/// can be exercised without a live provider.
+async fn insert_built_in(db: &Database, id: &str) -> TestResult {
+    let conn = db.connect()?;
+    conn.execute(
+        "INSERT INTO runtime_profiles
+            (id, provider_id, provider_runtime_key, display_name, product, platform,
+             runtime_class, ownership_state, source, owner_token,
+             installation_state, process_state, connection_state,
+             availability_state, is_selected, observation_revision,
+             observed_at_ms, created_at_ms, updated_at_ms)
+         VALUES (?1, 'windows-podman', 'machine/built', 'Built', 'podman', 'windows',
+             'built_in', 'studio_managed', 'studio_setup', 'own_tok',
+             'installed', 'running', 'summarized',
+             'available', 0, 0, 1, 1, 1)",
+        params![id.to_owned()],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn audit_statuses(conn: &turso::Connection) -> TestResult<Vec<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT terminal_status FROM runtime_action_audit
+             ORDER BY started_at_ms DESC, id DESC",
+            (),
+        )
+        .await?;
+    let mut statuses = Vec::new();
+    while let Some(row) = rows.next().await? {
+        statuses.push(row.get(0)?);
+    }
+    Ok(statuses)
+}
+
 #[tokio::test]
-async fn migration_preview_and_execution_move_selected_bindings_only() -> TestResult {
+async fn migration_commit_moves_only_the_planned_bindings() -> TestResult {
     let (db, path, source, target) = fixture().await?;
+    let store = ActionPlanStore::default();
     let request = MigrationRequest {
         source_profile_id: source.clone(),
         target_profile_id: target.clone(),
         project_ids: vec!["p1".to_owned()],
     };
-    let preview = preview_migration(&db, &request).await?.ok_or("preview")?;
+    let preview = preview_migration(&db, &store, OWNER, &request)
+        .await?
+        .ok_or("preview")?;
     assert!(preview.can_migrate);
-    assert_eq!(preview.projects.len(), 1);
-    assert!(preview.rollback_available);
+    let plan_id = preview.plan_id.clone().ok_or("plan_id")?;
 
-    let result = execute_migration(&db, &request).await?.ok_or("result")?;
+    // Wrong owner cannot claim; the plan survives for the real owner.
+    assert!(
+        commit_migration(&db, &store, "owner-b", &plan_id)
+            .await
+            .is_err()
+    );
+
+    let Ok(result) = commit_migration(&db, &store, OWNER, &plan_id).await else {
+        return Err("commit rejected".into());
+    };
     assert_eq!(result.status, "completed");
     assert_eq!(result.project_count, 1);
+
+    // Replay of a consumed plan is rejected.
+    assert!(
+        commit_migration(&db, &store, OWNER, &plan_id)
+            .await
+            .is_err()
+    );
 
     let conn = db.connect()?;
     assert_eq!(binding(&conn, "p1").await?, target);
     assert_eq!(binding(&conn, "p2").await?, source);
     assert_eq!(migration_status(&conn).await?, "completed");
+    let audit = audit_statuses(&conn).await?;
+    assert_eq!(audit.first().map(String::as_str), Some("rejected"));
+    assert!(audit.iter().any(|status| status == "completed"));
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
 
-    let rollback = rollback_migration(&db, &result.migration_id)
+#[tokio::test]
+async fn migration_commit_rejects_stale_preview() -> TestResult {
+    let (db, path, source, target) = fixture().await?;
+    let store = ActionPlanStore::default();
+    let request = MigrationRequest {
+        source_profile_id: source.clone(),
+        target_profile_id: target.clone(),
+        project_ids: vec!["p1".to_owned()],
+    };
+    let preview = preview_migration(&db, &store, OWNER, &request)
         .await?
-        .ok_or("rollback")?;
+        .ok_or("preview")?;
+    let plan_id = preview.plan_id.clone().ok_or("plan_id")?;
+
+    // Change the inventory after preview: rebind p1 away from the source.
+    let conn = db.connect()?;
+    conn.execute(
+        "UPDATE projects SET runtime_profile_id = ?1 WHERE id = 'p1'",
+        params![target.clone()],
+    )
+    .await?;
+
+    // Commit must refuse the stale plan rather than mutate.
+    assert!(
+        commit_migration(&db, &store, OWNER, &plan_id)
+            .await
+            .is_err()
+    );
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn migration_commit_rejects_when_a_job_starts_after_preview() -> TestResult {
+    let (db, path, source, target) = fixture().await?;
+    let store = ActionPlanStore::default();
+    let request = MigrationRequest {
+        source_profile_id: source.clone(),
+        target_profile_id: target.clone(),
+        project_ids: vec!["p1".to_owned()],
+    };
+    let preview = preview_migration(&db, &store, OWNER, &request)
+        .await?
+        .ok_or("preview")?;
+    let plan_id = preview.plan_id.clone().ok_or("plan_id")?;
+
+    // A running job appears on the source runtime after preview.
+    let conn = db.connect()?;
+    conn.execute(
+        "INSERT INTO jobs (id, kind, status, project_id, engine_id, request_json,
+            created_at_ms, updated_at_ms, runtime_profile_id, runtime_class)
+         VALUES ('j1','up','running','p1','engine-docker-local','{}',1,1,?1,'built_in')",
+        params![source.clone()],
+    )
+    .await?;
+
+    assert!(
+        commit_migration(&db, &store, OWNER, &plan_id)
+            .await
+            .is_err()
+    );
+    // Binding stays on the source.
+    assert_eq!(binding(&conn, "p1").await?, source);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rollback_prepare_and_commit_restore_bindings() -> TestResult {
+    let (db, path, source, target) = fixture().await?;
+    let store = ActionPlanStore::default();
+    let request = MigrationRequest {
+        source_profile_id: source.clone(),
+        target_profile_id: target.clone(),
+        project_ids: vec!["p1".to_owned()],
+    };
+    let preview = preview_migration(&db, &store, OWNER, &request)
+        .await?
+        .ok_or("preview")?;
+    let plan_id = preview.plan_id.clone().ok_or("plan_id")?;
+    let Ok(result) = commit_migration(&db, &store, OWNER, &plan_id).await else {
+        return Err("commit rejected".into());
+    };
+
+    let rollback_preview = preview_migration_rollback(&db, &store, OWNER, &result.migration_id)
+        .await?
+        .ok_or("rollback preview")?;
+    assert!(rollback_preview.restorable);
+    let rollback_plan = rollback_preview.plan_id.clone().ok_or("rollback plan")?;
+
+    let Ok(rollback) = commit_migration_rollback(&db, &store, OWNER, &rollback_plan).await else {
+        return Err("rollback rejected".into());
+    };
     assert_eq!(rollback.status, "rolled_back");
     assert_eq!(rollback.restored_project_count, 1);
+
+    let conn = db.connect()?;
     assert_eq!(binding(&conn, "p1").await?, source);
     assert_eq!(migration_status(&conn).await?, "rolled_back");
     let _ = std::fs::remove_file(path);
@@ -93,28 +248,13 @@ async fn migration_preview_and_execution_move_selected_bindings_only() -> TestRe
 }
 
 #[tokio::test]
-async fn migration_rolls_back_every_binding_when_one_update_fails() -> TestResult {
-    let (db, path, source, target) = fixture().await?;
-    let request = MigrationRequest {
-        source_profile_id: source.clone(),
-        target_profile_id: target,
-        project_ids: vec!["p1".to_owned(), "p1".to_owned()],
-    };
-    let result = execute_migration(&db, &request).await?.ok_or("result")?;
-    assert_eq!(result.status, "failed");
-
-    let conn = db.connect()?;
-    assert_eq!(binding(&conn, "p1").await?, source);
-    assert_eq!(migration_status(&conn).await?, "failed");
-    let _ = std::fs::remove_file(path);
-    Ok(())
-}
-
-#[tokio::test]
 async fn destructive_preview_never_allows_external_runtime() -> TestResult {
     let (db, path, source, _) = fixture().await?;
+    let store = ActionPlanStore::default();
     let preview = preview_destructive_operation(
         &db,
+        &store,
+        OWNER,
         &source,
         &DestructivePreviewRequest {
             action: DestructiveAction::ResetEngineData,
@@ -124,7 +264,88 @@ async fn destructive_preview_never_allows_external_runtime() -> TestResult {
     .ok_or("preview")?;
     assert!(!preview.allowed);
     assert!(preview.blocker.is_some());
+    assert!(preview.plan_id.is_none());
     assert_eq!(preview.affected.last().and_then(|item| item.count), Some(2));
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn destructive_commit_gates_then_defers_to_phase_14b() -> TestResult {
+    let (db, path, _, _) = fixture().await?;
+    let store = ActionPlanStore::default();
+    insert_built_in(&db, "built-1").await?;
+
+    let preview = preview_destructive_operation(
+        &db,
+        &store,
+        OWNER,
+        "built-1",
+        &DestructivePreviewRequest {
+            action: DestructiveAction::ResetEngineData,
+        },
+    )
+    .await?
+    .ok_or("preview")?;
+    assert!(preview.allowed);
+    let plan_id = preview.plan_id.clone().ok_or("plan_id")?;
+
+    let Ok(result) = commit_destructive_operation(&db, &store, OWNER, &plan_id).await else {
+        return Err("commit rejected".into());
+    };
+    assert_eq!(result.status, "deferred_to_phase_14b");
+    assert!(result.revalidated);
+
+    // No engine mutation is claimed; audit records the deferral, not success.
+    let conn = db.connect()?;
+    assert_eq!(
+        audit_statuses(&conn).await?.first().map(String::as_str),
+        Some("deferred_to_phase_14b")
+    );
+
+    // The single-use plan is spent.
+    assert!(
+        commit_destructive_operation(&db, &store, OWNER, &plan_id)
+            .await
+            .is_err()
+    );
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn destructive_commit_rejects_when_ownership_changes() -> TestResult {
+    let (db, path, _, _) = fixture().await?;
+    let store = ActionPlanStore::default();
+    insert_built_in(&db, "built-1").await?;
+
+    let preview = preview_destructive_operation(
+        &db,
+        &store,
+        OWNER,
+        "built-1",
+        &DestructivePreviewRequest {
+            action: DestructiveAction::RemoveBuiltInRuntime,
+        },
+    )
+    .await?
+    .ok_or("preview")?;
+    let plan_id = preview.plan_id.clone().ok_or("plan_id")?;
+
+    // Ownership drops to a conflict after preview → stale fingerprint.
+    let conn = db.connect()?;
+    conn.execute(
+        "UPDATE runtime_profiles SET ownership_state = 'ownership_conflict', owner_token = NULL
+         WHERE id = 'built-1'",
+        (),
+    )
+    .await?;
+
+    assert!(
+        commit_destructive_operation(&db, &store, OWNER, &plan_id)
+            .await
+            .is_err()
+    );
     let _ = std::fs::remove_file(path);
     Ok(())
 }

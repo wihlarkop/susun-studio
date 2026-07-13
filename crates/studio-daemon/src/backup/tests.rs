@@ -5,12 +5,21 @@ use std::path::Path;
 
 use super::{
     BackupContentEntry, BackupManifest, BackupPlatform, BackupSummary, CURRENT_MANIFEST_MAJOR,
-    CURRENT_MANIFEST_MINOR, DATABASE_ENTRY, KIND, ManifestVersion, RestoreError, append_bytes,
-    create_backup_archive, safe_entry_name, sha256_hex, validate_restore_archive,
+    CURRENT_MANIFEST_MINOR, DATABASE_ENTRY, KIND, ManifestVersion, RestoreError, RestorePreview,
+    append_bytes, create_backup_archive, safe_entry_name, sha256_hex, validated_database,
 };
 use crate::db;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+/// Thin wrapper mirroring the previous public helper: validate an archive and
+/// return just the preview.
+fn validate_restore_archive(
+    archive: &[u8],
+    current_schema_version: i64,
+) -> Result<RestorePreview, RestoreError> {
+    validated_database(archive, current_schema_version).map(|(preview, _)| preview)
+}
 
 fn unique_db_path() -> std::path::PathBuf {
     std::env::temp_dir().join(format!(

@@ -1,3 +1,5 @@
+mod action_audit;
+mod action_plans;
 mod archive_safety;
 mod auth;
 mod backup;
@@ -82,6 +84,7 @@ async fn run() -> Result<(), DaemonError> {
         watch: Arc::new(watch::registry::WatchRegistry::new()),
         restore: restore.clone(),
         trusted_plans: Arc::new(runtime::trusted_plans::TrustedPlanStore::default()),
+        action_plans: Arc::new(action_plans::ActionPlanStore::default()),
     };
 
     let listener = TcpListener::bind(bind_addr)

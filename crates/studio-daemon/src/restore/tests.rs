@@ -73,6 +73,19 @@ async fn prepare_stages_migrated_copy_and_pre_restore_backup() -> TestResult {
         .ok_or_else(|| std::io::Error::other("expected a count row"))?;
     let count: i64 = row.get(0)?;
     assert_eq!(count, 1);
+    let mut audit_rows = conn
+        .query(
+            "SELECT terminal_status, correlation_token FROM runtime_action_audit
+             WHERE action_kind = 'metadata_restore'",
+            (),
+        )
+        .await?;
+    let audit = audit_rows
+        .next()
+        .await?
+        .ok_or_else(|| std::io::Error::other("expected staged restore audit"))?;
+    assert_eq!(audit.get::<String>(0)?, "staged");
+    assert_eq!(audit.get::<String>(1)?, prepared.restore_id);
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
@@ -167,6 +180,15 @@ async fn begin_restore_shutdown_flips_state_and_wakes_waiter() -> TestResult {
         DaemonAvailability::RestoreShutdownPending
     );
     Ok(())
+}
+
+#[test]
+fn prepared_restore_token_is_single_use() {
+    let coordinator = RestoreCoordinator::new();
+    coordinator.arm_restore("rst_expected");
+    assert!(!coordinator.consume_armed_restore("rst_other"));
+    assert!(coordinator.consume_armed_restore("rst_expected"));
+    assert!(!coordinator.consume_armed_restore("rst_expected"));
 }
 
 #[test]

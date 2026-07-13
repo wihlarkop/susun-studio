@@ -3,10 +3,11 @@
   import { Badge } from "$lib/components/ui/badge/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
   import {
-    executeRuntimeMigration,
+    commitRuntimeMigration,
+    commitRuntimeMigrationRollback,
     listProjects,
+    prepareRuntimeMigrationRollback,
     previewRuntimeMigration,
-    rollbackRuntimeMigration,
     type RuntimeMigrationPreview,
     type RuntimeMigrationRequest,
     type RuntimeMigrationResult,
@@ -87,11 +88,11 @@
   }
 
   async function migrate() {
-    if (!preview?.can_migrate) return;
+    if (!preview?.can_migrate || !preview.plan_id) return;
     busy = true;
     errorMessage = null;
     try {
-      result = await executeRuntimeMigration(request);
+      result = await commitRuntimeMigration(preview.plan_id);
       if (result.status === "completed") {
         preview = null;
         await loadProjects();
@@ -109,7 +110,16 @@
     busy = true;
     errorMessage = null;
     try {
-      rollbackResult = await rollbackRuntimeMigration(result.migration_id);
+      const rollbackPlan = await prepareRuntimeMigrationRollback(result.migration_id);
+      if (!rollbackPlan.restorable || !rollbackPlan.plan_id) {
+        rollbackResult = {
+          migration_id: result.migration_id,
+          status: "unavailable",
+          restored_project_count: 0,
+        };
+        return;
+      }
+      rollbackResult = await commitRuntimeMigrationRollback(rollbackPlan.plan_id);
       if (rollbackResult.status === "rolled_back") {
         await loadProjects();
         oncompleted?.();

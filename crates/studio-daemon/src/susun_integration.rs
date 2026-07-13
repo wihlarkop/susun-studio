@@ -250,6 +250,24 @@ pub async fn connect_engine(
     BollardEngine::connect_to(endpoint).map_err(|error| error.to_string())
 }
 
+/// Connect to one exact runtime profile. Unlike `connect_engine`, this never
+/// follows a later global selection change. `None` explicitly means the local
+/// platform default.
+pub async fn connect_engine_for_profile(
+    db: &Database,
+    profile_id: Option<&str>,
+) -> Result<BollardEngine, String> {
+    let endpoint = match profile_id {
+        Some(profile_id) => runtime::endpoint_for_profile(db, profile_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("runtime profile `{profile_id}` is unavailable"))?,
+        None => EngineEndpoint::Local,
+    };
+    runtime::validate_engine_endpoint(&endpoint).map_err(|error| error.to_string())?;
+    BollardEngine::connect_to(endpoint).map_err(|error| error.to_string())
+}
+
 /// Checks engine reachability by requesting its capabilities.
 pub async fn engine_health(engine: &BollardEngine) -> EngineHealthRow {
     match engine.capabilities().await {
@@ -636,6 +654,68 @@ pub struct PruneReportRow {
     pub space_reclaimed_bytes: u64,
 }
 
+/// A single resource scope in a non-destructive cleanup preview, flattened for
+/// Studio. Counts/bytes are engine-reported; `support`/`estimate_kind` say how
+/// much to trust them.
+pub struct CleanupScopeRow {
+    pub scope: String,
+    pub support: String,
+    pub candidate_count: Option<u64>,
+    pub reclaimable_bytes: Option<u64>,
+    pub estimate_kind: String,
+}
+
+/// Server-derived, non-destructive prune inventory. Produced by the engine, never
+/// by the frontend.
+pub struct CleanupPreviewRow {
+    pub scopes: Vec<CleanupScopeRow>,
+}
+
+/// Maps Studio scope strings to SDK scopes. Unknown strings are ignored.
+fn prune_scopes(scopes: &[String]) -> Vec<susun::PruneScope> {
+    scopes
+        .iter()
+        .filter_map(|scope| match scope.as_str() {
+            "containers" => Some(susun::PruneScope::Containers),
+            "networks" => Some(susun::PruneScope::Networks),
+            "volumes" => Some(susun::PruneScope::Volumes),
+            "images" => Some(susun::PruneScope::Images),
+            "build_cache" => Some(susun::PruneScope::BuildCache),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Collects a non-destructive cleanup preview (counts + reclaim estimate) for the
+/// requested scopes. Never prunes. Errors if the engine cannot provide it.
+pub async fn cleanup_preview(
+    engine: &BollardEngine,
+    scopes: &[String],
+    all_images: bool,
+) -> Result<CleanupPreviewRow, String> {
+    let request = susun::PruneRequest {
+        scopes: prune_scopes(scopes),
+        all_images,
+    };
+    let preview = engine
+        .cleanup_preview(request)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(CleanupPreviewRow {
+        scopes: preview
+            .scopes
+            .iter()
+            .map(|scope| CleanupScopeRow {
+                scope: enum_label(scope.scope),
+                support: enum_label(scope.support),
+                candidate_count: scope.candidate_count,
+                reclaimable_bytes: scope.reclaimable_bytes,
+                estimate_kind: enum_label(scope.estimate_kind),
+            })
+            .collect(),
+    })
+}
+
 /// Runs a system-wide prune. Unknown scope strings are silently ignored —
 /// the route validates the request shape; this only interprets it.
 pub async fn system_prune(
@@ -643,19 +723,11 @@ pub async fn system_prune(
     scopes: &[String],
     all_images: bool,
 ) -> Result<PruneReportRow, String> {
-    let scopes = scopes
-        .iter()
-        .filter_map(|scope| match scope.as_str() {
-            "containers" => Some(susun::PruneScope::Containers),
-            "networks" => Some(susun::PruneScope::Networks),
-            "volumes" => Some(susun::PruneScope::Volumes),
-            "images" => Some(susun::PruneScope::Images),
-            _ => None,
-        })
-        .collect();
-
     let report = engine
-        .prune(susun::PruneRequest { scopes, all_images })
+        .prune(susun::PruneRequest {
+            scopes: prune_scopes(scopes),
+            all_images,
+        })
         .await
         .map_err(|error| error.to_string())?;
 

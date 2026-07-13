@@ -224,14 +224,6 @@ pub async fn create_backup_archive(db: &Database, db_path: &Path) -> Result<Vec<
     Ok(build_archive(&manifest_bytes, &db_bytes)?)
 }
 
-/// Validate an archive and produce a preview, without touching active data.
-pub fn validate_restore_archive(
-    archive: &[u8],
-    current_schema_version: i64,
-) -> Result<RestorePreview, RestoreError> {
-    validated_database(archive, current_schema_version).map(|(preview, _)| preview)
-}
-
 /// Validate an archive and, on success, return both the preview and the raw
 /// database bytes it carries. The restore-apply prepare step uses this so the
 /// untrusted archive is parsed and checked exactly once before staging.
@@ -479,7 +471,7 @@ fn append_bytes(
     archive.append_data(&mut header, name, contents)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hasher
