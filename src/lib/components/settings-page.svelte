@@ -9,9 +9,14 @@
     LifeBuoy,
     RefreshCw,
     ShieldCheck,
+    Trash2,
   } from "@lucide/svelte";
   import { invoke, isTauri } from "@tauri-apps/api/core";
-  import { setDaemonConnection } from "$lib/daemon/client";
+  import {
+    readRuntimeUninstallPolicy,
+    setDaemonConnection,
+    type RuntimeUninstallPolicy,
+  } from "$lib/daemon/client";
   import { checkForUpdate, type UpdateCheckResult } from "$lib/tauri/updater";
 
   type UpdateUiState = "idle" | "checking" | "none" | "available" | "installing" | "failed";
@@ -78,8 +83,25 @@
   let restoreError = $state<string | null>(null);
   let applyState = $state<"idle" | "applying" | "restored" | "rolled_back" | "failed">("idle");
   let applyMessage = $state<string | null>(null);
+  let uninstallPolicy = $state<RuntimeUninstallPolicy | null>(null);
+  let uninstallPolicyError = $state<string | null>(null);
 
   const canUseDesktopFeatures = $derived(isTauri());
+
+  $effect(() => {
+    const controller = new AbortController();
+    void readRuntimeUninstallPolicy({ signal: controller.signal })
+      .then((policy) => {
+        uninstallPolicy = policy;
+        uninstallPolicyError = null;
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) {
+          uninstallPolicyError = error instanceof Error ? error.message : String(error);
+        }
+      });
+    return () => controller.abort();
+  });
 
   async function backUpStudioData() {
     backupState = "backing-up";
@@ -479,6 +501,51 @@
           </div>
         {/if}
       </div>
+    {/if}
+  </Card.Root>
+
+  <Card.Root class="gap-0 overflow-hidden p-0">
+    <div class="border-b bg-muted/20 p-4">
+      <div class="flex min-w-0 gap-3">
+        <div class="flex size-9 shrink-0 items-center justify-center rounded-md border bg-background">
+          <Trash2 class="size-4 text-muted-foreground" />
+        </div>
+        <div class="min-w-0">
+          <div class="flex flex-wrap items-center gap-2">
+            <h4 class="text-base font-semibold">Removal and data retention</h4>
+            <Badge variant="secondary">Preserve by default</Badge>
+          </div>
+          <p class="mt-1 max-w-2xl text-sm text-muted-foreground">
+            Back up Studio data before uninstalling. External runtimes are never changed by app removal.
+          </p>
+        </div>
+      </div>
+    </div>
+    {#if uninstallPolicy}
+      <div class="grid gap-2 p-4 sm:grid-cols-2">
+        {#each uninstallPolicy.choices as choice (choice.id)}
+          <div class="flex items-start justify-between gap-3 rounded-md border p-3">
+            <div>
+              <div class="text-sm font-medium">{choice.label}</div>
+              <div class="mt-1 text-xs text-muted-foreground">
+                {choice.id === "app_binaries_only"
+                  ? "Conservative unattended behavior"
+                  : "Requires an explicit user choice"}
+              </div>
+            </div>
+            <Badge variant={choice.selected_by_default ? "default" : "outline"}>
+              {choice.selected_by_default ? "Default" : "Optional"}
+            </Badge>
+          </div>
+        {/each}
+      </div>
+      <div class="border-t p-4 text-xs text-muted-foreground">
+        Preserved runtime metadata is revalidated after reinstall. A runtime name alone never restores ownership.
+      </div>
+    {:else if uninstallPolicyError}
+      <p class="p-4 text-sm text-destructive">{uninstallPolicyError}</p>
+    {:else}
+      <p class="p-4 text-sm text-muted-foreground">Loading retention policy...</p>
     {/if}
   </Card.Root>
 </div>

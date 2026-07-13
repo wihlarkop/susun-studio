@@ -7,6 +7,7 @@ mod observe;
 mod plans;
 mod projects;
 mod runtime;
+mod runtime_transitions;
 mod service_actions;
 mod settings;
 mod watch;
@@ -82,6 +83,26 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/runtime/status", get(runtime::runtime_status))
         .route("/v1/runtime/logs", get(runtime::runtime_logs))
         .route("/v1/runtime/profiles", get(runtime::list_runtime_profiles))
+        .route(
+            "/v1/runtime/migrations/preview",
+            post(runtime_transitions::preview_migration),
+        )
+        .route(
+            "/v1/runtime/migrations/execute",
+            post(runtime_transitions::execute_migration),
+        )
+        .route(
+            "/v1/runtime/migrations/{id}/rollback",
+            post(runtime_transitions::rollback_migration),
+        )
+        .route(
+            "/v1/runtime/profiles/{id}/destructive-preview",
+            post(runtime_transitions::preview_destructive_operation),
+        )
+        .route(
+            "/v1/runtime/uninstall-policy",
+            get(runtime_transitions::uninstall_policy),
+        )
         .route(
             "/v1/runtime/profiles/{id}/select",
             post(runtime::select_runtime_profile),

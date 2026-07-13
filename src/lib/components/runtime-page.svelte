@@ -3,6 +3,8 @@
   import * as Dialog from "$lib/components/ui/dialog/index.js";
   import { Badge } from "$lib/components/ui/badge/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
+  import RuntimeMigrationDialog from "$lib/components/runtime-migration-dialog.svelte";
+  import RuntimeDataScopeDialog from "$lib/components/runtime-data-scope-dialog.svelte";
   import {
     cancelRuntimePlan,
     executeRuntimePlan,
@@ -23,6 +25,7 @@
   } from "$lib/daemon/client";
   import {
     AlertCircle,
+    ArrowRightLeft,
     CheckCircle2,
     ChevronRight,
     HardDrive,
@@ -30,6 +33,7 @@
     RefreshCw,
     RotateCw,
     Server,
+    SlidersHorizontal,
     Square,
     TerminalSquare,
     Wrench,
@@ -48,6 +52,9 @@
   let trustedPlan = $state<TrustedRuntimePlan | null>(null);
   let trustedPlanDialogOpen = $state(false);
   let trustedPlanBusy = $state(false);
+  let migrationDialogOpen = $state(false);
+  let dataScopeDialogOpen = $state(false);
+  let dataScopeProfile = $state<RuntimeProfile | null>(null);
 
   const actionIcons = {
     install: Wrench,
@@ -306,6 +313,11 @@
   function showExistingRuntimes() {
     expandedProviders = new Set(providers.map((provider) => provider.provider_id));
   }
+
+  function reviewDataScope(profile: RuntimeProfile) {
+    dataScopeProfile = profile;
+    dataScopeDialogOpen = true;
+  }
 </script>
 
 <div class="flex flex-col gap-4">
@@ -320,6 +332,10 @@
     <Button size="sm" variant="outline" disabled={loading} onclick={() => refresh()}>
       <RefreshCw />
       {loading ? "Checking" : "Recheck"}
+    </Button>
+    <Button size="sm" variant="outline" onclick={() => (migrationDialogOpen = true)}>
+      <ArrowRightLeft />
+      Migrate projects
     </Button>
   </div>
 
@@ -574,6 +590,12 @@
                     {/if}
                   </div>
                   <div class="flex flex-wrap items-center gap-2 md:justify-end">
+                    {#if profile.runtime_class === "built_in"}
+                      <Button size="sm" variant="outline" onclick={() => reviewDataScope(profile)}>
+                        <SlidersHorizontal />
+                        Data scope
+                      </Button>
+                    {/if}
                     {#if profile.management.can_forget}
                       <Button
                         size="sm"
@@ -709,4 +731,11 @@
       </Dialog.Footer>
     </Dialog.Content>
   </Dialog.Root>
+
+  <RuntimeMigrationDialog
+    profiles={providers.flatMap((provider) => provider.profiles)}
+    bind:open={migrationDialogOpen}
+    oncompleted={() => refresh()}
+  />
+  <RuntimeDataScopeDialog profile={dataScopeProfile} bind:open={dataScopeDialogOpen} />
 </div>
