@@ -1,5 +1,6 @@
 mod command;
 mod endpoint_policy;
+mod package_source;
 mod provider;
 pub mod transitions;
 mod trusted_exec;
@@ -574,8 +575,17 @@ pub async fn prepare_trusted_action(
             "Runtime action is unavailable. Recheck provider state.",
         )));
     };
-    if let Err(error) = trusted_exec::verify_trusted_program(command.program) {
-        return Ok(Err(not_executed(action, &error.to_string())));
+    let target = match trusted_exec::verify_trusted_program(command.program) {
+        Ok(target) => target,
+        Err(error) => return Ok(Err(not_executed(action, &error.to_string()))),
+    };
+    if let Err(reason) = command.validate_policy() {
+        return Ok(Err(not_executed(action, reason)));
+    }
+    if let Some(provenance) = &command.software_provenance
+        && let Err(reason) = package_source::verify(&target.path, provenance).await
+    {
+        return Ok(Err(not_executed(action, reason)));
     }
     Ok(Ok(store.prepare(
         owner,
@@ -861,6 +871,14 @@ async fn resolve_trusted_action(
 async fn run_command(command: &ExecutableCommand) -> Result<String, CommandRunError> {
     let target = trusted_exec::verify_trusted_program(command.program)
         .map_err(|error| CommandRunError::Failed(error.to_string()))?;
+    command
+        .validate_policy()
+        .map_err(|reason| CommandRunError::Failed(reason.to_owned()))?;
+    if let Some(provenance) = &command.software_provenance {
+        package_source::verify(&target.path, provenance)
+            .await
+            .map_err(|reason| CommandRunError::Failed(reason.to_owned()))?;
+    }
     match command.elevation {
         ProcessElevation::CurrentUser => run_once(&target.path, command)
             .await

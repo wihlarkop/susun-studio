@@ -671,6 +671,24 @@
             <span class="font-medium">Verified operation</span>
             <span class="text-muted-foreground">{trustedPlan.command_summary}</span>
           </div>
+          {#if trustedPlan.software_provenance}
+            <dl class="grid grid-cols-[minmax(7rem,auto)_minmax(0,1fr)] gap-x-4 gap-y-1 border-y py-3 text-xs">
+              <dt class="text-muted-foreground">Package</dt>
+              <dd class="min-w-0 font-mono [overflow-wrap:anywhere]">
+                {trustedPlan.software_provenance.package_id}
+              </dd>
+              <dt class="text-muted-foreground">Source</dt>
+              <dd class="min-w-0 [overflow-wrap:anywhere]">
+                {trustedPlan.software_provenance.source} · {trustedPlan.software_provenance.source_url}
+              </dd>
+              <dt class="text-muted-foreground">Expected publisher</dt>
+              <dd>{trustedPlan.software_provenance.expected_publisher}</dd>
+              <dt class="text-muted-foreground">Version</dt>
+              <dd>{trustedPlan.software_provenance.version_intent}</dd>
+              <dt class="text-muted-foreground">Restart impact</dt>
+              <dd>{trustedPlan.software_provenance.restart_impact}</dd>
+            </dl>
+          {/if}
           <div class="flex flex-wrap gap-2">
             <Badge variant={trustedPlan.destructive ? "destructive" : "secondary"}>
               {trustedPlan.destructive ? "Destructive" : "Runtime mutation"}

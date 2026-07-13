@@ -3,7 +3,9 @@ use susun::EngineEndpoint;
 
 use super::{
     RuntimeProfile,
-    command::{CommandKind, ExecutableCommand, ProcessElevation, TrustedProgram},
+    command::{
+        CommandKind, ExecutableCommand, ProcessElevation, SoftwareProvenance, TrustedProgram,
+    },
     command_output, dimension, now_ms,
     provider::{
         EndpointSummary, ObservedProfile, PLACEHOLDER_KEY, RESERVED_BUILT_IN_MACHINE,
@@ -207,6 +209,9 @@ impl WindowsPodmanProvider {
                     "install".into(),
                     "--id".into(),
                     "RedHat.Podman".into(),
+                    "--exact".into(),
+                    "--source".into(),
+                    "winget".into(),
                     "--accept-package-agreements".into(),
                     "--accept-source-agreements".into(),
                     "--disable-interactivity".into(),
@@ -216,6 +221,15 @@ impl WindowsPodmanProvider {
                 timeout: Duration::from_secs(30 * 60),
                 kind: CommandKind::PackageManager,
                 elevation: ProcessElevation::OneShotOsMediated,
+                software_provenance: Some(SoftwareProvenance {
+                    package_id: "RedHat.Podman",
+                    source: "winget",
+                    source_url: "https://cdn.winget.microsoft.com/cache",
+                    source_identifier: "Microsoft.Winget.Source_8wekyb3d8bbwe",
+                    expected_publisher: "Red Hat, Inc.",
+                    version_intent: "Latest version published by the pinned source",
+                    restart_impact: "No automatic restart; runtime setup is required after install",
+                }),
                 success_message: "Podman install command finished.".to_owned(),
             }),
             "setup" => Some(ExecutableCommand {
@@ -230,6 +244,7 @@ impl WindowsPodmanProvider {
                 timeout: Duration::from_secs(10 * 60),
                 kind: CommandKind::RuntimeCli,
                 elevation: ProcessElevation::CurrentUser,
+                software_provenance: None,
                 success_message: "Susun Runtime created. Use Start to bring it online.".to_owned(),
             }),
             "start" | "stop" | "restart" => {
@@ -248,6 +263,7 @@ impl WindowsPodmanProvider {
                     timeout: Duration::from_secs(5 * 60),
                     kind: CommandKind::RuntimeCli,
                     elevation: ProcessElevation::CurrentUser,
+                    software_provenance: None,
                     success_message: format!("Podman machine {action} command finished."),
                 })
             }

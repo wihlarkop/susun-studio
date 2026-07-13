@@ -15,6 +15,21 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use serde::Serialize;
+
+/// Provider-owned software identity shown in a trusted package-manager preview.
+/// These values are compile-time policy, never frontend input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SoftwareProvenance {
+    pub package_id: &'static str,
+    pub source: &'static str,
+    pub source_url: &'static str,
+    pub source_identifier: &'static str,
+    pub expected_publisher: &'static str,
+    pub version_intent: &'static str,
+    pub restart_impact: &'static str,
+}
+
 /// The closed set of executables Studio's runtime providers may invoke.
 ///
 /// Providers name a program by identity, never by a free string and never via a
@@ -103,6 +118,21 @@ pub struct ExecutableCommand {
     #[allow(dead_code)]
     pub kind: CommandKind,
     pub elevation: ProcessElevation,
+    /// Required for package-manager commands and absent for lifecycle commands.
+    pub software_provenance: Option<SoftwareProvenance>,
     /// Human-readable message shown when the command finishes successfully.
     pub success_message: String,
+}
+
+impl ExecutableCommand {
+    pub fn validate_policy(&self) -> Result<(), &'static str> {
+        match (self.kind, self.software_provenance.is_some()) {
+            (CommandKind::PackageManager, false) => {
+                Err("package-manager action is missing trusted software provenance")
+            }
+            (CommandKind::PackageManager, true) => Ok(()),
+            (_, true) => Err("non-installer action cannot carry software provenance"),
+            (_, false) => Ok(()),
+        }
+    }
 }

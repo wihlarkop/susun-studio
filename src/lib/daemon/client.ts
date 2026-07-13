@@ -299,6 +299,15 @@ export type TrustedRuntimePlan = {
   consequence: string;
   elevation: "current_user" | "os_mediated_consent";
   command_summary: string;
+  software_provenance: {
+    package_id: string;
+    source: string;
+    source_url: string;
+    source_identifier: string;
+    expected_publisher: string;
+    version_intent: string;
+    restart_impact: string;
+  } | null;
   expires_in_seconds: number;
   state: "pending";
 };
