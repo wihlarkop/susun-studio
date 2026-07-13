@@ -53,6 +53,10 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/v1/restore/shutdown", post(backup::begin_restore_shutdown))
         .route(
+            "/v1/restore/audit/{outcome}",
+            post(backup::finalize_restore_audit),
+        )
+        .route(
             "/v1/restore/availability",
             get(backup::restore_availability),
         )

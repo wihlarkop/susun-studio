@@ -40,9 +40,18 @@ CREATE TABLE runtime_action_audit (
     -- Short redacted failure code (e.g. 'stale_preview', 'provider_unreachable').
     -- Never a raw error string, path, or secret.
     failure_code TEXT,
+    -- Opaque, daemon-minted token correlating a multi-step action across the
+    -- process boundary (e.g. a restore staged in one process and finalized in the
+    -- restored/rolled-back process). Never accepted as free-form content from the
+    -- frontend. Used to finalize a non-terminal 'staged' row.
+    correlation_token TEXT,
     started_at_ms INTEGER NOT NULL,
     completed_at_ms INTEGER
 );
+
+CREATE UNIQUE INDEX runtime_action_audit_correlation_idx
+    ON runtime_action_audit (correlation_token)
+    WHERE correlation_token IS NOT NULL;
 
 CREATE INDEX runtime_action_audit_started_idx
     ON runtime_action_audit (started_at_ms DESC);

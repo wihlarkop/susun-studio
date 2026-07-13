@@ -83,14 +83,19 @@ async fn insert_built_in(db: &Database, id: &str) -> TestResult {
     Ok(())
 }
 
-async fn audit_status(conn: &turso::Connection) -> TestResult<String> {
+async fn audit_statuses(conn: &turso::Connection) -> TestResult<Vec<String>> {
     let mut rows = conn
         .query(
-            "SELECT terminal_status FROM runtime_action_audit ORDER BY started_at_ms DESC, id DESC LIMIT 1",
+            "SELECT terminal_status FROM runtime_action_audit
+             ORDER BY started_at_ms DESC, id DESC",
             (),
         )
         .await?;
-    Ok(rows.next().await?.ok_or("audit")?.get(0)?)
+    let mut statuses = Vec::new();
+    while let Some(row) = rows.next().await? {
+        statuses.push(row.get(0)?);
+    }
+    Ok(statuses)
 }
 
 #[tokio::test]
@@ -132,7 +137,9 @@ async fn migration_commit_moves_only_the_planned_bindings() -> TestResult {
     assert_eq!(binding(&conn, "p1").await?, target);
     assert_eq!(binding(&conn, "p2").await?, source);
     assert_eq!(migration_status(&conn).await?, "completed");
-    assert_eq!(audit_status(&conn).await?, "completed");
+    let audit = audit_statuses(&conn).await?;
+    assert_eq!(audit.first().map(String::as_str), Some("rejected"));
+    assert!(audit.iter().any(|status| status == "completed"));
     let _ = std::fs::remove_file(path);
     Ok(())
 }
@@ -291,7 +298,10 @@ async fn destructive_commit_gates_then_defers_to_phase_14b() -> TestResult {
 
     // No engine mutation is claimed; audit records the deferral, not success.
     let conn = db.connect()?;
-    assert_eq!(audit_status(&conn).await?, "deferred_to_phase_14b");
+    assert_eq!(
+        audit_statuses(&conn).await?.first().map(String::as_str),
+        Some("deferred_to_phase_14b")
+    );
 
     // The single-use plan is spent.
     assert!(

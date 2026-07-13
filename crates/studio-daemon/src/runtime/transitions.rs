@@ -339,7 +339,7 @@ pub async fn commit_migration(
     owner: &str,
     plan_id: &str,
 ) -> Result<MigrationResult, CommitRejected> {
-    let claimed = match store.claim(plan_id, owner, Some(ActionKind::MigrationCommit)) {
+    let claimed = match store.claim(plan_id, owner, &[ActionKind::MigrationCommit]) {
         Ok(claimed) => claimed,
         Err(error) => {
             let code = error.audit_code();
@@ -352,6 +352,7 @@ pub async fn commit_migration(
         }
     };
     let ActionPlanPayload::MigrationCommit(plan) = claimed.payload else {
+        store.finish(&claimed.plan_id, crate::action_plans::PlanState::Failed);
         return Err(CommitRejected::new(
             "Plan payload did not match a migration commit.",
             "rejected_plan",
@@ -455,6 +456,7 @@ pub async fn commit_migration(
                         count: plan.project_ids.len() as i64,
                     }],
                     failure_code: None,
+                    correlation_token: None,
                     started_at_ms: started,
                     completed_at_ms: Some(now_ms()),
                 },
@@ -492,6 +494,7 @@ pub async fn commit_migration(
                     terminal_status: action_audit::STATUS_FAILED.to_owned(),
                     affected: Vec::new(),
                     failure_code: Some("binding_race".to_owned()),
+                    correlation_token: None,
                     started_at_ms: started,
                     completed_at_ms: Some(now_ms()),
                 },
@@ -604,7 +607,7 @@ pub async fn commit_migration_rollback(
     owner: &str,
     plan_id: &str,
 ) -> Result<MigrationRollbackResult, CommitRejected> {
-    let claimed = match store.claim(plan_id, owner, Some(ActionKind::MigrationRollback)) {
+    let claimed = match store.claim(plan_id, owner, &[ActionKind::MigrationRollback]) {
         Ok(claimed) => claimed,
         Err(error) => {
             let code = error.audit_code();
@@ -617,6 +620,7 @@ pub async fn commit_migration_rollback(
         }
     };
     let ActionPlanPayload::MigrationRollback(plan) = claimed.payload else {
+        store.finish(&claimed.plan_id, crate::action_plans::PlanState::Failed);
         return Err(CommitRejected::new(
             "Plan payload did not match a rollback.",
             "rejected_plan",
@@ -701,6 +705,7 @@ pub async fn commit_migration_rollback(
                         count: project_ids.len() as i64,
                     }],
                     failure_code: None,
+                    correlation_token: None,
                     started_at_ms: started,
                     completed_at_ms: Some(now_ms()),
                 },
@@ -891,7 +896,15 @@ pub async fn commit_destructive_operation(
 ) -> Result<DestructiveCommitResult, CommitRejected> {
     // Destructive plans have three action kinds; claim without a single expected
     // kind, then confirm the domain.
-    let claimed = match store.claim(plan_id, owner, None) {
+    let claimed = match store.claim(
+        plan_id,
+        owner,
+        &[
+            ActionKind::DestructiveRepair,
+            ActionKind::DestructiveResetEngineData,
+            ActionKind::DestructiveRemoveBuiltInRuntime,
+        ],
+    ) {
         Ok(claimed) => claimed,
         Err(error) => {
             let code = error.audit_code();
@@ -904,6 +917,7 @@ pub async fn commit_destructive_operation(
         }
     };
     let ActionPlanPayload::Destructive(plan) = claimed.payload else {
+        store.finish(&claimed.plan_id, crate::action_plans::PlanState::Failed);
         return Err(CommitRejected::new(
             "Plan payload did not match a destructive action.",
             "rejected_plan",
@@ -911,6 +925,7 @@ pub async fn commit_destructive_operation(
         ));
     };
     let Some(action) = DestructiveAction::parse(&plan.action) else {
+        store.finish(&claimed.plan_id, crate::action_plans::PlanState::Failed);
         return Err(CommitRejected::new(
             "Unknown destructive action.",
             "rejected_plan",
@@ -1022,6 +1037,7 @@ pub async fn commit_destructive_operation(
                 count: project_count.max(0),
             }],
             failure_code: None,
+            correlation_token: None,
             started_at_ms: started,
             completed_at_ms: Some(now_ms()),
         },
@@ -1139,6 +1155,7 @@ async fn fail_commit(
             terminal_status: action_audit::STATUS_REJECTED.to_owned(),
             affected: Vec::new(),
             failure_code: Some(audit_code.to_owned()),
+            correlation_token: None,
             started_at_ms: started,
             completed_at_ms: Some(now_ms()),
         },

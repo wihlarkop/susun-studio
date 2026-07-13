@@ -885,14 +885,31 @@ export type PruneReport = {
   space_reclaimed_bytes: number;
 };
 
+export type PruneScopeInventory = {
+  scope: string;
+  support: string;
+  candidate_count: number | null;
+  reclaimable_bytes: number | null;
+  estimate_kind: string;
+};
+
 export type PrunePreview = {
   engine_id: string;
   scopes: PruneScope[];
   all_images: boolean;
   /** Prune is engine-wide: resources from other tools/projects may be removed. */
   affects_shared_engine: boolean;
-  plan_id: string;
-  expires_in_seconds: number;
+  /** Server-derived per-scope inventory (counts/reclaim/support). */
+  inventory: PruneScopeInventory[];
+  /** False when the engine can't provide a reliable inventory; commit disabled. */
+  inventory_supported: boolean;
+  estimated_reclaim_bytes: number | null;
+  active_jobs: number;
+  active_watch_sessions: number;
+  /** Whether a commit plan was minted (inventory available, no active work). */
+  commit_enabled: boolean;
+  plan_id: string | null;
+  expires_in_seconds: number | null;
 };
 
 export async function previewEnginePrune(
@@ -1180,6 +1197,20 @@ export type DiagnosticsReport = {
   project_count: number;
   recent_job_errors: DiagnosticsJobError[];
   engines: DiagnosticsEngineStatus[];
+  recent_action_audit: Array<{
+    action_kind: string;
+    domain: string;
+    runtime_class: string | null;
+    ownership_result: string;
+    command_kind: string | null;
+    elevation_mode: string | null;
+    terminal_status: string;
+    affected: Array<{ category: string; count: number }>;
+    app_version: string;
+    failure_code: string | null;
+    started_at_ms: number;
+    completed_at_ms: number | null;
+  }>;
 };
 
 export async function readDiagnostics(

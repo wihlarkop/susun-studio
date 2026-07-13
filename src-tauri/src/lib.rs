@@ -88,8 +88,9 @@ async fn preview_restore_studio_data(
 async fn apply_restore_studio_data(
     app: tauri::AppHandle,
     archive_path: String,
+    plan_id: String,
 ) -> Result<restore::RestoreOutcome, String> {
-    restore::apply_restore(&app, &archive_path)
+    restore::apply_restore(&app, &archive_path, &plan_id)
         .await
         .map_err(|error| {
             error!("event=apply_restore_studio_data_command_failed error={error}");

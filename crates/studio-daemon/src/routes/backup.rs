@@ -8,7 +8,7 @@ use axum::{
 use serde::Serialize;
 
 use crate::{
-    action_audit::{self, AffectedCount, AuditEntry},
+    action_audit::{self, AffectedCount},
     action_plans::{ActionKind, ActionPlanPayload, MetadataRestorePlan},
     auth::authorize,
     backup, db,
@@ -116,9 +116,12 @@ pub async fn prepare_restore(
 
     let claimed = state
         .action_plans
-        .claim(&plan_id, &owner, Some(ActionKind::MetadataRestore))
+        .claim(&plan_id, &owner, &[ActionKind::MetadataRestore])
         .map_err(|error| ApiError::ActionUnavailable(error.to_string()))?;
     let ActionPlanPayload::MetadataRestore(plan) = claimed.payload else {
+        state
+            .action_plans
+            .finish(&claimed.plan_id, crate::action_plans::PlanState::Failed);
         return Err(ApiError::ActionUnavailable(
             "Plan did not match a metadata restore.".to_owned(),
         ));
@@ -171,26 +174,20 @@ pub async fn prepare_restore(
     state
         .action_plans
         .finish(&claimed.plan_id, crate::action_plans::PlanState::Succeeded);
-    let _ = action_audit::record(
+
+    // The restore is only *staged*, not applied: the supervisor may still fail
+    // and roll back, and a successful swap replaces this database entirely. Record
+    // a NON-terminal `staged` row keyed by the restore id, and arm the coordinator
+    // so only this restore's token can trigger shutdown. The terminal outcome is
+    // recorded later by the finalize endpoint, after the swap/restart is known.
+    let _ = action_audit::record_staged_restore(
         &state.db,
-        AuditEntry {
-            kind: ActionKind::MetadataRestore,
-            profile_id: None,
-            runtime_class: None,
-            ownership_result: "authorized".to_owned(),
-            command_kind: Some("metadata_restore_staged".to_owned()),
-            elevation_mode: Some("none".to_owned()),
-            terminal_status: action_audit::STATUS_COMPLETED.to_owned(),
-            affected: vec![AffectedCount {
-                category: "restored_projects".to_owned(),
-                count: plan.manifest.project_count,
-            }],
-            failure_code: None,
-            started_at_ms: started,
-            completed_at_ms: Some(crate::runtime::now_ms()),
-        },
+        &prepared.restore_id,
+        plan.manifest.project_count,
+        started,
     )
     .await;
+    state.restore.arm_restore(&prepared.restore_id);
 
     logging::warn(
         "restore_prepare_finished",
@@ -200,15 +197,85 @@ pub async fn prepare_restore(
 }
 
 /// Enters the shutdown-pending state and triggers graceful shutdown so the
-/// supervisor can swap the database file with no live handle held here.
+/// supervisor can swap the database file with no live handle held here. Bound to
+/// the prepared restore: only the token minted by `prepare` may trigger it.
 pub async fn begin_restore_shutdown(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize(&state, &headers)?;
+    let token = restore_token(&headers)?;
+    if !state.restore.consume_armed_restore(&token) {
+        logging::warn(
+            "restore_shutdown_rejected",
+            &[("reason", "unarmed_or_wrong_token".to_owned())],
+        );
+        return Err(ApiError::ActionUnavailable(
+            "No prepared restore matches this shutdown request.".to_owned(),
+        ));
+    }
     logging::warn("restore_shutdown_requested", &[]);
     state.restore.begin_restore_shutdown();
     Ok(Json(serde_json::json!({ "status": "shutting_down" })))
+}
+
+/// Finalize a staged restore's audit row after the process-boundary swap. The
+/// supervisor calls this with the opaque restore token and a fixed outcome; the
+/// daemon derives affected counts from its own live database and never accepts
+/// audit content from the caller. On success this runs on the restored database;
+/// on rollback it runs on the preserved database. Both contain the staged
+/// handoff row, so finalization is update-only.
+pub async fn finalize_restore_audit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(outcome): Path<String>,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let token = restore_token(&headers)?;
+    if !body.is_empty() {
+        return Err(ApiError::TrustedPlanContentRejected);
+    }
+    let Some(outcome) = action_audit::RestoreFinalOutcome::parse(&outcome) else {
+        return Err(ApiError::ActionUnavailable(
+            "Unknown restore outcome.".to_owned(),
+        ));
+    };
+    let affected = restored_project_affected(&state).await;
+    if !action_audit::finalize_restore(&state.db, &token, outcome, affected).await? {
+        return Err(ApiError::ActionUnavailable(
+            "No staged restore matches this audit finalization.".to_owned(),
+        ));
+    }
+    logging::warn("restore_audit_finalized", &[]);
+    Ok(Json(serde_json::json!({ "finalized": true })))
+}
+
+fn restore_token(headers: &HeaderMap) -> Result<String, ApiError> {
+    headers
+        .get("x-susun-restore-token")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| ApiError::ActionUnavailable("Missing restore handoff token.".to_owned()))
+}
+
+/// Derive the restored project count from the daemon's own live database.
+async fn restored_project_affected(state: &AppState) -> Vec<AffectedCount> {
+    let count = async {
+        let conn = state.db.connect().ok()?;
+        let mut rows = conn.query("SELECT COUNT(*) FROM projects", ()).await.ok()?;
+        rows.next()
+            .await
+            .ok()?
+            .and_then(|row| row.get::<i64>(0).ok())
+    }
+    .await
+    .unwrap_or(0);
+    vec![AffectedCount {
+        category: "restored_projects".to_owned(),
+        count,
+    }]
 }
 
 /// Reports daemon availability so the supervisor/UI can block while a restore

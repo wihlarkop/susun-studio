@@ -39,6 +39,10 @@
     };
     replacement_scope: string[];
     reenter_after_restore: string[];
+    /** Opaque, single-use plan bound to this archive's validated identity. The
+     *  apply step must use exactly this plan so a changed archive is rejected. */
+    plan_id: string;
+    expires_in_seconds: number;
   };
 
   type RestorePreviewOutcome =
@@ -138,12 +142,15 @@
   }
 
   async function applyRestore() {
-    if (!restoreArchivePath || !restorePreview?.compatible) return;
+    if (!restoreArchivePath || !restorePreview?.compatible || !restorePreview.plan_id) return;
     applyState = "applying";
     applyMessage = null;
     try {
       const outcome = await invoke<RestoreOutcome>("apply_restore_studio_data", {
         archivePath: restoreArchivePath,
+        // Carry the plan from the visible preview so the daemon can reject an
+        // archive that changed after the user confirmed it.
+        planId: restorePreview.plan_id,
       });
       // The daemon restarted on a new port/token — re-point the client at it.
       setDaemonConnection({

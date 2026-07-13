@@ -411,7 +411,7 @@ pub async fn engine_endpoint_for(
     })
 }
 
-async fn endpoint_for_profile(
+pub(crate) async fn endpoint_for_profile(
     db: &Database,
     profile_id: &str,
 ) -> Result<Option<EngineEndpoint>, turso::Error> {

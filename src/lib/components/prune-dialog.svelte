@@ -5,6 +5,7 @@
   import {
     commitEnginePrune,
     previewEnginePrune,
+    type PrunePreview,
     type PruneReport,
     type PruneScope,
   } from "$lib/daemon/client";
@@ -23,8 +24,10 @@
   let includeAllImages = $state(false);
   let includeVolumes = $state(false);
   let confirmText = $state("");
+  let previewing = $state(false);
   let pruning = $state(false);
   let errorMessage = $state<string | null>(null);
+  let preview = $state<PrunePreview | null>(null);
   let report = $state<PruneReport | null>(null);
 
   const scopes = $derived.by(() => {
@@ -36,22 +39,48 @@
     return selected;
   });
 
-  async function confirmPrune() {
-    pruning = true;
+  async function buildPreview() {
+    previewing = true;
     errorMessage = null;
     report = null;
+    preview = null;
     try {
-      // Two-step: the server mints a single-use plan for this policy, then the
-      // engine derives and removes the exact resources at commit.
-      const plan = await previewEnginePrune(engineId, scopes, includeImages && includeAllImages);
-      report = await commitEnginePrune(plan.plan_id);
+      // The server derives a non-destructive inventory and, when safe, mints a
+      // single-use commit plan bound to the engine identity and that inventory.
+      preview = await previewEnginePrune(engineId, scopes, includeImages && includeAllImages);
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+    } finally {
+      previewing = false;
+    }
+  }
+
+  async function confirmPrune() {
+    if (!preview?.commit_enabled || !preview.plan_id) return;
+    pruning = true;
+    errorMessage = null;
+    try {
+      report = await commitEnginePrune(preview.plan_id);
       confirmText = "";
+      preview = null;
     } catch (error) {
       errorMessage = error instanceof Error ? error.message : String(error);
     } finally {
       pruning = false;
     }
   }
+
+  function formatBytesMaybe(value: number | null): string {
+    return value === null ? "unknown" : formatBytes(value);
+  }
+
+  // A preview is bound to a specific policy; drop it when the policy changes so a
+  // stale plan is never committed.
+  $effect(() => {
+    void scopes;
+    void includeAllImages;
+    preview = null;
+  });
 
   function totalRemoved(value: PruneReport): number {
     return (
@@ -118,6 +147,39 @@
       <p class="text-destructive text-sm">{errorMessage}</p>
     {/if}
 
+    {#if preview}
+      <div class="grid gap-2 rounded-md border p-3 text-sm">
+        {#if preview.active_jobs > 0 || preview.active_watch_sessions > 0}
+          <p class="text-destructive">
+            {preview.active_jobs} running job(s) and {preview.active_watch_sessions} watch session(s).
+            Stop them before pruning.
+          </p>
+        {/if}
+        {#if !preview.inventory_supported}
+          <p class="text-muted-foreground">
+            This engine can't report a prune inventory, so prune is disabled here.
+          </p>
+        {:else}
+          <div class="grid gap-1">
+            {#each preview.inventory as item (item.scope)}
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <span>{item.scope.replaceAll("_", " ")}</span>
+                <span class="text-muted-foreground">
+                  {item.candidate_count ?? "?"} candidate(s) · {formatBytesMaybe(
+                    item.reclaimable_bytes,
+                  )}
+                  {item.estimate_kind === "exact" ? "" : `(${item.estimate_kind.replaceAll("_", " ")})`}
+                </span>
+              </div>
+            {/each}
+          </div>
+          <p class="text-muted-foreground">
+            Estimated reclaim: {formatBytesMaybe(preview.estimated_reclaim_bytes)}.
+          </p>
+        {/if}
+      </div>
+    {/if}
+
     {#if report}
       <div class="bg-muted/40 rounded-md border p-2 text-sm">
         <p>Removed {totalRemoved(report)} resources.</p>
@@ -131,8 +193,16 @@
       <Button type="button" variant="outline" onclick={() => (open = false)}>Close</Button>
       <Button
         type="button"
+        variant="outline"
+        disabled={previewing || scopes.length === 0}
+        onclick={buildPreview}
+      >
+        {previewing ? "Checking…" : "Preview"}
+      </Button>
+      <Button
+        type="button"
         variant="destructive"
-        disabled={pruning || scopes.length === 0 || confirmText !== "prune"}
+        disabled={pruning || !preview?.commit_enabled || confirmText !== "prune"}
         onclick={confirmPrune}
       >
         {pruning ? "Pruning…" : "Prune"}

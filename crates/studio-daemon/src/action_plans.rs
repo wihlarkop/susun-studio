@@ -111,10 +111,22 @@ pub struct DestructivePlan {
 #[derive(Debug, Clone)]
 pub struct EnginePrunePlan {
     pub engine_id: String,
+    /// Exact runtime profile selected at preview. `None` means the platform
+    /// default was selected because no profile existed.
+    pub runtime_profile_id: Option<String>,
     /// Prune *policy* (which resource classes) — never a resource target list.
     /// The server derives the exact resources to remove at commit.
     pub scopes: Vec<String>,
     pub all_images: bool,
+    /// Fingerprint of the engine identity the preview ran against: selected
+    /// runtime profile id/class/endpoint/state/observation revision + engine API
+    /// version. Recomputed at commit; a mismatch means selection/endpoint/provider
+    /// state changed and the plan must be rejected (no silent default fallback).
+    pub identity_fingerprint: String,
+    /// Fingerprint of the server-derived cleanup inventory (per-scope support,
+    /// candidate counts, reclaimable bytes). Recomputed at commit to reject stale
+    /// inventory.
+    pub inventory_fingerprint: String,
 }
 
 #[derive(Debug, Clone)]
@@ -230,14 +242,19 @@ impl ActionPlanStore {
         }
     }
 
-    /// Consume a plan exactly once. Enforces owner binding, expiry, single-use,
-    /// and (when `expected` is set) that the plan is for the action the caller
-    /// believes it is committing.
+    /// Consume a plan exactly once, but only if its action is one of `allowed`.
+    ///
+    /// This is the atomic domain gate: owner binding, expiry, single-use, and the
+    /// allowed-kind check all happen under one lock, and a **kind mismatch never
+    /// consumes the plan** — it stays `Pending` for its rightful commit endpoint.
+    /// A commit endpoint must pass exactly the kinds it is allowed to execute, so
+    /// a prune/restore/migration plan can never be spent through the destructive
+    /// endpoint (or vice-versa).
     pub fn claim(
         &self,
         plan_id: &str,
         owner: &str,
-        expected: Option<ActionKind>,
+        allowed: &[ActionKind],
     ) -> Result<ClaimedActionPlan, ActionPlanError> {
         let mut plans = self.plans.lock().unwrap_or_else(|error| error.into_inner());
         let plan = plans.get_mut(plan_id).ok_or(ActionPlanError::NotFound)?;
@@ -251,9 +268,8 @@ impl ActionPlanStore {
         if !matches!(plan.state, PlanState::Pending) {
             return Err(ActionPlanError::AlreadyConsumed);
         }
-        if let Some(expected) = expected
-            && plan.kind != expected
-        {
+        // Reject before consuming: an unrelated plan is left untouched.
+        if !allowed.contains(&plan.kind) {
             return Err(ActionPlanError::KindMismatch);
         }
         plan.state = PlanState::Running;
@@ -304,6 +320,8 @@ mod tests {
         store.prepare("owner-a", ActionKind::MigrationCommit, payload())
     }
 
+    const MIGRATION: &[ActionKind] = &[ActionKind::MigrationCommit];
+
     #[test]
     fn concurrent_claim_allows_exactly_one_runner() {
         let store = Arc::new(ActionPlanStore::default());
@@ -312,7 +330,7 @@ mod tests {
             .map(|_| {
                 let store = Arc::clone(&store);
                 let id = ticket.plan_id.clone();
-                thread::spawn(move || store.claim(&id, "owner-a", None).is_ok())
+                thread::spawn(move || store.claim(&id, "owner-a", MIGRATION).is_ok())
             })
             .collect::<Vec<_>>();
         let winners = handles
@@ -328,12 +346,12 @@ mod tests {
         let store = ActionPlanStore::default();
         let ticket = prepare(&store);
         assert_eq!(
-            store.claim(&ticket.plan_id, "owner-b", None).err(),
+            store.claim(&ticket.plan_id, "owner-b", MIGRATION).err(),
             Some(ActionPlanError::WrongOwner)
         );
-        assert!(store.claim(&ticket.plan_id, "owner-a", None).is_ok());
+        assert!(store.claim(&ticket.plan_id, "owner-a", MIGRATION).is_ok());
         assert_eq!(
-            store.claim(&ticket.plan_id, "owner-a", None).err(),
+            store.claim(&ticket.plan_id, "owner-a", MIGRATION).err(),
             Some(ActionPlanError::AlreadyConsumed)
         );
     }
@@ -343,26 +361,39 @@ mod tests {
         let store = ActionPlanStore::with_ttl(Duration::ZERO);
         let ticket = prepare(&store);
         assert_eq!(
-            store.claim(&ticket.plan_id, "owner-a", None).err(),
+            store.claim(&ticket.plan_id, "owner-a", MIGRATION).err(),
             Some(ActionPlanError::Expired)
         );
         // A fresh store models a daemon restart: the old ID no longer exists.
         let restarted = ActionPlanStore::default();
         assert_eq!(
-            restarted.claim(&ticket.plan_id, "owner-a", None).err(),
+            restarted.claim(&ticket.plan_id, "owner-a", MIGRATION).err(),
             Some(ActionPlanError::NotFound)
         );
     }
 
     #[test]
-    fn kind_mismatch_is_rejected() {
+    fn cross_domain_claim_is_rejected_without_consuming_the_plan() {
         let store = ActionPlanStore::default();
-        let ticket = prepare(&store);
-        assert_eq!(
-            store
-                .claim(&ticket.plan_id, "owner-a", Some(ActionKind::EnginePrune))
-                .err(),
-            Some(ActionPlanError::KindMismatch)
-        );
+        let ticket = prepare(&store); // a MigrationCommit plan
+
+        // Attempt to spend it through the destructive/prune/restore domains.
+        for wrong in [
+            &[ActionKind::EnginePrune][..],
+            &[ActionKind::MetadataRestore][..],
+            &[
+                ActionKind::DestructiveRepair,
+                ActionKind::DestructiveResetEngineData,
+                ActionKind::DestructiveRemoveBuiltInRuntime,
+            ][..],
+        ] {
+            assert_eq!(
+                store.claim(&ticket.plan_id, "owner-a", wrong).err(),
+                Some(ActionPlanError::KindMismatch)
+            );
+        }
+
+        // The plan was never consumed: its rightful domain can still claim it.
+        assert!(store.claim(&ticket.plan_id, "owner-a", MIGRATION).is_ok());
     }
 }

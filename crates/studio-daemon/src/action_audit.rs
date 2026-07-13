@@ -36,6 +36,9 @@ pub const STATUS_COMPLETED: &str = "completed";
 pub const STATUS_FAILED: &str = "failed";
 pub const STATUS_REJECTED: &str = "rejected";
 pub const STATUS_DEFERRED_14B: &str = "deferred_to_phase_14b";
+/// Non-terminal: a restore has been staged but not yet swapped/restarted.
+pub const STATUS_STAGED: &str = "staged";
+pub const STATUS_ROLLED_BACK: &str = "rolled_back";
 
 /// The safe, redacted description of one destructive action attempt.
 pub struct AuditEntry {
@@ -54,6 +57,8 @@ pub struct AuditEntry {
     pub affected: Vec<AffectedCount>,
     /// Short redacted failure code, never a raw error string.
     pub failure_code: Option<String>,
+    /// Opaque correlation token for a multi-step action (see the column doc).
+    pub correlation_token: Option<String>,
     pub started_at_ms: i64,
     pub completed_at_ms: Option<i64>,
 }
@@ -87,8 +92,8 @@ pub async fn record(db: &Database, entry: AuditEntry) -> Result<String, turso::E
         "INSERT INTO runtime_action_audit (
             id, action_kind, domain, profile_id, runtime_class, ownership_result,
             command_kind, elevation_mode, terminal_status, affected_counts_json,
-            app_version, failure_code, started_at_ms, completed_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            app_version, failure_code, correlation_token, started_at_ms, completed_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             id.clone(),
             entry.kind.as_str().to_owned(),
@@ -102,6 +107,7 @@ pub async fn record(db: &Database, entry: AuditEntry) -> Result<String, turso::E
             affected_json,
             env!("CARGO_PKG_VERSION").to_owned(),
             entry.failure_code.as_deref().map(sanitize_code),
+            entry.correlation_token.as_deref().map(sanitize_code),
             entry.started_at_ms,
             entry.completed_at_ms,
         ],
@@ -144,11 +150,100 @@ pub async fn record_rejection(
             terminal_status: STATUS_REJECTED.to_owned(),
             affected: Vec::new(),
             failure_code: Some(failure_code.to_owned()),
+            correlation_token: None,
             started_at_ms: now,
             completed_at_ms: Some(now),
         },
     )
     .await
+}
+
+pub async fn record_staged_restore(
+    db: &Database,
+    token: &str,
+    project_count: i64,
+    started_at_ms: i64,
+) -> Result<String, turso::Error> {
+    record(
+        db,
+        AuditEntry {
+            kind: ActionKind::MetadataRestore,
+            profile_id: None,
+            runtime_class: None,
+            ownership_result: "authorized".to_owned(),
+            command_kind: Some("metadata_restore_staged".to_owned()),
+            elevation_mode: Some("none".to_owned()),
+            terminal_status: STATUS_STAGED.to_owned(),
+            affected: vec![AffectedCount {
+                category: "restored_projects".to_owned(),
+                count: project_count.max(0),
+            }],
+            failure_code: None,
+            correlation_token: Some(token.to_owned()),
+            started_at_ms,
+            completed_at_ms: None,
+        },
+    )
+    .await
+}
+
+/// The terminal outcome a restore correlation token can be finalized to.
+#[derive(Debug, Clone, Copy)]
+pub enum RestoreFinalOutcome {
+    Completed,
+    RolledBack,
+    Failed,
+}
+
+impl RestoreFinalOutcome {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "completed" => Some(Self::Completed),
+            "rolled_back" => Some(Self::RolledBack),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
+    fn status(self) -> &'static str {
+        match self {
+            Self::Completed => STATUS_COMPLETED,
+            Self::RolledBack => STATUS_ROLLED_BACK,
+            Self::Failed => STATUS_FAILED,
+        }
+    }
+}
+
+/// Finalize a staged restore audit row by its opaque correlation token.
+///
+/// The staged row exists in both possible post-swap databases. Finalization is
+/// update-only, so an unknown token cannot manufacture an audit event. Affected
+/// counts are derived by the daemon and never accepted from the frontend.
+pub async fn finalize_restore(
+    db: &Database,
+    token: &str,
+    outcome: RestoreFinalOutcome,
+    affected: Vec<AffectedCount>,
+) -> Result<bool, turso::Error> {
+    let token = sanitize_code(token);
+    let now = now_ms();
+    let affected_json = serde_json::to_string(&affected).unwrap_or_else(|_| "[]".to_owned());
+    let conn = db.connect()?;
+    let updated = conn
+        .execute(
+            "UPDATE runtime_action_audit
+             SET terminal_status = ?1, affected_counts_json = ?2, completed_at_ms = ?3
+             WHERE correlation_token = ?4 AND terminal_status = ?5",
+            params![
+                outcome.status().to_owned(),
+                affected_json.clone(),
+                now,
+                token.clone(),
+                STATUS_STAGED.to_owned(),
+            ],
+        )
+        .await?;
+    Ok(updated == 1)
 }
 
 /// List the most recent audit rows, newest first.
@@ -265,6 +360,7 @@ mod tests {
                     count: 3,
                 }],
                 failure_code: None,
+                correlation_token: None,
                 started_at_ms: 10,
                 completed_at_ms: Some(20),
             },
@@ -276,6 +372,45 @@ mod tests {
         assert_eq!(rows[0].domain, "migration");
         assert_eq!(rows[0].affected[0].count, 3);
         assert!(rows[0].failure_code.is_none());
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_finalization_requires_a_staged_token_and_is_single_use() -> TestResult {
+        let (db, path) = fixture().await?;
+        assert!(
+            !finalize_restore(
+                &db,
+                "rst_unknown",
+                RestoreFinalOutcome::Completed,
+                Vec::new(),
+            )
+            .await?
+        );
+        record_staged_restore(&db, "rst_expected", 2, 10).await?;
+        assert!(
+            finalize_restore(
+                &db,
+                "rst_expected",
+                RestoreFinalOutcome::Completed,
+                vec![AffectedCount {
+                    category: "restored_projects".to_owned(),
+                    count: 2,
+                }],
+            )
+            .await?
+        );
+        assert!(
+            !finalize_restore(
+                &db,
+                "rst_expected",
+                RestoreFinalOutcome::RolledBack,
+                Vec::new(),
+            )
+            .await?
+        );
+        assert_eq!(list(&db, 10).await?[0].terminal_status, STATUS_COMPLETED);
         let _ = std::fs::remove_file(path);
         Ok(())
     }

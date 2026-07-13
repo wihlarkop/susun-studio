@@ -91,6 +91,7 @@ pub enum RestoreOutcome {
 pub async fn apply_restore(
     app: &AppHandle,
     archive_path: &str,
+    plan_id: &str,
 ) -> Result<RestoreOutcome, RestoreCommandError> {
     let supervisor = app.state::<DaemonSupervisor>();
     if !supervisor.manages_child() {
@@ -103,15 +104,17 @@ pub async fn apply_restore(
     // Reuse the archive the user picked at preview time — no second dialog.
     let archive = crate::backup::read_capped_archive(std::path::Path::new(archive_path))?;
 
-    // 1. Preview binds a single-use plan to this exact archive's identity, then
-    //    prepare stages it. Preparing by plan id lets the daemon reject any
-    //    substituted archive or replayed request.
-    let plan_id = request_preview_plan(&connection, archive.clone()).await?;
-    let prepared = request_prepare(&connection, &plan_id, archive).await?;
-    info!("event=restore_prepared restore_id={}", prepared.restore_id);
+    // 1. Prepare using the ORIGINAL plan minted at the visible preview. The daemon
+    //    re-validates the archive against that plan's checksum/manifest, so an
+    //    archive changed since the user confirmed it is rejected here (requiring a
+    //    fresh preview) — never silently restored under a new plan.
+    let prepared = request_prepare(&connection, plan_id, archive).await?;
+    let restore_id = prepared.restore_id.clone();
+    info!("event=restore_prepared restore_id={restore_id}");
 
-    // 2. Ask the daemon to release the database and exit gracefully.
-    request_shutdown(&connection).await?;
+    // 2. Ask the daemon to release the database and exit gracefully. Shutdown is
+    //    bound to this prepared restore's token.
+    request_shutdown(&connection, &restore_id).await?;
     if !daemon::wait_until_unreachable(&connection.base_url, SHUTDOWN_WAIT).await {
         warn!("event=restore_daemon_graceful_timeout action=hard_kill");
         supervisor.shutdown();
@@ -125,6 +128,8 @@ pub async fn apply_restore(
         warn!("event=restore_swap_failed error={error}");
         restore_previous(&prepared).await;
         let connection = respawn_or_down(app).await?;
+        // Rollback ran on the preserved database; finalize the staged audit row.
+        finalize_audit(&connection, &restore_id, "rolled_back").await;
         return Ok(RestoreOutcome::RolledBack {
             reason: format!("could not swap the restored database: {error}"),
             connection: connection.into(),
@@ -134,9 +139,12 @@ pub async fn apply_restore(
     // 4. Bring the daemon back on the restored database.
     match daemon::respawn(app).await {
         Ok(connection) => {
-            info!("event=restore_finished restore_id={}", prepared.restore_id);
+            info!("event=restore_finished restore_id={restore_id}");
             // The restore succeeded; the rollback copy is no longer needed.
             let _ = std::fs::remove_file(&prepared.rollback_database_path);
+            // Finalize on the RESTORED database, which has no staged row: this
+            // records the durable `completed` audit in the data the user now has.
+            finalize_audit(&connection, &restore_id, "completed").await;
             Ok(RestoreOutcome::Restored {
                 summary: prepared.manifest,
                 connection: connection.into(),
@@ -149,6 +157,7 @@ pub async fn apply_restore(
             tokio::time::sleep(HANDLE_SETTLE).await;
             restore_previous(&prepared).await;
             let connection = respawn_or_down(app).await?;
+            finalize_audit(&connection, &restore_id, "rolled_back").await;
             Ok(RestoreOutcome::RolledBack {
                 reason: format!("the restored database did not start: {error}"),
                 connection: connection.into(),
@@ -208,38 +217,6 @@ async fn rename_with_retry(from: &Path, to: &Path) -> Result<(), std::io::Error>
     Err(last_error.unwrap_or_else(|| std::io::Error::other("rename failed")))
 }
 
-#[derive(Debug, Deserialize)]
-struct RestorePreviewPlan {
-    plan_id: String,
-}
-
-/// Ask the daemon to validate the archive and mint a single-use restore plan
-/// bound to its identity. Returns the opaque plan id used to prepare.
-async fn request_preview_plan(
-    connection: &DaemonConnection,
-    archive: Vec<u8>,
-) -> Result<String, RestoreCommandError> {
-    let response = reqwest::Client::new()
-        .post(format!("{}/v1/restore/preview", connection.base_url))
-        .bearer_auth(&connection.token)
-        .header("content-type", "application/octet-stream")
-        .body(archive)
-        .send()
-        .await?;
-
-    let status = response.status();
-    let body = response.text().await?;
-    if !status.is_success() {
-        return Err(RestoreCommandError::Daemon(daemon_error_message(
-            &body, status,
-        )));
-    }
-    let plan: RestorePreviewPlan = serde_json::from_str(&body).map_err(|error| {
-        RestoreCommandError::Daemon(format!("invalid preview response: {error}"))
-    })?;
-    Ok(plan.plan_id)
-}
-
 async fn request_prepare(
     connection: &DaemonConnection,
     plan_id: &str,
@@ -267,10 +244,14 @@ async fn request_prepare(
         .map_err(|error| RestoreCommandError::Daemon(format!("invalid prepare response: {error}")))
 }
 
-async fn request_shutdown(connection: &DaemonConnection) -> Result<(), RestoreCommandError> {
+async fn request_shutdown(
+    connection: &DaemonConnection,
+    restore_id: &str,
+) -> Result<(), RestoreCommandError> {
     let response = reqwest::Client::new()
         .post(format!("{}/v1/restore/shutdown", connection.base_url))
         .bearer_auth(&connection.token)
+        .header("x-susun-restore-token", restore_id)
         .send()
         .await?;
     if !response.status().is_success() {
@@ -281,6 +262,29 @@ async fn request_shutdown(connection: &DaemonConnection) -> Result<(), RestoreCo
         )));
     }
     Ok(())
+}
+
+/// Finalize the staged restore audit row once the swap/restart outcome is known.
+/// Best-effort: a failure to record audit must never fail an otherwise-complete
+/// restore, so this only logs.
+async fn finalize_audit(connection: &DaemonConnection, restore_id: &str, outcome: &str) {
+    let result = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/restore/audit/{}",
+            connection.base_url, outcome
+        ))
+        .bearer_auth(&connection.token)
+        .header("x-susun-restore-token", restore_id)
+        .send()
+        .await;
+    match result {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => warn!(
+            "event=restore_audit_finalize_failed status={} outcome={outcome}",
+            response.status()
+        ),
+        Err(error) => warn!("event=restore_audit_finalize_failed error={error} outcome={outcome}"),
+    }
 }
 
 fn daemon_error_message(body: &str, status: reqwest::StatusCode) -> String {

@@ -1,10 +1,12 @@
 use axum::{Json, extract::State, http::HeaderMap};
 use serde::Serialize;
 
-use crate::{auth::authorize, error::ApiError, logging, state::AppState};
+use crate::{action_audit, auth::authorize, error::ApiError, logging, state::AppState};
 
 const MAX_ERROR_MESSAGE_CHARS: usize = 200;
 const REDACTED: &str = "<redacted>";
+/// How many recent destructive-action audit rows to include in diagnostics.
+const MAX_AUDIT_ENTRIES: usize = 25;
 
 #[derive(Debug, Serialize)]
 pub struct DiagnosticsJobError {
@@ -23,6 +25,22 @@ pub struct DiagnosticsEngineStatus {
 }
 
 #[derive(Debug, Serialize)]
+pub struct DiagnosticsActionAudit {
+    pub action_kind: String,
+    pub domain: String,
+    pub runtime_class: Option<String>,
+    pub ownership_result: String,
+    pub command_kind: Option<String>,
+    pub elevation_mode: Option<String>,
+    pub terminal_status: String,
+    pub affected: Vec<action_audit::AffectedCount>,
+    pub app_version: String,
+    pub failure_code: Option<String>,
+    pub started_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct DiagnosticsReport {
     pub daemon_version: &'static str,
     pub api_version: &'static str,
@@ -35,6 +53,7 @@ pub struct DiagnosticsReport {
     pub project_count: i64,
     pub recent_job_errors: Vec<DiagnosticsJobError>,
     pub engines: Vec<DiagnosticsEngineStatus>,
+    pub recent_action_audit: Vec<DiagnosticsActionAudit>,
 }
 
 pub async fn diagnostics(
@@ -98,6 +117,32 @@ pub async fn diagnostics(
     let db_size_bytes = std::fs::metadata(&state.db_path)
         .ok()
         .map(|meta| meta.len());
+    let recent_action_audit = action_audit::list(&state.db, MAX_AUDIT_ENTRIES as i64)
+        .await?
+        .into_iter()
+        .map(|row| DiagnosticsActionAudit {
+            action_kind: diagnostic_code(&row.action_kind),
+            domain: diagnostic_code(&row.domain),
+            runtime_class: row.runtime_class.as_deref().map(diagnostic_code),
+            ownership_result: diagnostic_code(&row.ownership_result),
+            command_kind: row.command_kind.as_deref().map(diagnostic_code),
+            elevation_mode: row.elevation_mode.as_deref().map(diagnostic_code),
+            terminal_status: diagnostic_code(&row.terminal_status),
+            affected: row
+                .affected
+                .into_iter()
+                .take(16)
+                .map(|affected| action_audit::AffectedCount {
+                    category: diagnostic_code(&affected.category),
+                    count: affected.count.max(0),
+                })
+                .collect(),
+            app_version: diagnostic_code(&row.app_version),
+            failure_code: row.failure_code.as_deref().map(diagnostic_code),
+            started_at_ms: row.started_at_ms,
+            completed_at_ms: row.completed_at_ms,
+        })
+        .collect();
 
     let report = DiagnosticsReport {
         daemon_version: env!("CARGO_PKG_VERSION"),
@@ -109,6 +154,7 @@ pub async fn diagnostics(
         project_count,
         recent_job_errors,
         engines,
+        recent_action_audit,
     };
     logging::info(
         "diagnostics_finished",
@@ -119,9 +165,29 @@ pub async fn diagnostics(
                 report.recent_job_errors.len().to_string(),
             ),
             ("engine_count", report.engines.len().to_string()),
+            (
+                "action_audit_count",
+                report.recent_action_audit.len().to_string(),
+            ),
         ],
     );
     Ok(Json(report))
+}
+
+fn diagnostic_code(value: &str) -> String {
+    let mut output = String::with_capacity(value.len().min(48));
+    for character in value.chars().take(48) {
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-') {
+            output.push(character.to_ascii_lowercase());
+        } else {
+            output.push('_');
+        }
+    }
+    if output.is_empty() {
+        "unknown".to_owned()
+    } else {
+        output
+    }
 }
 
 fn redact_and_truncate_error(text: &str) -> String {
