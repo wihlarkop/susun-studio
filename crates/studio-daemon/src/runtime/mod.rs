@@ -28,6 +28,7 @@ use windows_podman::WindowsPodmanProvider;
 pub use endpoint_policy::validate_engine_endpoint;
 pub use provider::{
     ManagementCapabilities, RuntimeAction, RuntimeDimension, RuntimeError, RuntimeProfile,
+    RuntimeResourceSnapshot,
 };
 
 /// Columns selected to hydrate a [`RuntimeProfile`]; the order matches
@@ -109,6 +110,12 @@ pub enum AdoptOutcome {
     OwnershipUnproven,
 }
 
+pub enum ResourceSnapshotOutcome {
+    Found(Box<RuntimeResourceSnapshot>),
+    NotFound,
+    ProviderUnavailable,
+}
+
 /// The full set of runtime providers Studio knows how to detect and manage.
 /// Add a new provider implementation and register it here to extend Runtime
 /// support to another platform or product.
@@ -156,6 +163,25 @@ pub async fn status(db: &Database) -> Result<RuntimeStatus, turso::Error> {
     }
 
     Ok(RuntimeStatus { providers })
+}
+
+pub async fn resource_snapshot(
+    db: &Database,
+    profile_id: &str,
+) -> Result<ResourceSnapshotOutcome, turso::Error> {
+    let profile = list_all_profiles(db)
+        .await?
+        .into_iter()
+        .find(|profile| profile.id == profile_id);
+    let Some(profile) = profile else {
+        return Ok(ResourceSnapshotOutcome::NotFound);
+    };
+    let Some(provider) = find_provider(&profile.provider_id) else {
+        return Ok(ResourceSnapshotOutcome::ProviderUnavailable);
+    };
+    Ok(ResourceSnapshotOutcome::Found(Box::new(
+        provider.resource_snapshot(&profile),
+    )))
 }
 
 pub async fn select_profile(
@@ -543,6 +569,26 @@ pub(crate) fn command_output(program: &str, args: &[&str]) -> Result<String, Str
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+pub(crate) fn trusted_read_output(
+    program: &std::path::Path,
+    args: &[&str],
+) -> Result<String, &'static str> {
+    const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+    let output = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|_| "trusted provider query could not start")?;
+    if !output.status.success() {
+        return Err("trusted provider query failed");
+    }
+    if output.stdout.len() > MAX_OUTPUT_BYTES {
+        return Err("trusted provider query exceeded the output limit");
+    }
+    String::from_utf8(output.stdout).map_err(|_| "trusted provider query returned invalid text")
 }
 
 /// Runs exactly one trusted runtime command at its pre-approved elevation.

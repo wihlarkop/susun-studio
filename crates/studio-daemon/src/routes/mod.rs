@@ -95,6 +95,10 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/runtime/logs", get(runtime::runtime_logs))
         .route("/v1/runtime/profiles", get(runtime::list_runtime_profiles))
         .route(
+            "/v1/runtime/profiles/{id}/resources",
+            get(runtime::runtime_profile_resources),
+        )
+        .route(
             "/v1/runtime/migrations/preview",
             post(runtime_transitions::preview_migration),
         )

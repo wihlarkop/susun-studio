@@ -6,11 +6,13 @@
   import RuntimeMigrationDialog from "$lib/components/runtime-migration-dialog.svelte";
   import RuntimeDataScopeDialog from "$lib/components/runtime-data-scope-dialog.svelte";
   import RuntimeActionAudit from "$lib/components/runtime-action-audit.svelte";
+  import RuntimeResourcePanel from "$lib/components/runtime-resource-panel.svelte";
   import {
     cancelRuntimePlan,
     executeRuntimePlan,
     forgetRuntimeProfile,
     readRuntimeLogs,
+    readRuntimeProfileResources,
     readRuntimeStatus,
     prepareRuntimeAction,
     selectRuntimeProfile,
@@ -20,6 +22,7 @@
     type RuntimeEndpointSummary,
     type RuntimeLogLine,
     type RuntimeProfile,
+    type RuntimeResourceSnapshot,
     type RuntimeProviderStatus,
     type RuntimeStatus,
     type TrustedRuntimePlan,
@@ -56,6 +59,9 @@
   let migrationDialogOpen = $state(false);
   let dataScopeDialogOpen = $state(false);
   let dataScopeProfile = $state<RuntimeProfile | null>(null);
+  let resourceSnapshots = $state<Record<string, RuntimeResourceSnapshot>>({});
+  let resourceLoading = $state<Record<string, boolean>>({});
+  let resourceErrors = $state<Record<string, string>>({});
 
   const actionIcons = {
     install: Wrench,
@@ -113,12 +119,37 @@
       status = nextStatus;
       logs = nextLogs;
       errorMessage = null;
+      for (const profile of nextStatus.providers
+        .filter((provider) => expandedProviders.has(provider.provider_id))
+        .flatMap((provider) => provider.profiles)
+        .filter((profile) => profile.runtime_class === "built_in")) {
+        void loadResources(profile, signal);
+      }
     } catch (error) {
       if (!signal?.aborted) {
         errorMessage = error instanceof Error ? error.message : String(error);
       }
     } finally {
       loading = false;
+    }
+  }
+
+  async function loadResources(profile: RuntimeProfile, signal?: AbortSignal) {
+    resourceLoading = { ...resourceLoading, [profile.id]: true };
+    try {
+      const snapshot = await readRuntimeProfileResources(profile.id, { signal });
+      resourceSnapshots = { ...resourceSnapshots, [profile.id]: snapshot };
+      const { [profile.id]: _removed, ...remainingErrors } = resourceErrors;
+      resourceErrors = remainingErrors;
+    } catch (error) {
+      if (!signal?.aborted) {
+        resourceErrors = {
+          ...resourceErrors,
+          [profile.id]: error instanceof Error ? error.message : String(error),
+        };
+      }
+    } finally {
+      resourceLoading = { ...resourceLoading, [profile.id]: false };
     }
   }
 
@@ -297,12 +328,17 @@
     return enabled.map((action) => action.label).join(", ");
   }
 
-  function toggleProvider(providerId: string) {
+  function toggleProvider(provider: RuntimeProviderStatus) {
     const next = new Set(expandedProviders);
-    if (next.has(providerId)) {
-      next.delete(providerId);
+    if (next.has(provider.provider_id)) {
+      next.delete(provider.provider_id);
     } else {
-      next.add(providerId);
+      next.add(provider.provider_id);
+      for (const profile of provider.profiles.filter(
+        (profile) => profile.runtime_class === "built_in",
+      )) {
+        void loadResources(profile);
+      }
     }
     expandedProviders = next;
   }
@@ -313,6 +349,11 @@
 
   function showExistingRuntimes() {
     expandedProviders = new Set(providers.map((provider) => provider.provider_id));
+    for (const profile of providers
+      .flatMap((provider) => provider.profiles)
+      .filter((profile) => profile.runtime_class === "built_in")) {
+      void loadResources(profile);
+    }
   }
 
   function reviewDataScope(profile: RuntimeProfile) {
@@ -448,7 +489,7 @@
         type="button"
         class="w-full border-b bg-muted/20 p-4 text-left transition-colors hover:bg-muted/35"
         aria-expanded={open}
-        onclick={() => toggleProvider(provider.provider_id)}
+        onclick={() => toggleProvider(provider)}
       >
         <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
           <div class="min-w-0">
@@ -588,6 +629,14 @@
                         blocked. Remove the conflicting susun-runtime-default machine before using
                         Set up Susun Runtime.
                       </p>
+                    {/if}
+                    {#if profile.runtime_class === "built_in"}
+                      <RuntimeResourcePanel
+                        snapshot={resourceSnapshots[profile.id] ?? null}
+                        loading={resourceLoading[profile.id] ?? false}
+                        error={resourceErrors[profile.id] ?? null}
+                        onrefresh={() => loadResources(profile)}
+                      />
                     {/if}
                   </div>
                   <div class="flex flex-wrap items-center gap-2 md:justify-end">

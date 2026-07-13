@@ -258,6 +258,35 @@ export type RuntimeProfile = {
   freshness: string;
 };
 
+export type RuntimeResourceSupport = "supported" | "unknown" | "unavailable" | "unsupported";
+
+export type RuntimeResourceMetric = {
+  support: RuntimeResourceSupport;
+  value: number | null;
+  unit: "cores" | "bytes" | "count";
+  detail: string | null;
+};
+
+export type RuntimeResourceText = {
+  support: RuntimeResourceSupport;
+  value: string | null;
+  detail: string | null;
+};
+
+export type RuntimeResourceSnapshot = {
+  profile_id: string;
+  provider_id: string;
+  observed_at_ms: number;
+  managed: boolean;
+  cpu: RuntimeResourceMetric;
+  memory: RuntimeResourceMetric;
+  disk_allocation: RuntimeResourceMetric;
+  disk_usage: RuntimeResourceMetric;
+  data_location: RuntimeResourceText;
+  network: RuntimeResourceText;
+  volumes: RuntimeResourceMetric;
+};
+
 export type RuntimeEndpointSummary = {
   kind: string;
   redacted: string;
@@ -624,6 +653,13 @@ export async function listRuntimeProfiles(
 ): Promise<RuntimeProfile[]> {
   const response = await readJson<RuntimeProfilesResponse>("/v1/runtime/profiles", options);
   return response.profiles;
+}
+
+export async function readRuntimeProfileResources(
+  profileId: string,
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeResourceSnapshot> {
+  return readJson(`/v1/runtime/profiles/${encodeURIComponent(profileId)}/resources`, options);
 }
 
 export type RuntimeMigrationProject = {

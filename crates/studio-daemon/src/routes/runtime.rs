@@ -36,6 +36,25 @@ pub async fn list_runtime_profiles(
     Ok(Json(serde_json::json!({ "profiles": profiles })))
 }
 
+pub async fn runtime_profile_resources(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(profile_id): Path<String>,
+) -> Result<Json<runtime::RuntimeResourceSnapshot>, ApiError> {
+    authorize(&state, &headers)?;
+    logging::info(
+        "runtime_profile_resources_requested",
+        &[("profile_id", profile_id.clone())],
+    );
+    match runtime::resource_snapshot(&state.db, &profile_id).await? {
+        runtime::ResourceSnapshotOutcome::Found(snapshot) => Ok(Json(*snapshot)),
+        runtime::ResourceSnapshotOutcome::NotFound => Err(ApiError::RuntimeProfileNotFound),
+        runtime::ResourceSnapshotOutcome::ProviderUnavailable => Err(ApiError::ActionUnavailable(
+            "The runtime provider is unavailable.".to_owned(),
+        )),
+    }
+}
+
 pub async fn select_runtime_profile(
     State(state): State<AppState>,
     headers: HeaderMap,
