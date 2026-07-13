@@ -638,6 +638,9 @@ export type RuntimeMigrationPreview = {
   unavailable_capabilities: string[];
   artifact_policy: RuntimeArtifactPolicy[];
   rollback_available: boolean;
+  /** Opaque, single-use commit handle; present only when can_migrate. */
+  plan_id: string | null;
+  expires_in_seconds: number | null;
 };
 
 export type RuntimeMigrationResult = {
@@ -649,6 +652,14 @@ export type RuntimeMigrationResult = {
   skipped_items: string[];
   failures: string[];
   rollback_available: boolean;
+};
+
+export type RuntimeMigrationRollbackPreview = {
+  migration_id: string;
+  restorable: boolean;
+  blocker: string | null;
+  plan_id: string | null;
+  expires_in_seconds: number | null;
 };
 
 export type RuntimeMigrationRollbackResult = {
@@ -674,22 +685,35 @@ export async function previewRuntimeMigration(
   });
 }
 
-export async function executeRuntimeMigration(
-  request: RuntimeMigrationRequest,
+/**
+ * Commit a previewed migration by its opaque plan id. The moved bindings live
+ * only in the server-side plan — no target list is sent here.
+ */
+export async function commitRuntimeMigration(
+  planId: string,
   options: DaemonRequestOptions = {},
 ): Promise<RuntimeMigrationResult> {
-  return readJson("/v1/runtime/migrations/execute", {
+  return readJson(`/v1/runtime/migrations/commit/${encodeURIComponent(planId)}`, {
     ...options,
     method: "POST",
-    body: request,
   });
 }
 
-export async function rollbackRuntimeMigration(
+export async function prepareRuntimeMigrationRollback(
   migrationId: string,
   options: DaemonRequestOptions = {},
+): Promise<RuntimeMigrationRollbackPreview> {
+  return readJson(`/v1/runtime/migrations/${encodeURIComponent(migrationId)}/rollback/prepare`, {
+    ...options,
+    method: "POST",
+  });
+}
+
+export async function commitRuntimeMigrationRollback(
+  planId: string,
+  options: DaemonRequestOptions = {},
 ): Promise<RuntimeMigrationRollbackResult> {
-  return readJson(`/v1/runtime/migrations/${encodeURIComponent(migrationId)}/rollback`, {
+  return readJson(`/v1/runtime/migrations/rollback/commit/${encodeURIComponent(planId)}`, {
     ...options,
     method: "POST",
   });
@@ -713,6 +737,19 @@ export type RuntimeDestructivePreview = {
   affected: RuntimeAffectedCategory[];
   preserved: string[];
   requires_fresh_preview: boolean;
+  /** Opaque, single-use commit handle; present only when allowed. */
+  plan_id: string | null;
+  expires_in_seconds: number | null;
+};
+
+export type RuntimeDestructiveCommitResult = {
+  profile_id: string;
+  action: RuntimeDestructiveAction;
+  /** Ownership/state was revalidated but the engine operation is deferred. */
+  status: "deferred_to_phase_14b";
+  revalidated: boolean;
+  message: string;
+  next_steps: string[];
 };
 
 export async function previewRuntimeDestructiveOperation(
@@ -724,6 +761,57 @@ export async function previewRuntimeDestructiveOperation(
     ...options,
     method: "POST",
     body: { action },
+  });
+}
+
+/**
+ * Commit a previewed destructive action by its opaque plan id. The daemon
+ * revalidates ownership and state, then defers the engine operation to a later
+ * phase — nothing is changed and no target list is sent here.
+ */
+export async function commitRuntimeDestructiveOperation(
+  planId: string,
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeDestructiveCommitResult> {
+  return readJson(`/v1/runtime/destructive/commit/${encodeURIComponent(planId)}`, {
+    ...options,
+    method: "POST",
+  });
+}
+
+export type RuntimeActionAuditEntry = {
+  id: string;
+  action_kind: string;
+  domain: string;
+  profile_id: string | null;
+  runtime_class: string | null;
+  ownership_result: string;
+  command_kind: string | null;
+  elevation_mode: string | null;
+  terminal_status: string;
+  affected: { category: string; count: number }[];
+  app_version: string;
+  failure_code: string | null;
+  started_at_ms: number;
+  completed_at_ms: number | null;
+};
+
+export async function listRuntimeActionAudit(
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeActionAuditEntry[]> {
+  const response = await readJson<{ entries: RuntimeActionAuditEntry[] }>(
+    "/v1/runtime/action-audit",
+    options,
+  );
+  return response.entries;
+}
+
+export async function clearRuntimeActionAudit(
+  options: DaemonRequestOptions = {},
+): Promise<{ cleared: boolean; removed_count: number }> {
+  return readJson("/v1/runtime/action-audit/clear", {
+    ...options,
+    method: "POST",
   });
 }
 
@@ -797,16 +885,37 @@ export type PruneReport = {
   space_reclaimed_bytes: number;
 };
 
-export async function pruneEngine(
+export type PrunePreview = {
+  engine_id: string;
+  scopes: PruneScope[];
+  all_images: boolean;
+  /** Prune is engine-wide: resources from other tools/projects may be removed. */
+  affects_shared_engine: boolean;
+  plan_id: string;
+  expires_in_seconds: number;
+};
+
+export async function previewEnginePrune(
   engineId: string,
   scopes: PruneScope[],
   allImages: boolean = false,
   options: DaemonRequestOptions = {},
-): Promise<PruneReport> {
-  return readJson(`/v1/engines/${encodeURIComponent(engineId)}/prune`, {
+): Promise<PrunePreview> {
+  return readJson(`/v1/engines/${encodeURIComponent(engineId)}/prune/preview`, {
     ...options,
     method: "POST",
     body: { scopes, all_images: allImages },
+  });
+}
+
+/** Commit a previewed prune by its opaque plan id. The server derives targets. */
+export async function commitEnginePrune(
+  planId: string,
+  options: DaemonRequestOptions = {},
+): Promise<PruneReport> {
+  return readJson(`/v1/engines/prune/commit/${encodeURIComponent(planId)}`, {
+    ...options,
+    method: "POST",
   });
 }
 

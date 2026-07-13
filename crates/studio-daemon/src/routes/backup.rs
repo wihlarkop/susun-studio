@@ -1,12 +1,31 @@
 use axum::{
     Json,
     body::Bytes,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, header},
     response::IntoResponse,
 };
+use serde::Serialize;
 
-use crate::{auth::authorize, backup, db, error::ApiError, logging, restore, state::AppState};
+use crate::{
+    action_audit::{self, AffectedCount, AuditEntry},
+    action_plans::{ActionKind, ActionPlanPayload, MetadataRestorePlan},
+    auth::authorize,
+    backup, db,
+    error::ApiError,
+    logging, restore, runtime,
+    state::AppState,
+};
+
+/// A restore preview plus the opaque plan handle that binds the following
+/// `prepare` call to *this* archive's validated identity.
+#[derive(Debug, Serialize)]
+pub struct RestorePreviewResponse {
+    #[serde(flatten)]
+    pub preview: backup::RestorePreview,
+    pub plan_id: String,
+    pub expires_in_seconds: u64,
+}
 
 /// Streams a freshly-built Studio metadata backup archive. The caller (the
 /// Tauri app) writes the bytes to the user-chosen path atomically.
@@ -42,29 +61,49 @@ pub async fn preview_restore(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<backup::RestorePreview>, ApiError> {
+) -> Result<Json<RestorePreviewResponse>, ApiError> {
     authorize(&state, &headers)?;
     logging::info(
         "restore_preview_requested",
         &[("bytes", body.len().to_string())],
     );
 
-    let preview = backup::validate_restore_archive(&body, db::latest_migration_version())
+    // Validate once and bind the plan to the archive's database identity so the
+    // following `prepare` cannot substitute a different archive.
+    let (preview, db_bytes) = backup::validated_database(&body, db::latest_migration_version())
         .map_err(|error| ApiError::RestoreArchiveInvalid(error.to_string()))?;
+    let archive_sha256 = backup::sha256_hex(&db_bytes);
+
+    let owner = runtime::stable_suffix(&state.auth_token);
+    let ticket = state.action_plans.prepare(
+        &owner,
+        ActionKind::MetadataRestore,
+        ActionPlanPayload::MetadataRestore(MetadataRestorePlan {
+            archive_sha256,
+            manifest: preview.manifest.clone(),
+        }),
+    );
 
     logging::info(
         "restore_preview_finished",
         &[("compatible", preview.compatible.to_string())],
     );
-    Ok(Json(preview))
+    Ok(Json(RestorePreviewResponse {
+        preview,
+        plan_id: ticket.plan_id,
+        expires_in_seconds: ticket.expires_in_seconds,
+    }))
 }
 
-/// Prepares a restore: validates, stages a migrated copy, writes a pre-restore
-/// backup, and returns the on-disk handoff for the Tauri supervisor. Active data
-/// is not mutated here.
+/// Prepares a restore: claims the opaque plan minted at preview, verifies the
+/// uploaded archive still hashes to the previewed identity (rejecting any
+/// substituted archive), stages a migrated copy, writes a pre-restore backup, and
+/// returns the on-disk handoff for the Tauri supervisor. Active data is not
+/// mutated here, and no replacement path is accepted — the daemon derives paths.
 pub async fn prepare_restore(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Path(plan_id): Path<String>,
     body: Bytes,
 ) -> Result<Json<restore::PreparedRestore>, ApiError> {
     authorize(&state, &headers)?;
@@ -72,10 +111,86 @@ pub async fn prepare_restore(
         "restore_prepare_requested",
         &[("bytes", body.len().to_string())],
     );
+    let owner = runtime::stable_suffix(&state.auth_token);
+    let started = crate::runtime::now_ms();
 
-    let prepared = restore::prepare_restore(&state.restore, &state.db, &state.db_path, &body)
-        .await
-        .map_err(map_restore_error)?;
+    let claimed = state
+        .action_plans
+        .claim(&plan_id, &owner, Some(ActionKind::MetadataRestore))
+        .map_err(|error| ApiError::ActionUnavailable(error.to_string()))?;
+    let ActionPlanPayload::MetadataRestore(plan) = claimed.payload else {
+        return Err(ApiError::ActionUnavailable(
+            "Plan did not match a metadata restore.".to_owned(),
+        ));
+    };
+
+    // Reject a substituted archive: the bytes must hash to the previewed identity.
+    let (_, db_bytes) =
+        backup::validated_database(&body, db::latest_migration_version()).map_err(|error| {
+            state
+                .action_plans
+                .finish(&claimed.plan_id, crate::action_plans::PlanState::Failed);
+            ApiError::RestoreArchiveInvalid(error.to_string())
+        })?;
+    if backup::sha256_hex(&db_bytes) != plan.archive_sha256 {
+        state
+            .action_plans
+            .finish(&claimed.plan_id, crate::action_plans::PlanState::Failed);
+        let _ = action_audit::record_rejection(
+            &state.db,
+            ActionKind::MetadataRestore,
+            None,
+            "rejected_stale",
+            "archive_substituted",
+        )
+        .await;
+        return Err(ApiError::RestoreArchiveInvalid(
+            "the uploaded archive does not match the previewed backup".to_owned(),
+        ));
+    }
+
+    let prepared =
+        match restore::prepare_restore(&state.restore, &state.db, &state.db_path, &body).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                state
+                    .action_plans
+                    .finish(&claimed.plan_id, crate::action_plans::PlanState::Failed);
+                let _ = action_audit::record_rejection(
+                    &state.db,
+                    ActionKind::MetadataRestore,
+                    None,
+                    "failed",
+                    "restore_prepare_failed",
+                )
+                .await;
+                return Err(map_restore_error(error));
+            }
+        };
+
+    state
+        .action_plans
+        .finish(&claimed.plan_id, crate::action_plans::PlanState::Succeeded);
+    let _ = action_audit::record(
+        &state.db,
+        AuditEntry {
+            kind: ActionKind::MetadataRestore,
+            profile_id: None,
+            runtime_class: None,
+            ownership_result: "authorized".to_owned(),
+            command_kind: Some("metadata_restore_staged".to_owned()),
+            elevation_mode: Some("none".to_owned()),
+            terminal_status: action_audit::STATUS_COMPLETED.to_owned(),
+            affected: vec![AffectedCount {
+                category: "restored_projects".to_owned(),
+                count: plan.manifest.project_count,
+            }],
+            failure_code: None,
+            started_at_ms: started,
+            completed_at_ms: Some(crate::runtime::now_ms()),
+        },
+    )
+    .await;
 
     logging::warn(
         "restore_prepare_finished",

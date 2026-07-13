@@ -2,7 +2,12 @@
   import * as Dialog from "$lib/components/ui/dialog/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
   import { Input } from "$lib/components/ui/input/index.js";
-  import { pruneEngine, type PruneReport, type PruneScope } from "$lib/daemon/client";
+  import {
+    commitEnginePrune,
+    previewEnginePrune,
+    type PruneReport,
+    type PruneScope,
+  } from "$lib/daemon/client";
 
   let {
     engineId,
@@ -36,7 +41,10 @@
     errorMessage = null;
     report = null;
     try {
-      report = await pruneEngine(engineId, scopes, includeImages && includeAllImages);
+      // Two-step: the server mints a single-use plan for this policy, then the
+      // engine derives and removes the exact resources at commit.
+      const plan = await previewEnginePrune(engineId, scopes, includeImages && includeAllImages);
+      report = await commitEnginePrune(plan.plan_id);
       confirmText = "";
     } catch (error) {
       errorMessage = error instanceof Error ? error.message : String(error);

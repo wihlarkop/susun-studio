@@ -2,13 +2,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json,
+    body::Bytes,
     extract::{Path, State},
     http::HeaderMap,
 };
 use serde::{Deserialize, Serialize};
 use turso::params;
 
-use crate::{auth::authorize, error::ApiError, logging, state::AppState, susun_integration};
+use crate::{
+    action_audit::{self, AffectedCount, AuditEntry},
+    action_plans::{ActionKind, ActionPlanPayload, EnginePrunePlan},
+    auth::authorize,
+    error::ApiError,
+    logging, runtime,
+    state::AppState,
+    susun_integration,
+};
 
 #[derive(Debug, Serialize)]
 pub struct EngineResponse {
@@ -170,9 +179,24 @@ pub async fn engine_capabilities(
 
 #[derive(Debug, Deserialize)]
 pub struct PruneRequest {
+    /// Prune *policy*: which resource classes to reclaim. This is not a resource
+    /// target list — the engine derives the exact resources to remove at commit.
     pub scopes: Vec<String>,
     #[serde(default)]
     pub all_images: bool,
+}
+
+/// Non-mutating prune preview that mints an opaque, single-use commit plan.
+#[derive(Debug, Serialize)]
+pub struct PrunePreview {
+    pub engine_id: String,
+    pub scopes: Vec<String>,
+    pub all_images: bool,
+    /// Prune operates engine-wide: resources created by other tools or projects
+    /// sharing this engine may also be removed. Surfaced so the UI can warn.
+    pub affects_shared_engine: bool,
+    pub plan_id: String,
+    pub expires_in_seconds: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -184,27 +208,116 @@ pub struct PruneResponse {
     pub space_reclaimed_bytes: u64,
 }
 
-pub async fn prune_engine(
+/// Commit endpoints carry no body; the executable policy lives in the plan.
+fn reject_commit_body(body: &Bytes) -> Result<(), ApiError> {
+    if body.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::TrustedPlanContentRejected)
+    }
+}
+
+pub async fn preview_prune(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(_engine_id): Path<String>,
+    Path(engine_id): Path<String>,
     Json(request): Json<PruneRequest>,
-) -> Result<Json<PruneResponse>, ApiError> {
+) -> Result<Json<PrunePreview>, ApiError> {
     authorize(&state, &headers)?;
+    let owner = runtime::stable_suffix(&state.auth_token);
+    let ticket = state.action_plans.prepare(
+        &owner,
+        ActionKind::EnginePrune,
+        ActionPlanPayload::EnginePrune(EnginePrunePlan {
+            engine_id: engine_id.clone(),
+            scopes: request.scopes.clone(),
+            all_images: request.all_images,
+        }),
+    );
     logging::warn(
-        "engine_prune_started",
+        "engine_prune_previewed",
         &[
+            ("engine_id", engine_id.clone()),
             ("scope_count", request.scopes.len().to_string()),
             ("all_images", request.all_images.to_string()),
         ],
     );
+    Ok(Json(PrunePreview {
+        engine_id,
+        scopes: request.scopes,
+        all_images: request.all_images,
+        affects_shared_engine: true,
+        plan_id: ticket.plan_id,
+        expires_in_seconds: ticket.expires_in_seconds,
+    }))
+}
 
-    let engine = susun_integration::connect_engine(&state.db, None)
-        .await
-        .map_err(ApiError::EngineUnavailable)?;
-    let report = susun_integration::system_prune(&engine, &request.scopes, request.all_images)
-        .await
-        .map_err(ApiError::EngineUnavailable)?;
+pub async fn commit_prune(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(plan_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<PruneResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_commit_body(&body)?;
+    let owner = runtime::stable_suffix(&state.auth_token);
+    let started = now_ms()?;
+
+    let claimed = state
+        .action_plans
+        .claim(&plan_id, &owner, Some(ActionKind::EnginePrune))
+        .map_err(|error| ApiError::ActionUnavailable(error.to_string()))?;
+    let ActionPlanPayload::EnginePrune(plan) = claimed.payload else {
+        return Err(ApiError::ActionUnavailable(
+            "Plan did not match an engine prune.".to_owned(),
+        ));
+    };
+
+    logging::warn(
+        "engine_prune_started",
+        &[
+            ("engine_id", plan.engine_id.clone()),
+            ("scope_count", plan.scopes.len().to_string()),
+            ("all_images", plan.all_images.to_string()),
+        ],
+    );
+
+    // Revalidate provider state at commit; the server derives the exact targets.
+    let engine = match susun_integration::connect_engine(&state.db, None).await {
+        Ok(engine) => engine,
+        Err(error) => {
+            state
+                .action_plans
+                .finish(&claimed.plan_id, crate::action_plans::PlanState::Failed);
+            let _ = action_audit::record_rejection(
+                &state.db,
+                ActionKind::EnginePrune,
+                None,
+                "rejected_state",
+                "provider_unreachable",
+            )
+            .await;
+            return Err(ApiError::EngineUnavailable(error));
+        }
+    };
+    let report = match susun_integration::system_prune(&engine, &plan.scopes, plan.all_images).await
+    {
+        Ok(report) => report,
+        Err(error) => {
+            state
+                .action_plans
+                .finish(&claimed.plan_id, crate::action_plans::PlanState::Failed);
+            let _ = action_audit::record_rejection(
+                &state.db,
+                ActionKind::EnginePrune,
+                None,
+                "failed",
+                "prune_failed",
+            )
+            .await;
+            return Err(ApiError::EngineUnavailable(error));
+        }
+    };
 
     let response = PruneResponse {
         containers_removed: report.containers_removed,
@@ -213,6 +326,43 @@ pub async fn prune_engine(
         images_removed: report.images_removed,
         space_reclaimed_bytes: report.space_reclaimed_bytes,
     };
+    state
+        .action_plans
+        .finish(&claimed.plan_id, crate::action_plans::PlanState::Succeeded);
+    let _ = action_audit::record(
+        &state.db,
+        AuditEntry {
+            kind: ActionKind::EnginePrune,
+            profile_id: None,
+            runtime_class: None,
+            ownership_result: "authorized".to_owned(),
+            command_kind: Some("provider_prune".to_owned()),
+            elevation_mode: Some("none".to_owned()),
+            terminal_status: action_audit::STATUS_COMPLETED.to_owned(),
+            affected: vec![
+                AffectedCount {
+                    category: "containers".to_owned(),
+                    count: response.containers_removed.len() as i64,
+                },
+                AffectedCount {
+                    category: "networks".to_owned(),
+                    count: response.networks_removed.len() as i64,
+                },
+                AffectedCount {
+                    category: "volumes".to_owned(),
+                    count: response.volumes_removed.len() as i64,
+                },
+                AffectedCount {
+                    category: "images".to_owned(),
+                    count: response.images_removed.len() as i64,
+                },
+            ],
+            failure_code: None,
+            started_at_ms: started,
+            completed_at_ms: Some(now_ms()?),
+        },
+    )
+    .await;
     logging::warn(
         "engine_prune_finished",
         &[

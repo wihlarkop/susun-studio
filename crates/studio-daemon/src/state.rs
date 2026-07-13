@@ -18,4 +18,7 @@ pub struct AppState {
     pub watch: Arc<WatchRegistry>,
     pub restore: Arc<RestoreCoordinator>,
     pub trusted_plans: Arc<crate::runtime::trusted_plans::TrustedPlanStore>,
+    /// Shared security envelope for destructive data operations (migration,
+    /// reset/remove/repair, engine prune, metadata restore).
+    pub action_plans: Arc<crate::action_plans::ActionPlanStore>,
 }

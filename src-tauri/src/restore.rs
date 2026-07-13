@@ -103,8 +103,11 @@ pub async fn apply_restore(
     // Reuse the archive the user picked at preview time — no second dialog.
     let archive = crate::backup::read_capped_archive(std::path::Path::new(archive_path))?;
 
-    // 1. Daemon validates + stages a migrated copy + writes a pre-restore backup.
-    let prepared = request_prepare(&connection, archive).await?;
+    // 1. Preview binds a single-use plan to this exact archive's identity, then
+    //    prepare stages it. Preparing by plan id lets the daemon reject any
+    //    substituted archive or replayed request.
+    let plan_id = request_preview_plan(&connection, archive.clone()).await?;
+    let prepared = request_prepare(&connection, &plan_id, archive).await?;
     info!("event=restore_prepared restore_id={}", prepared.restore_id);
 
     // 2. Ask the daemon to release the database and exit gracefully.
@@ -205,12 +208,48 @@ async fn rename_with_retry(from: &Path, to: &Path) -> Result<(), std::io::Error>
     Err(last_error.unwrap_or_else(|| std::io::Error::other("rename failed")))
 }
 
+#[derive(Debug, Deserialize)]
+struct RestorePreviewPlan {
+    plan_id: String,
+}
+
+/// Ask the daemon to validate the archive and mint a single-use restore plan
+/// bound to its identity. Returns the opaque plan id used to prepare.
+async fn request_preview_plan(
+    connection: &DaemonConnection,
+    archive: Vec<u8>,
+) -> Result<String, RestoreCommandError> {
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/restore/preview", connection.base_url))
+        .bearer_auth(&connection.token)
+        .header("content-type", "application/octet-stream")
+        .body(archive)
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(RestoreCommandError::Daemon(daemon_error_message(
+            &body, status,
+        )));
+    }
+    let plan: RestorePreviewPlan = serde_json::from_str(&body).map_err(|error| {
+        RestoreCommandError::Daemon(format!("invalid preview response: {error}"))
+    })?;
+    Ok(plan.plan_id)
+}
+
 async fn request_prepare(
     connection: &DaemonConnection,
+    plan_id: &str,
     archive: Vec<u8>,
 ) -> Result<PreparedRestore, RestoreCommandError> {
     let response = reqwest::Client::new()
-        .post(format!("{}/v1/restore/prepare", connection.base_url))
+        .post(format!(
+            "{}/v1/restore/prepare/{}",
+            connection.base_url, plan_id
+        ))
         .bearer_auth(&connection.token)
         .header("content-type", "application/octet-stream")
         .body(archive)

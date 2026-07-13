@@ -5,6 +5,7 @@
   import { Button } from "$lib/components/ui/button/index.js";
   import RuntimeMigrationDialog from "$lib/components/runtime-migration-dialog.svelte";
   import RuntimeDataScopeDialog from "$lib/components/runtime-data-scope-dialog.svelte";
+  import RuntimeActionAudit from "$lib/components/runtime-action-audit.svelte";
   import {
     cancelRuntimePlan,
     executeRuntimePlan,
@@ -649,6 +650,8 @@
       </ul>
     {/if}
   </Card.Root>
+
+  <RuntimeActionAudit />
 
   <Dialog.Root bind:open={trustedPlanDialogOpen}>
     <Dialog.Content class="sm:max-w-lg">
