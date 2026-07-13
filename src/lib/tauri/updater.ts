@@ -18,7 +18,7 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
     if (isUnpublishedUpdateError(error)) {
       return { available: false, reason: "unpublished" };
     }
-    throw error;
+    throw new Error("Update check failed. Verify network access and try again.");
   }
 
   if (!update) {
@@ -29,8 +29,20 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
     available: true,
     version: update.version,
     install: async () => {
-      await update.downloadAndInstall();
-      await relaunch();
+      try {
+        await update.downloadAndInstall();
+      } catch {
+        throw new Error(
+          "Update installation did not complete. Restart Studio, check the installed version, and try again later.",
+        );
+      }
+      try {
+        await relaunch();
+      } catch {
+        throw new Error(
+          "The update was installed, but Studio could not relaunch. Restart it manually.",
+        );
+      }
     },
   };
 }

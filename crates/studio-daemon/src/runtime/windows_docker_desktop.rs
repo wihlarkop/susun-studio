@@ -2,7 +2,9 @@ use susun::EngineEndpoint;
 
 use super::{
     RuntimeProfile,
-    command::{CommandKind, ExecutableCommand, ProcessElevation, TrustedProgram},
+    command::{
+        CommandKind, ExecutableCommand, ProcessElevation, SoftwareProvenance, TrustedProgram,
+    },
     command_output, dimension, now_ms,
     provider::{
         EndpointSummary, ObservedProfile, PLACEHOLDER_KEY, RuntimeAction, RuntimeClass,
@@ -193,6 +195,9 @@ impl WindowsDockerDesktopProvider {
                     "install".into(),
                     "--id".into(),
                     "Docker.DockerDesktop".into(),
+                    "--exact".into(),
+                    "--source".into(),
+                    "winget".into(),
                     "--accept-package-agreements".into(),
                     "--accept-source-agreements".into(),
                     "--disable-interactivity".into(),
@@ -202,6 +207,15 @@ impl WindowsDockerDesktopProvider {
                 timeout: Duration::from_secs(30 * 60),
                 kind: CommandKind::PackageManager,
                 elevation: ProcessElevation::OneShotOsMediated,
+                software_provenance: Some(SoftwareProvenance {
+                    package_id: "Docker.DockerDesktop",
+                    source: "winget",
+                    source_url: "https://cdn.winget.microsoft.com/cache",
+                    source_identifier: "Microsoft.Winget.Source_8wekyb3d8bbwe",
+                    expected_publisher: "Docker Inc.",
+                    version_intent: "Latest version published by the pinned source",
+                    restart_impact: "Windows restart may be requested by the installer",
+                }),
                 success_message: "Docker Desktop install command finished.".to_owned(),
             }),
             "start" => Some(ExecutableCommand {
@@ -218,6 +232,7 @@ impl WindowsDockerDesktopProvider {
                 timeout: Duration::from_secs(30),
                 kind: CommandKind::OsConfigTool,
                 elevation: ProcessElevation::CurrentUser,
+                software_provenance: None,
                 success_message:
                     "Docker Desktop launch requested. It may take a minute to become ready."
                         .to_owned(),
@@ -236,6 +251,7 @@ impl WindowsDockerDesktopProvider {
                 timeout: Duration::from_secs(30),
                 kind: CommandKind::OsConfigTool,
                 elevation: ProcessElevation::CurrentUser,
+                software_provenance: None,
                 success_message: "Docker Desktop stop requested (engine and UI processes)."
                     .to_owned(),
             }),
@@ -255,6 +271,7 @@ impl WindowsDockerDesktopProvider {
                 timeout: Duration::from_secs(30),
                 kind: CommandKind::OsConfigTool,
                 elevation: ProcessElevation::CurrentUser,
+                software_provenance: None,
                 success_message: "Docker Desktop restart requested.".to_owned(),
             }),
             _ => None,

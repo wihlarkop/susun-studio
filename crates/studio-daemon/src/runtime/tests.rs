@@ -396,6 +396,17 @@ fn podman_install_is_a_one_shot_elevated_package_manager_command() -> TestResult
     assert_eq!(command.program, TrustedProgram::Winget);
     assert_eq!(command.kind, CommandKind::PackageManager);
     assert_eq!(command.elevation, ProcessElevation::OneShotOsMediated);
+    let provenance = command
+        .software_provenance
+        .as_ref()
+        .ok_or("podman install provenance")?;
+    assert_eq!(provenance.package_id, "RedHat.Podman");
+    assert_eq!(provenance.source, "winget");
+    assert_eq!(provenance.expected_publisher, "Red Hat, Inc.");
+    assert!(command.validate_policy().is_ok());
+    let mut missing_provenance = command.clone();
+    missing_provenance.software_provenance = None;
+    assert!(missing_provenance.validate_policy().is_err());
     assert!(
         command
             .args
@@ -439,6 +450,12 @@ fn docker_desktop_install_is_a_one_shot_elevated_package_manager_command() -> Te
     assert_eq!(command.program, TrustedProgram::Winget);
     assert_eq!(command.kind, CommandKind::PackageManager);
     assert_eq!(command.elevation, ProcessElevation::OneShotOsMediated);
+    let provenance = command
+        .software_provenance
+        .as_ref()
+        .ok_or("docker install provenance")?;
+    assert_eq!(provenance.package_id, "Docker.DockerDesktop");
+    assert_eq!(provenance.source, "winget");
     assert!(
         command
             .args
@@ -491,6 +508,9 @@ fn provider_built_arguments_preserve_order() -> TestResult {
             "install",
             "--id",
             "RedHat.Podman",
+            "--exact",
+            "--source",
+            "winget",
             "--accept-package-agreements",
             "--accept-source-agreements",
             "--disable-interactivity",
@@ -519,6 +539,7 @@ fn native_non_utf8_arguments_are_preserved() {
         timeout: std::time::Duration::from_secs(1),
         kind: super::command::CommandKind::RuntimeCli,
         elevation: super::command::ProcessElevation::CurrentUser,
+        software_provenance: None,
         success_message: String::new(),
     };
 

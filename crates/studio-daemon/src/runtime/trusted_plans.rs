@@ -8,7 +8,7 @@ use std::{
 
 use serde::Serialize;
 
-use super::command::{CommandKind, ExecutableCommand, ProcessElevation};
+use super::command::{CommandKind, ExecutableCommand, ProcessElevation, SoftwareProvenance};
 
 const PLAN_TTL: Duration = Duration::from_secs(5 * 60);
 
@@ -32,6 +32,7 @@ pub struct TrustedPlanPreview {
     pub consequence: String,
     pub elevation: String,
     pub command_summary: String,
+    pub software_provenance: Option<SoftwareProvenance>,
     pub expires_in_seconds: u64,
     pub state: TrustedPlanState,
 }
@@ -114,6 +115,7 @@ impl TrustedPlanStore {
             consequence: metadata.consequence.to_owned(),
             elevation: elevation.to_owned(),
             command_summary: command_summary.to_owned(),
+            software_provenance: command.software_provenance.clone(),
             expires_in_seconds: self.ttl.as_secs(),
             state: TrustedPlanState::Pending,
         };
@@ -208,6 +210,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             kind: CommandKind::RuntimeCli,
             elevation: ProcessElevation::CurrentUser,
+            software_provenance: None,
             success_message: "started".to_owned(),
         }
     }
