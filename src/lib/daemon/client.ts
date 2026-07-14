@@ -1000,6 +1000,148 @@ export async function commitEnginePrune(
   });
 }
 
+/**
+ * Selected-runtime attribution attached to every engine-wide artifact
+ * response, so built-in and external runtimes stay distinguishable.
+ */
+export type ArtifactRuntimeContext = {
+  runtime_profile_id: string | null;
+  runtime_class: string | null;
+  display_name: string | null;
+  is_selected: boolean | null;
+};
+
+export type ContainerArtifactSummary = {
+  id: string;
+  name: string;
+  state: string;
+  health: string | null;
+  image_reference: string | null;
+  label_keys: string[];
+  known_project_id: string | null;
+  created_at_epoch_seconds: number | null;
+  writable_size_bytes: number | null;
+  root_filesystem_size_bytes: number | null;
+};
+
+export type EngineContainerInventoryResponse = {
+  engine_id: string;
+  runtime: ArtifactRuntimeContext;
+  /** SDK support level for engine-wide container inventory ("supported", "unsupported", "unknown", ...). */
+  capability: string;
+  observed_at_epoch_seconds: number | null;
+  containers: ContainerArtifactSummary[];
+};
+
+export async function readEngineContainers(
+  engineId: string,
+  options: DaemonRequestOptions = {},
+): Promise<EngineContainerInventoryResponse> {
+  return readJson(`/v1/engines/${encodeURIComponent(engineId)}/containers`, options);
+}
+
+export type ContainerArtifactDetailResponse = {
+  engine_id: string;
+  runtime: ArtifactRuntimeContext;
+  container: ContainerArtifactSummary;
+};
+
+export async function readEngineContainer(
+  engineId: string,
+  containerId: string,
+  options: DaemonRequestOptions = {},
+): Promise<ContainerArtifactDetailResponse> {
+  return readJson(
+    `/v1/engines/${encodeURIComponent(engineId)}/containers/${encodeURIComponent(containerId)}`,
+    options,
+  );
+}
+
+export type ImageArtifactSummary = {
+  id: string;
+  references: string[];
+  digests: string[];
+  label_keys: string[];
+  created_at_epoch_seconds: number | null;
+  size_bytes: number | null;
+  shared_size_bytes: number | null;
+  container_count: number | null;
+};
+
+export type EngineImageInventoryResponse = {
+  engine_id: string;
+  runtime: ArtifactRuntimeContext;
+  /** SDK support level for engine-wide image inventory. */
+  capability: string;
+  observed_at_epoch_seconds: number | null;
+  images: ImageArtifactSummary[];
+};
+
+export async function readEngineImages(
+  engineId: string,
+  options: DaemonRequestOptions = {},
+): Promise<EngineImageInventoryResponse> {
+  return readJson(`/v1/engines/${encodeURIComponent(engineId)}/images`, options);
+}
+
+export type ImageArtifactDetailResponse = {
+  engine_id: string;
+  runtime: ArtifactRuntimeContext;
+  image: ImageArtifactSummary;
+};
+
+export async function readEngineImage(
+  engineId: string,
+  imageId: string,
+  options: DaemonRequestOptions = {},
+): Promise<ImageArtifactDetailResponse> {
+  return readJson(
+    `/v1/engines/${encodeURIComponent(engineId)}/images/${encodeURIComponent(imageId)}`,
+    options,
+  );
+}
+
+export type BuildCacheScopeStatus = {
+  support: string;
+  candidate_count: number | null;
+  reclaimable_bytes: number | null;
+  estimate_kind: string;
+};
+
+export type BuildCacheStatusResponse = {
+  engine_id: string;
+  runtime: ArtifactRuntimeContext;
+  /** SDK support level for build-cache inventory and cleanup. */
+  support: string;
+  usage: BuildCacheScopeStatus | null;
+};
+
+export async function readEngineBuildCacheStatus(
+  engineId: string,
+  options: DaemonRequestOptions = {},
+): Promise<BuildCacheStatusResponse> {
+  return readJson(`/v1/engines/${encodeURIComponent(engineId)}/build-cache`, options);
+}
+
+/**
+ * Capability flags only — no live login state, no configured-registry list,
+ * and no credential material. Credential storage is not part of this slice.
+ */
+export type RegistryCapabilityResponse = {
+  engine_id: string;
+  runtime: ArtifactRuntimeContext;
+  supports_pull: string;
+  supports_push: string;
+  supports_auth: string;
+};
+
+export async function readEngineRegistryCapability(
+  engineId: string,
+  options: DaemonRequestOptions = {},
+): Promise<RegistryCapabilityResponse> {
+  return readJson(`/v1/engines/${encodeURIComponent(engineId)}/registry`, options);
+}
+
 export async function runAction(
   projectId: string,
   action: "up" | "down" | "build" | "clean",
