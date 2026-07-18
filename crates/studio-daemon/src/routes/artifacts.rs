@@ -112,9 +112,7 @@ pub async fn list_engine_containers(
     let engine_id = validate_engine_id(&state, &engine_id).await?.id;
     let (engine, _, runtime_ctx) = connect_selected_engine(&state).await?;
 
-    let result = artifact_inventory::container_inventory(&state.db, &engine)
-        .await
-        .map_err(ApiError::EngineUnavailable)?;
+    let result = artifact_inventory::container_inventory(&state.db, &engine).await?;
 
     logging::info(
         "engine_containers_listed",
@@ -169,11 +167,11 @@ fn container_detail_response(
     lookup: DetailLookup<artifact_inventory::ContainerSummaryRow>,
 ) -> Result<ContainerArtifactDetailResponse, ApiError> {
     match lookup {
-        DetailLookup::Found(container) => Ok(ContainerArtifactDetailResponse {
+        DetailLookup::Found { capability, value } => Ok(ContainerArtifactDetailResponse {
             engine_id,
             runtime: runtime_ctx,
-            capability: "supported".to_owned(),
-            container: Some(container.into()),
+            capability,
+            container: Some(value.into()),
         }),
         DetailLookup::Unsupported { capability } => Ok(ContainerArtifactDetailResponse {
             engine_id,
@@ -194,9 +192,7 @@ pub async fn read_engine_container(
     let engine_id = validate_engine_id(&state, &engine_id).await?.id;
     let (engine, _, runtime_ctx) = connect_selected_engine(&state).await?;
 
-    let lookup = artifact_inventory::container_details(&state.db, &engine, &container_id)
-        .await
-        .map_err(ApiError::EngineUnavailable)?;
+    let lookup = artifact_inventory::container_details(&state.db, &engine, &container_id).await?;
 
     Ok(Json(container_detail_response(
         engine_id,
@@ -251,9 +247,7 @@ pub async fn list_engine_images(
     let engine_id = validate_engine_id(&state, &engine_id).await?.id;
     let (engine, _, runtime_ctx) = connect_selected_engine(&state).await?;
 
-    let result = artifact_inventory::image_inventory(&engine)
-        .await
-        .map_err(ApiError::EngineUnavailable)?;
+    let result = artifact_inventory::image_inventory(&engine).await?;
 
     logging::info(
         "engine_images_listed",
@@ -307,11 +301,11 @@ fn image_detail_response(
     lookup: DetailLookup<artifact_inventory::ImageSummaryRow>,
 ) -> Result<ImageArtifactDetailResponse, ApiError> {
     match lookup {
-        DetailLookup::Found(image) => Ok(ImageArtifactDetailResponse {
+        DetailLookup::Found { capability, value } => Ok(ImageArtifactDetailResponse {
             engine_id,
             runtime: runtime_ctx,
-            capability: "supported".to_owned(),
-            image: Some(image.into()),
+            capability,
+            image: Some(value.into()),
         }),
         DetailLookup::Unsupported { capability } => Ok(ImageArtifactDetailResponse {
             engine_id,
@@ -332,9 +326,7 @@ pub async fn read_engine_image(
     let engine_id = validate_engine_id(&state, &engine_id).await?.id;
     let (engine, _, runtime_ctx) = connect_selected_engine(&state).await?;
 
-    let lookup = artifact_inventory::image_details(&engine, &image_id)
-        .await
-        .map_err(ApiError::EngineUnavailable)?;
+    let lookup = artifact_inventory::image_details(&engine, &image_id).await?;
 
     Ok(Json(image_detail_response(engine_id, runtime_ctx, lookup)?))
 }
@@ -369,9 +361,7 @@ pub async fn engine_build_cache_status(
     let engine_id = validate_engine_id(&state, &engine_id).await?.id;
     let (engine, _, runtime_ctx) = connect_selected_engine(&state).await?;
 
-    let status = artifact_inventory::build_cache_status(&engine)
-        .await
-        .map_err(ApiError::EngineUnavailable)?;
+    let status = artifact_inventory::build_cache_status(&engine).await?;
 
     Ok(Json(BuildCacheStatusResponse {
         engine_id,
@@ -407,9 +397,7 @@ pub async fn engine_registry_capability(
     let engine_id = validate_engine_id(&state, &engine_id).await?.id;
     let (engine, _, runtime_ctx) = connect_selected_engine(&state).await?;
 
-    let capability = artifact_inventory::registry_capability(&engine)
-        .await
-        .map_err(ApiError::EngineUnavailable)?;
+    let capability = artifact_inventory::registry_capability(&engine).await?;
 
     Ok(Json(RegistryCapabilityResponse {
         engine_id,
@@ -521,10 +509,8 @@ mod tests {
         Ok(())
     }
 
-    /// A found artifact reads as a normal 200 with `capability: "supported"`.
-    #[test]
-    fn container_detail_response_maps_found_to_populated_body() -> TestResult {
-        let row = artifact_inventory::ContainerSummaryRow {
+    fn sample_container_row() -> artifact_inventory::ContainerSummaryRow {
+        artifact_inventory::ContainerSummaryRow {
             id: "c1".to_owned(),
             name: "web-1".to_owned(),
             state: "running".to_owned(),
@@ -535,15 +521,42 @@ mod tests {
             created_at_epoch_seconds: None,
             writable_size_bytes: None,
             root_filesystem_size_bytes: None,
-        };
+        }
+    }
 
+    /// A found artifact reads as a normal 200, carrying whatever real
+    /// support level the provider reported.
+    #[test]
+    fn container_detail_response_maps_found_to_populated_body() -> TestResult {
         let response = container_detail_response(
             "engine-1".to_owned(),
             sample_runtime(),
-            DetailLookup::Found(row),
+            DetailLookup::Found {
+                capability: "supported".to_owned(),
+                value: sample_container_row(),
+            },
         )?;
 
         assert_eq!(response.capability, "supported");
+        assert!(response.container.is_some());
+        Ok(())
+    }
+
+    /// A provider that only supports a documented subset must not be
+    /// reported as fully "supported" — the route used to hardcode that
+    /// string regardless of what the SDK actually reported.
+    #[test]
+    fn container_detail_response_preserves_supported_subset_capability() -> TestResult {
+        let response = container_detail_response(
+            "engine-1".to_owned(),
+            sample_runtime(),
+            DetailLookup::Found {
+                capability: "supported_subset".to_owned(),
+                value: sample_container_row(),
+            },
+        )?;
+
+        assert_eq!(response.capability, "supported_subset");
         assert!(response.container.is_some());
         Ok(())
     }
@@ -581,10 +594,42 @@ mod tests {
 
     #[test]
     fn image_detail_response_maps_not_found_to_artifact_not_found_error() {
-        let result =
-            image_detail_response("engine-1".to_owned(), sample_runtime(), DetailLookup::NotFound);
+        let result = image_detail_response(
+            "engine-1".to_owned(),
+            sample_runtime(),
+            DetailLookup::NotFound,
+        );
 
         assert!(matches!(result, Err(ApiError::ArtifactNotFound)));
+    }
+
+    /// Mirrors the container-side regression: a documented-subset provider
+    /// must not be reported as fully "supported".
+    #[test]
+    fn image_detail_response_preserves_supported_subset_capability() -> TestResult {
+        let row = artifact_inventory::ImageSummaryRow {
+            id: "img1".to_owned(),
+            references: Vec::new(),
+            digests: Vec::new(),
+            label_keys: Vec::new(),
+            created_at_epoch_seconds: None,
+            size_bytes: None,
+            shared_size_bytes: None,
+            container_count: None,
+        };
+
+        let response = image_detail_response(
+            "engine-1".to_owned(),
+            sample_runtime(),
+            DetailLookup::Found {
+                capability: "supported_subset".to_owned(),
+                value: row,
+            },
+        )?;
+
+        assert_eq!(response.capability, "supported_subset");
+        assert!(response.image.is_some());
+        Ok(())
     }
 }
 

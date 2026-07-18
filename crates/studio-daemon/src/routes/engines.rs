@@ -19,51 +19,57 @@ use crate::{
     susun_integration,
 };
 
-/// A Studio-owned, server-confirmed engine identity. `id` names a row in the
-/// `engines` table — a logical, Studio-registered engine — never a
-/// connection endpoint. It exists purely so responses, logs, and plans carry
-/// an id the daemon has actually checked, instead of an unvalidated path
-/// segment a caller could set to anything.
+/// Identity of the platform-default local engine: used only when no runtime
+/// profile is selected or bound. Kept as this literal string — matching the
+/// legacy `engines` table's one seeded row — so existing logs, responses,
+/// and stored plans keep reading a familiar id. It is no longer *looked up*
+/// from that table for identity purposes, though: runtime profiles are what
+/// actually selects an engine, and the `engines` table does not drive this.
+pub(crate) const PLATFORM_DEFAULT_ENGINE_ID: &str = "engine-docker-local";
+
+/// A Studio-owned engine identity that matches the runtime actually
+/// connected for this request. Exists purely so responses, logs, and plans
+/// carry an id the daemon has actually checked, instead of an unvalidated
+/// path segment a caller could set to anything — including a stale id left
+/// over from before the user switched runtimes.
 #[derive(Debug, Clone)]
 pub(crate) struct ValidatedEngineId {
     pub id: String,
 }
 
-/// Confirms `engine_id` names a real, enabled row in the `engines` table.
-/// Every route that accepts an `{id}` path segment must call this before
-/// doing anything else with it (including connecting to an engine, mutating
-/// state, or minting a plan), so a fabricated id can never surface real
-/// engine-wide data or trigger a real operation under a false label.
+/// Resolves the logical engine identity for whichever runtime is actually
+/// selected right now: the selected runtime profile's own id, or
+/// [`PLATFORM_DEFAULT_ENGINE_ID`] when none is selected/bound. This is the
+/// single source of truth for "which engine a request is about" — every
+/// route that reports or stores an `engine_id` must derive it from here,
+/// never from the legacy `engines` table, which does not drive engine
+/// selection and can silently disagree with the runtime actually connected.
+pub(crate) async fn resolved_engine_id(db: &turso::Database) -> Result<String, ApiError> {
+    let (runtime_profile_id, _) = runtime::attribution_for(db, None).await?;
+    Ok(runtime_profile_id.unwrap_or_else(|| PLATFORM_DEFAULT_ENGINE_ID.to_owned()))
+}
+
+/// Confirms `engine_id` names the engine actually selected right now. Every
+/// route that accepts an `{id}` path segment must call this before doing
+/// anything else with it (including connecting to an engine, mutating
+/// state, or minting a plan), so a fabricated *or stale* id can never
+/// surface real engine-wide data, or label one runtime's data with another
+/// runtime's identity (e.g. an external Podman profile echoed back as
+/// `engine-docker-local`).
 ///
-/// This deliberately never touches the `runtime_profiles` table or engine
-/// connection logic: the validated id identifies *which registered engine
-/// row* the caller means, it never selects a connection endpoint or
-/// overrides the selected/bound runtime profile. Engine connection stays
-/// governed entirely by `runtime::attribution_for` /
-/// `susun_integration::connect_engine_for_profile`, exactly as before.
+/// This never selects a connection endpoint or overrides the
+/// selected/bound runtime profile — it only reads the same selection engine
+/// connection already uses (`runtime::attribution_for`), it never chooses
+/// it.
 pub(crate) async fn validate_engine_id(
     state: &AppState,
     engine_id: &str,
 ) -> Result<ValidatedEngineId, ApiError> {
-    let conn = state.db.connect()?;
-    let mut rows = conn
-        .query(
-            "SELECT enabled FROM engines WHERE id = ?1",
-            params![engine_id.to_owned()],
-        )
-        .await?;
-    let Some(row) = rows.next().await? else {
+    let resolved = resolved_engine_id(&state.db).await?;
+    if engine_id != resolved {
         return Err(ApiError::EngineNotFound);
-    };
-    let enabled: i64 = row.get(0)?;
-    if enabled == 0 {
-        return Err(ApiError::ActionUnavailable(format!(
-            "engine `{engine_id}` is disabled"
-        )));
     }
-    Ok(ValidatedEngineId {
-        id: engine_id.to_owned(),
-    })
+    Ok(ValidatedEngineId { id: resolved })
 }
 
 #[derive(Debug, Serialize)]
@@ -163,13 +169,16 @@ pub async fn engine_health(
         error: health.error,
     };
 
-    // Persist the latest result. No read cursor is open on this connection.
+    // Persist the latest result into the legacy engines-table health cache.
+    // This is a pure cache slot, keyed by the table's one fixed row — not by
+    // `engine_id`, which now reflects the actually-selected runtime and may
+    // not correspond to any row in this legacy table at all.
     let health_json = serde_json::to_string(&response)?;
     let now = now_ms()?;
     let conn = state.db.connect()?;
     conn.execute(
         "UPDATE engines SET last_health_json = ?1, last_health_at_ms = ?2 WHERE id = ?3",
-        params![health_json, now, engine_id.clone()],
+        params![health_json, now, PLATFORM_DEFAULT_ENGINE_ID.to_owned()],
     )
     .await?;
 
@@ -325,6 +334,25 @@ async fn engine_identity_fingerprint(
         (None, None) => "platform_default".to_owned(),
     };
     runtime::stable_suffix(&format!("{identity};api={api_version}"))
+}
+
+/// Confirms the plan's server-stored engine identity still matches what's
+/// actually selected right now. `plan_engine_id` was resolved and validated
+/// once already, at preview time (`validate_engine_id`); this re-derives the
+/// same identity fresh and rejects on any drift, so a destructive commit can
+/// never execute under a stale or superseded engine label.
+async fn revalidate_engine_still_selected(
+    db: &turso::Database,
+    plan_engine_id: &str,
+) -> Result<(), String> {
+    let current = resolved_engine_id(db)
+        .await
+        .map_err(|error| error.to_string())?;
+    if current == plan_engine_id {
+        Ok(())
+    } else {
+        Err("The selected engine changed since preview. Preview prune again.".to_owned())
+    }
 }
 
 /// Fingerprints a server-derived cleanup inventory so a commit can detect any
@@ -699,6 +727,27 @@ pub async fn commit_prune(
         .await);
     }
 
+    // Revalidate the engine identity itself, immediately before the
+    // destructive call — not just implicitly via a successful connection
+    // above. The connect step already fails outright if the previewed
+    // profile was forgotten or became unavailable; this catches the
+    // remaining gap: a *different* engine now selected while the previewed
+    // one is still perfectly connectable. Commit always executes against
+    // the profile pinned at preview time (by design, so a later global
+    // selection switch never redirects an in-flight prune), so this cannot
+    // reject a healthy commit — it only rejects when the plan's own
+    // server-stored identity has gone stale.
+    if let Err(error) = revalidate_engine_still_selected(&state.db, &plan.engine_id).await {
+        return Err(reject(
+            &state,
+            &claimed.plan_id,
+            plan.runtime_profile_id.clone(),
+            "engine_removed_or_changed",
+            error,
+        )
+        .await);
+    }
+
     let report = match susun_integration::system_prune(&engine, &plan.scopes, plan.all_images).await
     {
         Ok(report) => report,
@@ -805,14 +854,17 @@ mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-    /// Migration 0005 always seeds exactly this row on a fresh database.
-    const SEEDED_ENGINE_ID: &str = "engine-docker-local";
-
-    async fn disable_seeded_engine(state: &AppState) -> TestResult {
+    async fn insert_selected_runtime_profile(state: &AppState, id: &str) -> TestResult {
         let conn = state.db.connect()?;
         conn.execute(
-            "UPDATE engines SET enabled = 0 WHERE id = ?1",
-            params![SEEDED_ENGINE_ID.to_owned()],
+            "INSERT INTO runtime_profiles (
+                id, provider_id, provider_runtime_key, display_name, product, platform,
+                runtime_class, ownership_state, source,
+                installation_state, process_state, connection_state,
+                is_selected, observed_at_ms, created_at_ms, updated_at_ms
+            ) VALUES (?1, ?2, ?2, ?3, 'podman', 'windows', 'external_local', 'external',
+                'provider_discovery', 'installed', 'running', 'summarized', 1, 1, 1, 1)",
+            params![id.to_owned(), format!("key-{id}"), format!("Runtime {id}")],
         )
         .await?;
         Ok(())
@@ -829,23 +881,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_engine_id_rejects_a_disabled_engine() -> TestResult {
-        let state = test_state(fresh_db("engines-validate-disabled").await?);
-        disable_seeded_engine(&state).await?;
+    async fn validate_engine_id_accepts_the_platform_default_when_no_profile_is_selected()
+    -> TestResult {
+        let state = test_state(fresh_db("engines-validate-platform-default").await?);
 
-        let result = validate_engine_id(&state, SEEDED_ENGINE_ID).await;
+        let validated = validate_engine_id(&state, PLATFORM_DEFAULT_ENGINE_ID).await?;
 
-        assert!(matches!(result, Err(ApiError::ActionUnavailable(_))));
+        assert_eq!(validated.id, PLATFORM_DEFAULT_ENGINE_ID);
         Ok(())
     }
 
     #[tokio::test]
-    async fn validate_engine_id_accepts_a_known_enabled_engine() -> TestResult {
-        let state = test_state(fresh_db("engines-validate-known").await?);
+    async fn validate_engine_id_accepts_the_selected_runtime_profiles_own_id() -> TestResult {
+        let state = test_state(fresh_db("engines-validate-profile").await?);
+        insert_selected_runtime_profile(&state, "profile-podman-1").await?;
 
-        let validated = validate_engine_id(&state, SEEDED_ENGINE_ID).await?;
+        let validated = validate_engine_id(&state, "profile-podman-1").await?;
 
-        assert_eq!(validated.id, SEEDED_ENGINE_ID);
+        assert_eq!(validated.id, "profile-podman-1");
+        Ok(())
+    }
+
+    /// The regression this whole reconciliation exists to prevent: once a
+    /// Podman (or any non-default) profile is selected, the platform-default
+    /// id — the only id a caller could have gotten from before the switch,
+    /// or by guessing — must no longer resolve. Labeling Podman's data as
+    /// `engine-docker-local` would misrepresent which runtime it came from.
+    #[tokio::test]
+    async fn validate_engine_id_rejects_platform_default_once_another_engine_is_selected()
+    -> TestResult {
+        let state = test_state(fresh_db("engines-validate-stale-default").await?);
+        insert_selected_runtime_profile(&state, "profile-podman-1").await?;
+
+        let result = validate_engine_id(&state, PLATFORM_DEFAULT_ENGINE_ID).await;
+
+        assert!(matches!(result, Err(ApiError::EngineNotFound)));
         Ok(())
     }
 
@@ -871,7 +941,7 @@ mod tests {
         let mut rows = conn
             .query(
                 "SELECT last_health_json, last_health_at_ms FROM engines WHERE id = ?1",
-                params![SEEDED_ENGINE_ID.to_owned()],
+                params![PLATFORM_DEFAULT_ENGINE_ID.to_owned()],
             )
             .await?;
         let row = rows.next().await?.ok_or("seeded engine row missing")?;
@@ -903,6 +973,46 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(ApiError::EngineNotFound)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revalidate_engine_still_selected_accepts_when_nothing_changed() -> TestResult {
+        let state = test_state(fresh_db("engines-revalidate-unchanged").await?);
+
+        revalidate_engine_still_selected(&state.db, PLATFORM_DEFAULT_ENGINE_ID).await?;
+        Ok(())
+    }
+
+    /// Covers the specific gap this check closes: `commit_prune` always
+    /// reconnects to the exact profile pinned at preview time (by design,
+    /// so a later global selection switch never redirects an in-flight
+    /// prune), so a merely-different *global* selection cannot be caught by
+    /// the connect step or the identity fingerprint — both are scoped to
+    /// the pinned profile, not "whatever is selected now". This explicit
+    /// check is what rejects a commit whose server-stored engine id has
+    /// gone stale relative to the currently selected engine.
+    ///
+    /// The other half of "preview -> disable -> commit rejection" — the
+    /// *same* previewed profile becoming unavailable rather than a
+    /// different one being selected — is already covered by the pre-existing
+    /// `connect_engine_for_profile` step above this check: an unavailable
+    /// profile's `availability_state` makes `ManagementCapabilities::can_select`
+    /// false, `endpoint_for_profile` then returns `None`, and the connect
+    /// call fails outright before this check is ever reached.
+    #[tokio::test]
+    async fn revalidate_engine_still_selected_rejects_when_a_different_engine_is_now_selected()
+    -> TestResult {
+        let state = test_state(fresh_db("engines-revalidate-changed").await?);
+        // At preview time no profile was selected, so the plan's stored
+        // engine_id is the platform default.
+        let plan_engine_id = PLATFORM_DEFAULT_ENGINE_ID;
+        // Before commit, the user switches to a different runtime.
+        insert_selected_runtime_profile(&state, "profile-podman-1").await?;
+
+        let result = revalidate_engine_still_selected(&state.db, plan_engine_id).await;
+
+        assert!(result.is_err());
         Ok(())
     }
 }

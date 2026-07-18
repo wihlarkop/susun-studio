@@ -10,6 +10,18 @@ use turso::Database;
 
 use crate::susun_integration::enum_label;
 
+/// Typed failure for artifact-inventory operations, so a genuine provider
+/// fault (Docker/Podman itself failed — a 502) stays distinguishable from a
+/// fault in Studio's own database (a 500). Flattening both into one opaque
+/// string, as this module used to, loses that distinction for the caller.
+#[derive(Debug, thiserror::Error)]
+pub enum ArtifactError {
+    #[error("{0}")]
+    Provider(String),
+    #[error("database error: {0}")]
+    Database(#[from] turso::Error),
+}
+
 /// Studio-owned selected-runtime attribution attached to every engine-wide
 /// artifact response, so built-in and external runtimes stay distinguishable
 /// and external runtimes are never presented as Studio-owned.
@@ -28,7 +40,7 @@ pub struct RuntimeContextRow {
 pub async fn runtime_context(
     db: &Database,
     profile_id: Option<&str>,
-) -> Result<RuntimeContextRow, turso::Error> {
+) -> Result<RuntimeContextRow, ArtifactError> {
     let profile = match profile_id {
         Some(id) => crate::runtime::list_all_profiles(db)
             .await?
@@ -165,11 +177,11 @@ fn container_summary_row(
 pub async fn container_inventory(
     db: &Database,
     engine: &DockerCompatibleEngine,
-) -> Result<CapabilityResult<ContainerInventoryRow>, String> {
+) -> Result<CapabilityResult<ContainerInventoryRow>, ArtifactError> {
     let capabilities = engine
         .capabilities()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ArtifactError::Provider(error.to_string()))?;
     let capability = enum_label(capabilities.supports_container_inventory);
 
     if !capabilities.supports_container_inventory.is_supported() {
@@ -182,10 +194,8 @@ pub async fn container_inventory(
     let inventory = engine
         .container_inventory()
         .await
-        .map_err(|error| error.to_string())?;
-    let known = known_projects(db)
-        .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ArtifactError::Provider(error.to_string()))?;
+    let known = known_projects(db).await?;
     let data = Some(ContainerInventoryRow {
         observed_at_epoch_seconds: inventory.observed_at_epoch_seconds,
         containers: inventory
@@ -202,9 +212,12 @@ pub async fn container_inventory(
 /// Distinguishes "the provider doesn't support this at all" (an explicit
 /// capability state, never an error) from "the provider supports it but no
 /// such id exists" (a genuine 404) from an actual provider failure
-/// (propagated as `Err`, mapped to a 502 by the caller).
+/// (propagated as `Err`, mapped to a 502 by the caller). `Found` carries the
+/// real support level (`supported` vs `supported_subset`) rather than
+/// assuming full support — a caller that only reads partial data still
+/// deserves to know that, the same way the list endpoints already do.
 pub enum DetailLookup<T> {
-    Found(T),
+    Found { capability: String, value: T },
     Unsupported { capability: String },
     NotFound,
 }
@@ -214,27 +227,28 @@ pub async fn container_details(
     db: &Database,
     engine: &DockerCompatibleEngine,
     container_id: &str,
-) -> Result<DetailLookup<ContainerSummaryRow>, String> {
+) -> Result<DetailLookup<ContainerSummaryRow>, ArtifactError> {
     let capabilities = engine
         .capabilities()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ArtifactError::Provider(error.to_string()))?;
     let capability = enum_label(capabilities.supports_container_inventory);
     if !capabilities.supports_container_inventory.is_supported() {
         return Ok(DetailLookup::Unsupported { capability });
     }
 
     let id = ContainerId::new(container_id.to_owned())
-        .map_err(|_| "container id must not be empty".to_owned())?;
+        .map_err(|_| ArtifactError::Provider("container id must not be empty".to_owned()))?;
     match engine.container_details(&id).await {
         Ok(container) => {
-            let known = known_projects(db)
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(DetailLookup::Found(container_summary_row(&container, &known)))
+            let known = known_projects(db).await?;
+            Ok(DetailLookup::Found {
+                capability,
+                value: container_summary_row(&container, &known),
+            })
         }
         Err(EngineError::NotFound { .. }) => Ok(DetailLookup::NotFound),
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(ArtifactError::Provider(error.to_string())),
     }
 }
 
@@ -283,11 +297,11 @@ fn image_summary_row(image: &susun::EngineImageSummary) -> ImageSummaryRow {
 /// call failure on a supported provider propagates as `Err`.
 pub async fn image_inventory(
     engine: &DockerCompatibleEngine,
-) -> Result<CapabilityResult<ImageInventoryRow>, String> {
+) -> Result<CapabilityResult<ImageInventoryRow>, ArtifactError> {
     let capabilities = engine
         .capabilities()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ArtifactError::Provider(error.to_string()))?;
     let capability = enum_label(capabilities.supports_image_inventory);
 
     if !capabilities.supports_image_inventory.is_supported() {
@@ -300,7 +314,7 @@ pub async fn image_inventory(
     let inventory = engine
         .image_inventory()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ArtifactError::Provider(error.to_string()))?;
     let data = Some(ImageInventoryRow {
         observed_at_epoch_seconds: inventory.observed_at_epoch_seconds,
         images: inventory.images.iter().map(image_summary_row).collect(),
@@ -313,22 +327,25 @@ pub async fn image_inventory(
 pub async fn image_details(
     engine: &DockerCompatibleEngine,
     image_id: &str,
-) -> Result<DetailLookup<ImageSummaryRow>, String> {
+) -> Result<DetailLookup<ImageSummaryRow>, ArtifactError> {
     let capabilities = engine
         .capabilities()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ArtifactError::Provider(error.to_string()))?;
     let capability = enum_label(capabilities.supports_image_inventory);
     if !capabilities.supports_image_inventory.is_supported() {
         return Ok(DetailLookup::Unsupported { capability });
     }
 
-    let id =
-        ImageId::new(image_id.to_owned()).map_err(|_| "image id must not be empty".to_owned())?;
+    let id = ImageId::new(image_id.to_owned())
+        .map_err(|_| ArtifactError::Provider("image id must not be empty".to_owned()))?;
     match engine.image_details(&id).await {
-        Ok(image) => Ok(DetailLookup::Found(image_summary_row(&image))),
+        Ok(image) => Ok(DetailLookup::Found {
+            capability,
+            value: image_summary_row(&image),
+        }),
         Err(EngineError::NotFound { .. }) => Ok(DetailLookup::NotFound),
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(ArtifactError::Provider(error.to_string())),
     }
 }
 
@@ -341,17 +358,18 @@ pub struct BuildCacheStatusRow {
 
 pub async fn build_cache_status(
     engine: &DockerCompatibleEngine,
-) -> Result<BuildCacheStatusRow, String> {
+) -> Result<BuildCacheStatusRow, ArtifactError> {
     let capabilities = engine
         .capabilities()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ArtifactError::Provider(error.to_string()))?;
     let support = enum_label(capabilities.supports_build_cache);
 
     let scope = if capabilities.supports_build_cache.is_supported() {
         let preview =
             crate::susun_integration::cleanup_preview(engine, &["build_cache".to_owned()], false)
-                .await?;
+                .await
+                .map_err(ArtifactError::Provider)?;
         preview.scopes.into_iter().next()
     } else {
         None
@@ -373,11 +391,11 @@ pub struct RegistryCapabilityRow {
 
 pub async fn registry_capability(
     engine: &DockerCompatibleEngine,
-) -> Result<RegistryCapabilityRow, String> {
+) -> Result<RegistryCapabilityRow, ArtifactError> {
     let capabilities = engine
         .capabilities()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ArtifactError::Provider(error.to_string()))?;
     Ok(RegistryCapabilityRow {
         supports_pull: enum_label(capabilities.supports_registry_pull),
         supports_push: enum_label(capabilities.supports_registry_push),

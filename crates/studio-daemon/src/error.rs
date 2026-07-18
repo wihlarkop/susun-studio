@@ -5,7 +5,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::{db, logging};
+use crate::{artifact_inventory, db, logging};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -117,6 +117,20 @@ pub enum ApiError {
 impl From<susun::Error> for ApiError {
     fn from(error: susun::Error) -> Self {
         Self::InvalidImport(error.to_string())
+    }
+}
+
+/// A provider-side artifact-inventory failure is an engine fault (502); a
+/// database-side one is a daemon fault (500) — this conversion preserves
+/// that distinction instead of flattening both to the same status.
+impl From<artifact_inventory::ArtifactError> for ApiError {
+    fn from(error: artifact_inventory::ArtifactError) -> Self {
+        match error {
+            artifact_inventory::ArtifactError::Provider(message) => {
+                Self::EngineUnavailable(message)
+            }
+            artifact_inventory::ArtifactError::Database(source) => Self::Database(source),
+        }
     }
 }
 
