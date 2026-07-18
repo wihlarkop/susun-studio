@@ -5,7 +5,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::{db, logging};
+use crate::{artifact_inventory, db, logging};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -74,6 +74,12 @@ pub enum ApiError {
     #[error("runtime profile not found")]
     RuntimeProfileNotFound,
 
+    #[error("engine not found")]
+    EngineNotFound,
+
+    #[error("artifact not found")]
+    ArtifactNotFound,
+
     #[error("planning failed: {0}")]
     PlanningFailed(String),
 
@@ -114,6 +120,20 @@ impl From<susun::Error> for ApiError {
     }
 }
 
+/// A provider-side artifact-inventory failure is an engine fault (502); a
+/// database-side one is a daemon fault (500) — this conversion preserves
+/// that distinction instead of flattening both to the same status.
+impl From<artifact_inventory::ArtifactError> for ApiError {
+    fn from(error: artifact_inventory::ArtifactError) -> Self {
+        match error {
+            artifact_inventory::ArtifactError::Provider(message) => {
+                Self::EngineUnavailable(message)
+            }
+            artifact_inventory::ArtifactError::Database(source) => Self::Database(source),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
@@ -133,7 +153,9 @@ impl IntoResponse for ApiError {
             | Self::JobNotFound
             | Self::ServiceNotFound
             | Self::WatchNotFound
-            | Self::RuntimeProfileNotFound => StatusCode::NOT_FOUND,
+            | Self::RuntimeProfileNotFound
+            | Self::EngineNotFound
+            | Self::ArtifactNotFound => StatusCode::NOT_FOUND,
             Self::EngineUnavailable(_) => StatusCode::BAD_GATEWAY,
             Self::InvalidImport(_)
             | Self::PlanningFailed(_)

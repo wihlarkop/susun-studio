@@ -1,6 +1,7 @@
 mod action_audit;
 mod action_plans;
 mod archive_safety;
+mod artifact_inventory;
 mod auth;
 mod backup;
 mod config;
@@ -15,6 +16,8 @@ mod routes;
 mod runtime;
 mod state;
 mod susun_integration;
+#[cfg(test)]
+mod test_support;
 mod watch;
 
 use std::sync::Arc;

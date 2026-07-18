@@ -1,3 +1,4 @@
+mod artifacts;
 mod backup;
 mod diagnostics;
 mod engines;
@@ -90,6 +91,30 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/v1/engines/prune/commit/{plan_id}",
             post(engines::commit_prune),
+        )
+        .route(
+            "/v1/engines/{id}/containers",
+            get(artifacts::list_engine_containers),
+        )
+        .route(
+            "/v1/engines/{id}/containers/{container_id}",
+            get(artifacts::read_engine_container),
+        )
+        .route(
+            "/v1/engines/{id}/images",
+            get(artifacts::list_engine_images),
+        )
+        .route(
+            "/v1/engines/{id}/images/{image_id}",
+            get(artifacts::read_engine_image),
+        )
+        .route(
+            "/v1/engines/{id}/build-cache",
+            get(artifacts::engine_build_cache_status),
+        )
+        .route(
+            "/v1/engines/{id}/registry",
+            get(artifacts::engine_registry_capability),
         )
         .route("/v1/runtime/status", get(runtime::runtime_status))
         .route("/v1/runtime/logs", get(runtime::runtime_logs))

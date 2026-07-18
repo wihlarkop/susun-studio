@@ -314,7 +314,7 @@ pub async fn engine_capabilities(engine: &BollardEngine) -> Result<EngineCapabil
 }
 
 /// Serializes a serde enum (SupportLevel, MountType) to its snake_case string.
-fn enum_label<T: serde::Serialize>(value: T) -> String {
+pub(crate) fn enum_label<T: serde::Serialize>(value: T) -> String {
     serde_json::to_value(value)
         .ok()
         .and_then(|json| json.as_str().map(str::to_owned))
