@@ -8,6 +8,7 @@
   import ActiveEngineStrip from "$lib/components/active-engine-strip.svelte";
   import JobsPage from "$lib/components/jobs-page.svelte";
   import RuntimePage from "$lib/components/runtime-page.svelte";
+  import ArtifactsPage from "$lib/components/artifacts-page.svelte";
   import SettingsPage from "$lib/components/settings-page.svelte";
   import ImportProjectDialog from "$lib/components/import-project-dialog.svelte";
   import BetaOnboardingPanel from "$lib/components/beta-onboarding-panel.svelte";
@@ -16,7 +17,7 @@
 
   const daemonState = createDaemonState();
   let importDialogOpen = $state(false);
-  let activeView = $state<"projects" | "jobs" | "runtime" | "settings">("projects");
+  let activeView = $state<"projects" | "jobs" | "runtime" | "artifacts" | "settings">("projects");
   let selectedProjectId = $state<string | null>(null);
   const selectedProject = $derived(
     daemonState.projects.find((project) => project.id === selectedProjectId) ??
@@ -73,7 +74,9 @@
         ? "Jobs"
         : activeView === "runtime"
           ? "Runtime"
-          : "Settings",
+          : activeView === "artifacts"
+            ? "Artifacts"
+            : "Settings",
   );
 </script>
 
@@ -131,6 +134,12 @@
         <JobsPage projects={daemonState.projects} />
       {:else if activeView === "runtime"}
         <RuntimePage />
+      {:else if activeView === "artifacts"}
+        <ArtifactsPage
+          profiles={daemonState.runtimeProfiles}
+          connected={daemonState.healthState.kind === "connected"}
+          projects={daemonState.projects}
+        />
       {:else}
         <SettingsPage />
       {/if}
