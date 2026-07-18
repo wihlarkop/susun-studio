@@ -13,8 +13,17 @@
   } from "$lib/daemon/client";
   import { resolveArtifactViewState } from "$lib/artifacts/workspace-state";
   import { toArtifactRequestError } from "$lib/artifacts/fetch-error";
+  import { capabilityLabel } from "$lib/artifacts/capability";
+  import {
+    applyLoadError,
+    applyLoadSuccess,
+    applyNotConnected,
+    initialScopedFetchState,
+    resetForNewEngine,
+    withLoading,
+  } from "$lib/artifacts/scoped-fetch";
+  import { scopedDetailKey, toDetailEntry, type ScopedDetailEntry } from "$lib/artifacts/scoped-detail";
   import { formatBytes, relativeTime } from "$lib/utils";
-  import type { ArtifactRequestError } from "$lib/artifacts/workspace-state";
 
   let {
     engineId,
@@ -26,82 +35,121 @@
     return projects.find((project) => project.id === projectId)?.name ?? projectId;
   }
 
-  let response = $state<EngineContainerInventoryResponse | null>(null);
-  let loading = $state(false);
-  let error = $state<ArtifactRequestError | null>(null);
+  let fetchState = $state(initialScopedFetchState<EngineContainerInventoryResponse>());
   let expandedId = $state<string | null>(null);
-  let detailCache = $state<Record<string, ContainerArtifactSummary | "unsupported">>({});
-  let detailError = $state<string | null>(null);
+  let detailCache = $state<Record<string, ScopedDetailEntry<ContainerArtifactSummary>>>({});
+  let detailController: AbortController | null = null;
 
-  async function load(id: string, isConnected: boolean, signal: AbortSignal) {
+  async function load(id: string, isConnected: boolean, signal: AbortSignal, generation: number) {
     if (!isConnected) {
-      loading = false;
+      fetchState = applyNotConnected(fetchState, generation);
       return;
     }
-    loading = true;
+    fetchState = withLoading(fetchState);
     try {
       const result = await readEngineContainers(id, { signal });
       if (signal.aborted) return;
-      response = result;
-      error = null;
+      fetchState = applyLoadSuccess(fetchState, generation, result);
     } catch (caught) {
       if (signal.aborted) return;
-      error = toArtifactRequestError(caught);
-    } finally {
-      if (!signal.aborted) loading = false;
+      fetchState = applyLoadError(fetchState, generation, toArtifactRequestError(caught));
     }
   }
 
   $effect(() => {
     const id = engineId;
     const isConnected = connected;
+
+    // Engine changed (or this is the first run): every piece of state scoped
+    // to the previous engine is cleared synchronously, before the new
+    // engine's data is requested, so the old engine's containers, errors,
+    // expanded row, and cached detail can never render underneath the new
+    // engine's header.
+    fetchState = resetForNewEngine(fetchState);
+    detailController?.abort();
+    detailController = null;
+    detailCache = {};
+    expandedId = null;
+    const generation = fetchState.generation;
+
     const controller = new AbortController();
-    void load(id, isConnected, controller.signal);
+    void load(id, isConnected, controller.signal, generation);
     return () => controller.abort();
+  });
+
+  // Detail requests are triggered by row clicks, not the effect above, so
+  // they need their own cleanup hook to be aborted on component teardown.
+  $effect(() => {
+    return () => detailController?.abort();
   });
 
   const viewState = $derived(
     resolveArtifactViewState({
       connected,
-      loading,
-      hasData: response !== null,
-      error,
-      capability: response?.capability ?? null,
-      itemCount: response?.containers.length ?? null,
+      loading: fetchState.loading,
+      hasData: fetchState.data !== null,
+      error: fetchState.error,
+      capability: fetchState.data?.capability ?? null,
+      itemCount: fetchState.data?.containers.length ?? null,
     }),
   );
 
-  async function toggleDetail(containerId: string) {
+  async function toggleDetail(id: string, containerId: string) {
     if (expandedId === containerId) {
       expandedId = null;
       return;
     }
     expandedId = containerId;
-    detailError = null;
-    if (detailCache[containerId] !== undefined) return;
+    const key = scopedDetailKey(id, containerId);
+    if (detailCache[key] !== undefined) return;
+
+    detailController?.abort();
+    const controller = new AbortController();
+    detailController = controller;
+    const generation = fetchState.generation;
     try {
-      const detail = await readEngineContainer(engineId, containerId);
+      const detail = await readEngineContainer(id, containerId, { signal: controller.signal });
+      if (controller.signal.aborted || generation !== fetchState.generation) return;
       detailCache = {
         ...detailCache,
-        [containerId]: detail.container ?? "unsupported",
+        [key]: toDetailEntry({ capability: detail.capability, value: detail.container }),
       };
     } catch (caught) {
-      detailError = toArtifactRequestError(caught).message;
+      if (controller.signal.aborted || generation !== fetchState.generation) return;
+      detailCache = {
+        ...detailCache,
+        [key]: { kind: "error", message: toArtifactRequestError(caught).message },
+      };
     }
   }
 </script>
 
 {#if viewState.kind === "ready" || viewState.kind === "refreshing" || viewState.kind === "stale"}
   <div class="flex flex-col gap-2">
-    <div class="flex items-center justify-between gap-2">
-      <p class="text-xs text-muted-foreground">
-        {response?.containers.length ?? 0} container{response?.containers.length === 1 ? "" : "s"}
-        {#if response?.observed_at_epoch_seconds}
-          · observed {relativeTime(response.observed_at_epoch_seconds * 1000)}
+    <div class="flex flex-wrap items-center justify-between gap-2">
+      <div class="flex items-center gap-2">
+        <p class="text-xs text-muted-foreground">
+          {fetchState.data?.containers.length ?? 0} container{fetchState.data?.containers.length === 1
+            ? ""
+            : "s"}
+          {#if fetchState.data?.observed_at_epoch_seconds}
+            · observed {relativeTime(fetchState.data.observed_at_epoch_seconds * 1000)}
+          {/if}
+        </p>
+        {#if fetchState.data}
+          <StatusBadge
+            status={fetchState.data.capability}
+            label={capabilityLabel(fetchState.data.capability)}
+          />
         {/if}
-      </p>
-      <Button size="sm" variant="outline" disabled={loading} onclick={() => load(engineId, connected, new AbortController().signal)}>
-        <RefreshCw class={loading ? "animate-spin" : undefined} />
+      </div>
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={fetchState.loading}
+        onclick={() => load(engineId, connected, new AbortController().signal, fetchState.generation)}
+      >
+        <RefreshCw class={fetchState.loading ? "animate-spin" : undefined} />
         Refresh
       </Button>
     </div>
@@ -124,8 +172,8 @@
         </Table.Row>
       </Table.Header>
       <Table.Body>
-        {#each response?.containers ?? [] as container (container.id)}
-          <Table.Row class="cursor-pointer" onclick={() => toggleDetail(container.id)}>
+        {#each fetchState.data?.containers ?? [] as container (container.id)}
+          <Table.Row class="cursor-pointer" onclick={() => toggleDetail(engineId, container.id)}>
             <Table.Cell class="max-w-48 truncate font-medium" title={container.name}>
               {container.name}
             </Table.Cell>
@@ -137,7 +185,10 @@
                 {/if}
               </div>
             </Table.Cell>
-            <Table.Cell class="max-w-56 truncate text-muted-foreground" title={container.image_reference ?? undefined}>
+            <Table.Cell
+              class="max-w-56 truncate text-muted-foreground"
+              title={container.image_reference ?? undefined}
+            >
               {container.image_reference ?? "—"}
             </Table.Cell>
             <Table.Cell class="max-w-40 truncate text-muted-foreground">
@@ -157,26 +208,36 @@
           {#if expandedId === container.id}
             <Table.Row>
               <Table.Cell colspan={6} class="bg-muted/40 whitespace-normal">
-                {@const detail = detailCache[container.id]}
+                {@const entry = detailCache[scopedDetailKey(engineId, container.id)]}
                 <div class="flex flex-col gap-2 py-1 text-xs">
-                  {#if detailError}
-                    <p class="text-destructive">{detailError}</p>
-                  {:else if detail === undefined}
+                  {#if entry === undefined}
                     <p class="text-muted-foreground">Loading detail…</p>
-                  {:else if detail === "unsupported"}
-                    <p class="text-muted-foreground">
-                      Detail isn't available for this container on this engine.
-                    </p>
+                  {:else if entry.kind === "error"}
+                    <p class="text-destructive">{entry.message}</p>
+                  {:else if entry.kind === "unsupported"}
+                    <div class="flex items-center gap-2">
+                      <StatusBadge status={entry.capability} label={capabilityLabel(entry.capability)} />
+                      <span class="text-muted-foreground">
+                        Detail isn't available for this container on this engine.
+                      </span>
+                    </div>
                   {:else}
+                    <StatusBadge status={entry.capability} label={capabilityLabel(entry.capability)} />
                     <div class="grid grid-cols-2 gap-x-6 gap-y-1 md:grid-cols-3">
-                      <div><span class="text-muted-foreground">Container id</span><br />
-                        <span class="font-mono">{detail.id}</span></div>
-                      <div><span class="text-muted-foreground">Root filesystem</span><br />
-                        {detail.root_filesystem_size_bytes !== null
-                          ? formatBytes(detail.root_filesystem_size_bytes)
-                          : "—"}</div>
-                      <div><span class="text-muted-foreground">Label keys</span><br />
-                        {detail.label_keys.length > 0 ? detail.label_keys.join(", ") : "none"}</div>
+                      <div>
+                        <span class="text-muted-foreground">Container id</span><br />
+                        <span class="font-mono">{entry.value.id}</span>
+                      </div>
+                      <div>
+                        <span class="text-muted-foreground">Root filesystem</span><br />
+                        {entry.value.root_filesystem_size_bytes !== null
+                          ? formatBytes(entry.value.root_filesystem_size_bytes)
+                          : "—"}
+                      </div>
+                      <div>
+                        <span class="text-muted-foreground">Label keys</span><br />
+                        {entry.value.label_keys.length > 0 ? entry.value.label_keys.join(", ") : "none"}
+                      </div>
                     </div>
                   {/if}
                 </div>
@@ -191,6 +252,6 @@
   <ArtifactsStateBanner
     state={viewState}
     itemNoun="containers"
-    onRetry={() => load(engineId, connected, new AbortController().signal)}
+    onRetry={() => load(engineId, connected, new AbortController().signal, fetchState.generation)}
   />
 {/if}

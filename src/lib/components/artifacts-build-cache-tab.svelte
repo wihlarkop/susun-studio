@@ -7,49 +7,58 @@
   import { resolveArtifactViewState } from "$lib/artifacts/workspace-state";
   import { toArtifactRequestError } from "$lib/artifacts/fetch-error";
   import { capabilityLabel } from "$lib/artifacts/capability";
+  import {
+    applyLoadError,
+    applyLoadSuccess,
+    applyNotConnected,
+    initialScopedFetchState,
+    resetForNewEngine,
+    withLoading,
+  } from "$lib/artifacts/scoped-fetch";
   import { formatBytes } from "$lib/utils";
-  import type { ArtifactRequestError } from "$lib/artifacts/workspace-state";
 
   let { engineId, connected }: { engineId: string; connected: boolean } = $props();
 
-  let response = $state<BuildCacheStatusResponse | null>(null);
-  let loading = $state(false);
-  let error = $state<ArtifactRequestError | null>(null);
+  let fetchState = $state(initialScopedFetchState<BuildCacheStatusResponse>());
 
-  async function load(id: string, isConnected: boolean, signal: AbortSignal) {
+  async function load(id: string, isConnected: boolean, signal: AbortSignal, generation: number) {
     if (!isConnected) {
-      loading = false;
+      fetchState = applyNotConnected(fetchState, generation);
       return;
     }
-    loading = true;
+    fetchState = withLoading(fetchState);
     try {
       const result = await readEngineBuildCacheStatus(id, { signal });
       if (signal.aborted) return;
-      response = result;
-      error = null;
+      fetchState = applyLoadSuccess(fetchState, generation, result);
     } catch (caught) {
       if (signal.aborted) return;
-      error = toArtifactRequestError(caught);
-    } finally {
-      if (!signal.aborted) loading = false;
+      fetchState = applyLoadError(fetchState, generation, toArtifactRequestError(caught));
     }
   }
 
   $effect(() => {
     const id = engineId;
     const isConnected = connected;
+
+    // Engine changed (or first run): clear the previous engine's status
+    // before requesting the new one's, so it can never render underneath
+    // the new engine's header.
+    fetchState = resetForNewEngine(fetchState);
+    const generation = fetchState.generation;
+
     const controller = new AbortController();
-    void load(id, isConnected, controller.signal);
+    void load(id, isConnected, controller.signal, generation);
     return () => controller.abort();
   });
 
   const viewState = $derived(
     resolveArtifactViewState({
       connected,
-      loading,
-      hasData: response !== null,
-      error,
-      capability: response?.support ?? null,
+      loading: fetchState.loading,
+      hasData: fetchState.data !== null,
+      error: fetchState.error,
+      capability: fetchState.data?.support ?? null,
       itemCount: null,
     }),
   );
@@ -60,17 +69,20 @@
     <div class="flex items-center justify-between gap-2">
       <div class="flex items-center gap-2">
         <span class="text-sm font-medium">Build cache</span>
-        {#if response}
-          <StatusBadge status={response.support} label={capabilityLabel(response.support)} />
+        {#if fetchState.data}
+          <StatusBadge
+            status={fetchState.data.support}
+            label={capabilityLabel(fetchState.data.support)}
+          />
         {/if}
       </div>
       <Button
         size="sm"
         variant="outline"
-        disabled={loading}
-        onclick={() => load(engineId, connected, new AbortController().signal)}
+        disabled={fetchState.loading}
+        onclick={() => load(engineId, connected, new AbortController().signal, fetchState.generation)}
       >
-        <RefreshCw class={loading ? "animate-spin" : undefined} />
+        <RefreshCw class={fetchState.loading ? "animate-spin" : undefined} />
         Refresh
       </Button>
     </div>
@@ -81,29 +93,31 @@
       </p>
     {/if}
 
-    {#if response?.usage}
+    {#if fetchState.data?.usage}
       <div class="grid grid-cols-2 gap-2 md:grid-cols-4">
         <div class="rounded-md border p-3">
           <div class="text-xs font-medium text-muted-foreground">Candidates</div>
           <div class="mt-1 font-semibold tabular-nums">
-            {response.usage.candidate_count ?? "unknown"}
+            {fetchState.data.usage.candidate_count ?? "unknown"}
           </div>
         </div>
         <div class="rounded-md border p-3">
           <div class="text-xs font-medium text-muted-foreground">Reclaimable</div>
           <div class="mt-1 font-semibold tabular-nums">
-            {response.usage.reclaimable_bytes !== null
-              ? formatBytes(response.usage.reclaimable_bytes)
+            {fetchState.data.usage.reclaimable_bytes !== null
+              ? formatBytes(fetchState.data.usage.reclaimable_bytes)
               : "unknown"}
           </div>
         </div>
         <div class="rounded-md border p-3">
           <div class="text-xs font-medium text-muted-foreground">Estimate</div>
-          <div class="mt-1 font-semibold">{response.usage.estimate_kind.replaceAll("_", " ")}</div>
+          <div class="mt-1 font-semibold">
+            {fetchState.data.usage.estimate_kind.replaceAll("_", " ")}
+          </div>
         </div>
         <div class="rounded-md border p-3">
           <div class="text-xs font-medium text-muted-foreground">Scope support</div>
-          <div class="mt-1 font-semibold">{capabilityLabel(response.usage.support)}</div>
+          <div class="mt-1 font-semibold">{capabilityLabel(fetchState.data.usage.support)}</div>
         </div>
       </div>
     {:else}
@@ -120,6 +134,6 @@
   <ArtifactsStateBanner
     state={viewState}
     itemNoun="build-cache status"
-    onRetry={() => load(engineId, connected, new AbortController().signal)}
+    onRetry={() => load(engineId, connected, new AbortController().signal, fetchState.generation)}
   />
 {/if}

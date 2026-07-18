@@ -7,38 +7,47 @@
   import { resolveArtifactViewState } from "$lib/artifacts/workspace-state";
   import { toArtifactRequestError } from "$lib/artifacts/fetch-error";
   import { capabilityLabel } from "$lib/artifacts/capability";
-  import type { ArtifactRequestError } from "$lib/artifacts/workspace-state";
+  import {
+    applyLoadError,
+    applyLoadSuccess,
+    applyNotConnected,
+    initialScopedFetchState,
+    resetForNewEngine,
+    withLoading,
+  } from "$lib/artifacts/scoped-fetch";
 
   let { engineId, connected }: { engineId: string; connected: boolean } = $props();
 
-  let response = $state<RegistryCapabilityResponse | null>(null);
-  let loading = $state(false);
-  let error = $state<ArtifactRequestError | null>(null);
+  let fetchState = $state(initialScopedFetchState<RegistryCapabilityResponse>());
 
-  async function load(id: string, isConnected: boolean, signal: AbortSignal) {
+  async function load(id: string, isConnected: boolean, signal: AbortSignal, generation: number) {
     if (!isConnected) {
-      loading = false;
+      fetchState = applyNotConnected(fetchState, generation);
       return;
     }
-    loading = true;
+    fetchState = withLoading(fetchState);
     try {
       const result = await readEngineRegistryCapability(id, { signal });
       if (signal.aborted) return;
-      response = result;
-      error = null;
+      fetchState = applyLoadSuccess(fetchState, generation, result);
     } catch (caught) {
       if (signal.aborted) return;
-      error = toArtifactRequestError(caught);
-    } finally {
-      if (!signal.aborted) loading = false;
+      fetchState = applyLoadError(fetchState, generation, toArtifactRequestError(caught));
     }
   }
 
   $effect(() => {
     const id = engineId;
     const isConnected = connected;
+
+    // Engine changed (or first run): clear the previous engine's
+    // capabilities before requesting the new one's, so they can never
+    // render underneath the new engine's header.
+    fetchState = resetForNewEngine(fetchState);
+    const generation = fetchState.generation;
+
     const controller = new AbortController();
-    void load(id, isConnected, controller.signal);
+    void load(id, isConnected, controller.signal, generation);
     return () => controller.abort();
   });
 
@@ -49,20 +58,20 @@
   const viewState = $derived(
     resolveArtifactViewState({
       connected,
-      loading,
-      hasData: response !== null,
-      error,
+      loading: fetchState.loading,
+      hasData: fetchState.data !== null,
+      error: fetchState.error,
       capability: null,
       itemCount: null,
     }),
   );
 
   const flags = $derived(
-    response
+    fetchState.data
       ? [
-          { label: "Pull", support: response.supports_pull },
-          { label: "Push", support: response.supports_push },
-          { label: "Auth", support: response.supports_auth },
+          { label: "Pull", support: fetchState.data.supports_pull },
+          { label: "Push", support: fetchState.data.supports_push },
+          { label: "Auth", support: fetchState.data.supports_auth },
         ]
       : [],
   );
@@ -75,10 +84,10 @@
       <Button
         size="sm"
         variant="outline"
-        disabled={loading}
-        onclick={() => load(engineId, connected, new AbortController().signal)}
+        disabled={fetchState.loading}
+        onclick={() => load(engineId, connected, new AbortController().signal, fetchState.generation)}
       >
-        <RefreshCw class={loading ? "animate-spin" : undefined} />
+        <RefreshCw class={fetchState.loading ? "animate-spin" : undefined} />
         Refresh
       </Button>
     </div>
@@ -107,6 +116,6 @@
   <ArtifactsStateBanner
     state={viewState}
     itemNoun="registry capabilities"
-    onRetry={() => load(engineId, connected, new AbortController().signal)}
+    onRetry={() => load(engineId, connected, new AbortController().signal, fetchState.generation)}
   />
 {/if}
