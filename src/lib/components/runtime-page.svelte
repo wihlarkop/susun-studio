@@ -29,6 +29,7 @@
     type RuntimeStatus,
     type TrustedRuntimePlan,
   } from "$lib/daemon/client";
+  import { resolveActiveEngineId } from "$lib/engine-identity";
   import {
     AlertCircle,
     ArrowRightLeft,
@@ -855,7 +856,7 @@
     oncompleted={() => refresh()}
   />
   <PruneDialog
-    engineId="engine-docker-local"
+    engineId={resolveActiveEngineId(pruneProfile?.id)}
     runtimeName={pruneProfile
       ? `${pruneProfile.display_name} (${pruneProfile.provider_runtime_key})`
       : undefined}

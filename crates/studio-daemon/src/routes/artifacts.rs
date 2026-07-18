@@ -9,12 +9,12 @@ use axum::{
 };
 use serde::Serialize;
 
-use super::engines::validate_engine_id;
+use super::engines::resolve_and_validate_engine;
 use crate::{
     artifact_inventory::{self, DetailLookup, RuntimeContextRow},
     auth::authorize,
     error::ApiError,
-    logging, runtime,
+    logging,
     state::AppState,
     susun_integration,
 };
@@ -40,25 +40,35 @@ impl From<RuntimeContextRow> for ArtifactRuntimeContext {
     }
 }
 
+/// Resolves and validates `requested_engine_id` exactly once, then connects
+/// using that same resolution's `runtime_profile_id` — never a fresh
+/// `attribution_for` call. Resolving twice (once to validate the path, once
+/// to connect) would open a race: a concurrent profile switch between the
+/// two queries could validate one engine's identity while actually
+/// connecting to a different one.
 async fn connect_selected_engine(
     state: &AppState,
+    requested_engine_id: &str,
 ) -> Result<
     (
         susun::DockerCompatibleEngine,
-        Option<String>,
+        String,
         ArtifactRuntimeContext,
     ),
     ApiError,
 > {
-    let (runtime_profile_id, _) = runtime::attribution_for(&state.db, None).await?;
-    let engine =
-        susun_integration::connect_engine_for_profile(&state.db, runtime_profile_id.as_deref())
-            .await
-            .map_err(ApiError::EngineUnavailable)?;
-    let runtime_ctx = artifact_inventory::runtime_context(&state.db, runtime_profile_id.as_deref())
-        .await?
-        .into();
-    Ok((engine, runtime_profile_id, runtime_ctx))
+    let resolved = resolve_and_validate_engine(state, requested_engine_id).await?;
+    let engine = susun_integration::connect_engine_for_profile(
+        &state.db,
+        resolved.runtime_profile_id.as_deref(),
+    )
+    .await
+    .map_err(ApiError::EngineUnavailable)?;
+    let runtime_ctx =
+        artifact_inventory::runtime_context(&state.db, resolved.runtime_profile_id.as_deref())
+            .await?
+            .into();
+    Ok((engine, resolved.engine_id, runtime_ctx))
 }
 
 #[derive(Debug, Serialize)]
@@ -109,8 +119,7 @@ pub async fn list_engine_containers(
     Path(engine_id): Path<String>,
 ) -> Result<Json<EngineContainerInventoryResponse>, ApiError> {
     authorize(&state, &headers)?;
-    let engine_id = validate_engine_id(&state, &engine_id).await?.id;
-    let (engine, _, runtime_ctx) = connect_selected_engine(&state).await?;
+    let (engine, engine_id, runtime_ctx) = connect_selected_engine(&state, &engine_id).await?;
 
     let result = artifact_inventory::container_inventory(&state.db, &engine).await?;
 
@@ -189,8 +198,7 @@ pub async fn read_engine_container(
     Path((engine_id, container_id)): Path<(String, String)>,
 ) -> Result<Json<ContainerArtifactDetailResponse>, ApiError> {
     authorize(&state, &headers)?;
-    let engine_id = validate_engine_id(&state, &engine_id).await?.id;
-    let (engine, _, runtime_ctx) = connect_selected_engine(&state).await?;
+    let (engine, engine_id, runtime_ctx) = connect_selected_engine(&state, &engine_id).await?;
 
     let lookup = artifact_inventory::container_details(&state.db, &engine, &container_id).await?;
 
@@ -244,8 +252,7 @@ pub async fn list_engine_images(
     Path(engine_id): Path<String>,
 ) -> Result<Json<EngineImageInventoryResponse>, ApiError> {
     authorize(&state, &headers)?;
-    let engine_id = validate_engine_id(&state, &engine_id).await?.id;
-    let (engine, _, runtime_ctx) = connect_selected_engine(&state).await?;
+    let (engine, engine_id, runtime_ctx) = connect_selected_engine(&state, &engine_id).await?;
 
     let result = artifact_inventory::image_inventory(&engine).await?;
 
@@ -323,8 +330,7 @@ pub async fn read_engine_image(
     Path((engine_id, image_id)): Path<(String, String)>,
 ) -> Result<Json<ImageArtifactDetailResponse>, ApiError> {
     authorize(&state, &headers)?;
-    let engine_id = validate_engine_id(&state, &engine_id).await?.id;
-    let (engine, _, runtime_ctx) = connect_selected_engine(&state).await?;
+    let (engine, engine_id, runtime_ctx) = connect_selected_engine(&state, &engine_id).await?;
 
     let lookup = artifact_inventory::image_details(&engine, &image_id).await?;
 
@@ -358,8 +364,7 @@ pub async fn engine_build_cache_status(
     Path(engine_id): Path<String>,
 ) -> Result<Json<BuildCacheStatusResponse>, ApiError> {
     authorize(&state, &headers)?;
-    let engine_id = validate_engine_id(&state, &engine_id).await?.id;
-    let (engine, _, runtime_ctx) = connect_selected_engine(&state).await?;
+    let (engine, engine_id, runtime_ctx) = connect_selected_engine(&state, &engine_id).await?;
 
     let status = artifact_inventory::build_cache_status(&engine).await?;
 
@@ -394,8 +399,7 @@ pub async fn engine_registry_capability(
     Path(engine_id): Path<String>,
 ) -> Result<Json<RegistryCapabilityResponse>, ApiError> {
     authorize(&state, &headers)?;
-    let engine_id = validate_engine_id(&state, &engine_id).await?.id;
-    let (engine, _, runtime_ctx) = connect_selected_engine(&state).await?;
+    let (engine, engine_id, runtime_ctx) = connect_selected_engine(&state, &engine_id).await?;
 
     let capability = artifact_inventory::registry_capability(&engine).await?;
 
