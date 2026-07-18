@@ -9,8 +9,9 @@ use axum::{
 };
 use serde::Serialize;
 
+use super::engines::validate_engine_id;
 use crate::{
-    artifact_inventory::{self, RuntimeContextRow},
+    artifact_inventory::{self, DetailLookup, RuntimeContextRow},
     auth::authorize,
     error::ApiError,
     logging, runtime,
@@ -55,7 +56,7 @@ async fn connect_selected_engine(
             .await
             .map_err(ApiError::EngineUnavailable)?;
     let runtime_ctx = artifact_inventory::runtime_context(&state.db, runtime_profile_id.as_deref())
-        .await
+        .await?
         .into();
     Ok((engine, runtime_profile_id, runtime_ctx))
 }
@@ -108,6 +109,7 @@ pub async fn list_engine_containers(
     Path(engine_id): Path<String>,
 ) -> Result<Json<EngineContainerInventoryResponse>, ApiError> {
     authorize(&state, &headers)?;
+    let engine_id = validate_engine_id(&state, &engine_id).await?.id;
     let (engine, _, runtime_ctx) = connect_selected_engine(&state).await?;
 
     let result = artifact_inventory::container_inventory(&state.db, &engine)
@@ -150,7 +152,37 @@ pub async fn list_engine_containers(
 pub struct ContainerArtifactDetailResponse {
     pub engine_id: String,
     pub runtime: ArtifactRuntimeContext,
-    pub container: ContainerArtifactSummary,
+    /// SDK support level for engine-wide container inventory on this
+    /// provider. `container` is only ever absent when this reads
+    /// "unsupported" — a missing id on a supported provider is a 404, not a
+    /// null field.
+    pub capability: String,
+    pub container: Option<ContainerArtifactSummary>,
+}
+
+/// Maps a capability-gated detail lookup to its response shape. Pulled out
+/// as a pure function so the Found/Unsupported/NotFound mapping can be
+/// tested directly, without needing a live engine connection.
+fn container_detail_response(
+    engine_id: String,
+    runtime_ctx: ArtifactRuntimeContext,
+    lookup: DetailLookup<artifact_inventory::ContainerSummaryRow>,
+) -> Result<ContainerArtifactDetailResponse, ApiError> {
+    match lookup {
+        DetailLookup::Found(container) => Ok(ContainerArtifactDetailResponse {
+            engine_id,
+            runtime: runtime_ctx,
+            capability: "supported".to_owned(),
+            container: Some(container.into()),
+        }),
+        DetailLookup::Unsupported { capability } => Ok(ContainerArtifactDetailResponse {
+            engine_id,
+            runtime: runtime_ctx,
+            capability,
+            container: None,
+        }),
+        DetailLookup::NotFound => Err(ApiError::ArtifactNotFound),
+    }
 }
 
 pub async fn read_engine_container(
@@ -159,17 +191,18 @@ pub async fn read_engine_container(
     Path((engine_id, container_id)): Path<(String, String)>,
 ) -> Result<Json<ContainerArtifactDetailResponse>, ApiError> {
     authorize(&state, &headers)?;
+    let engine_id = validate_engine_id(&state, &engine_id).await?.id;
     let (engine, _, runtime_ctx) = connect_selected_engine(&state).await?;
 
-    let container = artifact_inventory::container_details(&state.db, &engine, &container_id)
+    let lookup = artifact_inventory::container_details(&state.db, &engine, &container_id)
         .await
-        .map_err(ApiError::ActionUnavailable)?;
+        .map_err(ApiError::EngineUnavailable)?;
 
-    Ok(Json(ContainerArtifactDetailResponse {
+    Ok(Json(container_detail_response(
         engine_id,
-        runtime: runtime_ctx,
-        container: container.into(),
-    }))
+        runtime_ctx,
+        lookup,
+    )?))
 }
 
 #[derive(Debug, Serialize)]
@@ -215,6 +248,7 @@ pub async fn list_engine_images(
     Path(engine_id): Path<String>,
 ) -> Result<Json<EngineImageInventoryResponse>, ApiError> {
     authorize(&state, &headers)?;
+    let engine_id = validate_engine_id(&state, &engine_id).await?.id;
     let (engine, _, runtime_ctx) = connect_selected_engine(&state).await?;
 
     let result = artifact_inventory::image_inventory(&engine)
@@ -257,7 +291,36 @@ pub async fn list_engine_images(
 pub struct ImageArtifactDetailResponse {
     pub engine_id: String,
     pub runtime: ArtifactRuntimeContext,
-    pub image: ImageArtifactSummary,
+    /// SDK support level for engine-wide image inventory on this provider.
+    /// `image` is only ever absent when this reads "unsupported" — a
+    /// missing id on a supported provider is a 404, not a null field.
+    pub capability: String,
+    pub image: Option<ImageArtifactSummary>,
+}
+
+/// Maps a capability-gated detail lookup to its response shape. Pulled out
+/// as a pure function so the Found/Unsupported/NotFound mapping can be
+/// tested directly, without needing a live engine connection.
+fn image_detail_response(
+    engine_id: String,
+    runtime_ctx: ArtifactRuntimeContext,
+    lookup: DetailLookup<artifact_inventory::ImageSummaryRow>,
+) -> Result<ImageArtifactDetailResponse, ApiError> {
+    match lookup {
+        DetailLookup::Found(image) => Ok(ImageArtifactDetailResponse {
+            engine_id,
+            runtime: runtime_ctx,
+            capability: "supported".to_owned(),
+            image: Some(image.into()),
+        }),
+        DetailLookup::Unsupported { capability } => Ok(ImageArtifactDetailResponse {
+            engine_id,
+            runtime: runtime_ctx,
+            capability,
+            image: None,
+        }),
+        DetailLookup::NotFound => Err(ApiError::ArtifactNotFound),
+    }
 }
 
 pub async fn read_engine_image(
@@ -266,17 +329,14 @@ pub async fn read_engine_image(
     Path((engine_id, image_id)): Path<(String, String)>,
 ) -> Result<Json<ImageArtifactDetailResponse>, ApiError> {
     authorize(&state, &headers)?;
+    let engine_id = validate_engine_id(&state, &engine_id).await?.id;
     let (engine, _, runtime_ctx) = connect_selected_engine(&state).await?;
 
-    let image = artifact_inventory::image_details(&engine, &image_id)
+    let lookup = artifact_inventory::image_details(&engine, &image_id)
         .await
-        .map_err(ApiError::ActionUnavailable)?;
+        .map_err(ApiError::EngineUnavailable)?;
 
-    Ok(Json(ImageArtifactDetailResponse {
-        engine_id,
-        runtime: runtime_ctx,
-        image: image.into(),
-    }))
+    Ok(Json(image_detail_response(engine_id, runtime_ctx, lookup)?))
 }
 
 /// Mirrors `PruneScopeInventory`'s support/estimate vocabulary so the
@@ -306,6 +366,7 @@ pub async fn engine_build_cache_status(
     Path(engine_id): Path<String>,
 ) -> Result<Json<BuildCacheStatusResponse>, ApiError> {
     authorize(&state, &headers)?;
+    let engine_id = validate_engine_id(&state, &engine_id).await?.id;
     let (engine, _, runtime_ctx) = connect_selected_engine(&state).await?;
 
     let status = artifact_inventory::build_cache_status(&engine)
@@ -343,6 +404,7 @@ pub async fn engine_registry_capability(
     Path(engine_id): Path<String>,
 ) -> Result<Json<RegistryCapabilityResponse>, ApiError> {
     authorize(&state, &headers)?;
+    let engine_id = validate_engine_id(&state, &engine_id).await?.id;
     let (engine, _, runtime_ctx) = connect_selected_engine(&state).await?;
 
     let capability = artifact_inventory::registry_capability(&engine)
@@ -456,6 +518,100 @@ mod tests {
         let value = serde_json::to_value(&response)?;
         assert_eq!(value["support"], "unsupported");
         assert!(value["usage"].is_null());
+        Ok(())
+    }
+
+    /// A found artifact reads as a normal 200 with `capability: "supported"`.
+    #[test]
+    fn container_detail_response_maps_found_to_populated_body() -> TestResult {
+        let row = artifact_inventory::ContainerSummaryRow {
+            id: "c1".to_owned(),
+            name: "web-1".to_owned(),
+            state: "running".to_owned(),
+            health: None,
+            image_reference: None,
+            label_keys: Vec::new(),
+            known_project_id: None,
+            created_at_epoch_seconds: None,
+            writable_size_bytes: None,
+            root_filesystem_size_bytes: None,
+        };
+
+        let response = container_detail_response(
+            "engine-1".to_owned(),
+            sample_runtime(),
+            DetailLookup::Found(row),
+        )?;
+
+        assert_eq!(response.capability, "supported");
+        assert!(response.container.is_some());
+        Ok(())
+    }
+
+    /// An unsupported provider is still a 200: `capability` carries the real
+    /// support level and `container` is explicitly absent, never a fake
+    /// empty-looking success or a generic error.
+    #[test]
+    fn container_detail_response_maps_unsupported_to_explicit_capability_state() -> TestResult {
+        let response = container_detail_response(
+            "engine-1".to_owned(),
+            sample_runtime(),
+            DetailLookup::Unsupported {
+                capability: "unsupported".to_owned(),
+            },
+        )?;
+
+        assert_eq!(response.capability, "unsupported");
+        assert!(response.container.is_none());
+        Ok(())
+    }
+
+    /// A supported provider with no such id is a real 404, not a 422 or a
+    /// null-shaped 200.
+    #[test]
+    fn container_detail_response_maps_not_found_to_artifact_not_found_error() {
+        let result = container_detail_response(
+            "engine-1".to_owned(),
+            sample_runtime(),
+            DetailLookup::NotFound,
+        );
+
+        assert!(matches!(result, Err(ApiError::ArtifactNotFound)));
+    }
+
+    #[test]
+    fn image_detail_response_maps_not_found_to_artifact_not_found_error() {
+        let result =
+            image_detail_response("engine-1".to_owned(), sample_runtime(), DetailLookup::NotFound);
+
+        assert!(matches!(result, Err(ApiError::ArtifactNotFound)));
+    }
+}
+
+#[cfg(test)]
+mod engine_id_validation_tests {
+    use super::*;
+    use crate::test_support::{authorized_headers, fresh_db, test_state};
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    /// A fabricated `engine_id` must be rejected before the handler connects
+    /// to the selected engine at all, so a caller can never label real
+    /// engine-wide data with a made-up id. Representative of all six
+    /// artifact routes, which share the exact same validation call.
+    #[tokio::test]
+    async fn list_engine_containers_rejects_fake_engine_id_without_touching_the_engine()
+    -> TestResult {
+        let state = test_state(fresh_db("artifacts-containers-fake").await?);
+
+        let result = list_engine_containers(
+            State(state),
+            authorized_headers(),
+            Path("fake-engine".to_owned()),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::EngineNotFound)));
         Ok(())
     }
 }

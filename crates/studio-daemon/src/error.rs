@@ -74,6 +74,12 @@ pub enum ApiError {
     #[error("runtime profile not found")]
     RuntimeProfileNotFound,
 
+    #[error("engine not found")]
+    EngineNotFound,
+
+    #[error("artifact not found")]
+    ArtifactNotFound,
+
     #[error("planning failed: {0}")]
     PlanningFailed(String),
 
@@ -133,7 +139,9 @@ impl IntoResponse for ApiError {
             | Self::JobNotFound
             | Self::ServiceNotFound
             | Self::WatchNotFound
-            | Self::RuntimeProfileNotFound => StatusCode::NOT_FOUND,
+            | Self::RuntimeProfileNotFound
+            | Self::EngineNotFound
+            | Self::ArtifactNotFound => StatusCode::NOT_FOUND,
             Self::EngineUnavailable(_) => StatusCode::BAD_GATEWAY,
             Self::InvalidImport(_)
             | Self::PlanningFailed(_)

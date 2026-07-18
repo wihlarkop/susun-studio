@@ -16,6 +16,8 @@ mod routes;
 mod runtime;
 mod state;
 mod susun_integration;
+#[cfg(test)]
+mod test_support;
 mod watch;
 
 use std::sync::Arc;

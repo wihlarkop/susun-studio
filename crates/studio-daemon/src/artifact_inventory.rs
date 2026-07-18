@@ -3,7 +3,9 @@
 //! Everything here is read-only: nothing pulls, pushes, builds, tags, or
 //! prunes. Mutating artifact workflows are Phase 15b+.
 
-use susun::{ContainerEngine, ContainerId, DockerCompatibleEngine, ImageId, ProjectName};
+use susun::{
+    ContainerEngine, ContainerId, DockerCompatibleEngine, EngineError, ImageId, ProjectName,
+};
 use turso::Database;
 
 use crate::susun_integration::enum_label;
@@ -19,16 +21,22 @@ pub struct RuntimeContextRow {
 }
 
 /// Resolves display-safe runtime attribution for the given profile. `None`
-/// means the platform default engine (no profile selected or bound).
-pub async fn runtime_context(db: &Database, profile_id: Option<&str>) -> RuntimeContextRow {
+/// means the platform default engine (no profile selected or bound). A
+/// database fault propagates as `Err` rather than silently collapsing into
+/// "no attribution" — the two must stay distinguishable, since the latter is
+/// a normal state but the former is a daemon fault worth surfacing as one.
+pub async fn runtime_context(
+    db: &Database,
+    profile_id: Option<&str>,
+) -> Result<RuntimeContextRow, turso::Error> {
     let profile = match profile_id {
         Some(id) => crate::runtime::list_all_profiles(db)
-            .await
-            .ok()
-            .and_then(|profiles| profiles.into_iter().find(|profile| profile.id == id)),
+            .await?
+            .into_iter()
+            .find(|profile| profile.id == id),
         None => None,
     };
-    match profile {
+    Ok(match profile {
         Some(profile) => RuntimeContextRow {
             runtime_profile_id: Some(profile.id),
             runtime_class: Some(profile.runtime_class),
@@ -41,7 +49,7 @@ pub async fn runtime_context(db: &Database, profile_id: Option<&str>) -> Runtime
             display_name: None,
             is_selected: None,
         },
-    }
+    })
 }
 
 /// One Studio project's derived project identity, used only to associate
@@ -106,9 +114,11 @@ pub struct ContainerInventoryRow {
 }
 
 /// Result of an engine-wide capability-gated read. `data` is `None` exactly
-/// when the provider does not support the operation (or the call otherwise
-/// failed) — never an HTTP error, so unsupported providers surface as an
-/// explicit capability state rather than a generic failure.
+/// when the provider does not support the operation — never an HTTP error,
+/// so unsupported providers surface as an explicit capability state rather
+/// than a generic failure. A provider that *does* support the operation but
+/// fails the call is a genuine fault and propagates as `Err`, never folded
+/// into this same "no data" shape.
 pub struct CapabilityResult<T> {
     pub capability: String,
     pub data: Option<T>,
@@ -149,6 +159,9 @@ fn container_summary_row(
 
 /// Lists containers across the whole engine. `capability` reflects the
 /// provider's advertised support for engine-wide container inventory.
+/// `data` is `None` only when the provider does not support this operation;
+/// a provider that *does* support it but fails the call is a real failure
+/// and propagates as `Err`, never a silent empty-looking success.
 pub async fn container_inventory(
     db: &Database,
     engine: &DockerCompatibleEngine,
@@ -159,24 +172,41 @@ pub async fn container_inventory(
         .map_err(|error| error.to_string())?;
     let capability = enum_label(capabilities.supports_container_inventory);
 
-    let data = match engine.container_inventory().await {
-        Ok(inventory) => {
-            let known = known_projects(db)
-                .await
-                .map_err(|error| error.to_string())?;
-            Some(ContainerInventoryRow {
-                observed_at_epoch_seconds: inventory.observed_at_epoch_seconds,
-                containers: inventory
-                    .containers
-                    .iter()
-                    .map(|container| container_summary_row(container, &known))
-                    .collect(),
-            })
-        }
-        Err(_) => None,
-    };
+    if !capabilities.supports_container_inventory.is_supported() {
+        return Ok(CapabilityResult {
+            capability,
+            data: None,
+        });
+    }
+
+    let inventory = engine
+        .container_inventory()
+        .await
+        .map_err(|error| error.to_string())?;
+    let known = known_projects(db)
+        .await
+        .map_err(|error| error.to_string())?;
+    let data = Some(ContainerInventoryRow {
+        observed_at_epoch_seconds: inventory.observed_at_epoch_seconds,
+        containers: inventory
+            .containers
+            .iter()
+            .map(|container| container_summary_row(container, &known))
+            .collect(),
+    });
 
     Ok(CapabilityResult { capability, data })
+}
+
+/// Outcome of looking up one artifact by id from the engine-wide inventory.
+/// Distinguishes "the provider doesn't support this at all" (an explicit
+/// capability state, never an error) from "the provider supports it but no
+/// such id exists" (a genuine 404) from an actual provider failure
+/// (propagated as `Err`, mapped to a 502 by the caller).
+pub enum DetailLookup<T> {
+    Found(T),
+    Unsupported { capability: String },
+    NotFound,
 }
 
 /// Reads one container from the engine-wide inventory.
@@ -184,17 +214,28 @@ pub async fn container_details(
     db: &Database,
     engine: &DockerCompatibleEngine,
     container_id: &str,
-) -> Result<ContainerSummaryRow, String> {
+) -> Result<DetailLookup<ContainerSummaryRow>, String> {
+    let capabilities = engine
+        .capabilities()
+        .await
+        .map_err(|error| error.to_string())?;
+    let capability = enum_label(capabilities.supports_container_inventory);
+    if !capabilities.supports_container_inventory.is_supported() {
+        return Ok(DetailLookup::Unsupported { capability });
+    }
+
     let id = ContainerId::new(container_id.to_owned())
         .map_err(|_| "container id must not be empty".to_owned())?;
-    let container = engine
-        .container_details(&id)
-        .await
-        .map_err(|error| error.to_string())?;
-    let known = known_projects(db)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(container_summary_row(&container, &known))
+    match engine.container_details(&id).await {
+        Ok(container) => {
+            let known = known_projects(db)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(DetailLookup::Found(container_summary_row(&container, &known)))
+        }
+        Err(EngineError::NotFound { .. }) => Ok(DetailLookup::NotFound),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// Display-safe engine-wide image summary, redaction-inherited from the
@@ -237,7 +278,9 @@ fn image_summary_row(image: &susun::EngineImageSummary) -> ImageSummaryRow {
 }
 
 /// Lists images across the whole engine. `capability` reflects the
-/// provider's advertised support for engine-wide image inventory.
+/// provider's advertised support for engine-wide image inventory. `data` is
+/// `None` only when the provider does not support this operation; a real
+/// call failure on a supported provider propagates as `Err`.
 pub async fn image_inventory(
     engine: &DockerCompatibleEngine,
 ) -> Result<CapabilityResult<ImageInventoryRow>, String> {
@@ -247,13 +290,21 @@ pub async fn image_inventory(
         .map_err(|error| error.to_string())?;
     let capability = enum_label(capabilities.supports_image_inventory);
 
-    let data = match engine.image_inventory().await {
-        Ok(inventory) => Some(ImageInventoryRow {
-            observed_at_epoch_seconds: inventory.observed_at_epoch_seconds,
-            images: inventory.images.iter().map(image_summary_row).collect(),
-        }),
-        Err(_) => None,
-    };
+    if !capabilities.supports_image_inventory.is_supported() {
+        return Ok(CapabilityResult {
+            capability,
+            data: None,
+        });
+    }
+
+    let inventory = engine
+        .image_inventory()
+        .await
+        .map_err(|error| error.to_string())?;
+    let data = Some(ImageInventoryRow {
+        observed_at_epoch_seconds: inventory.observed_at_epoch_seconds,
+        images: inventory.images.iter().map(image_summary_row).collect(),
+    });
 
     Ok(CapabilityResult { capability, data })
 }
@@ -262,14 +313,23 @@ pub async fn image_inventory(
 pub async fn image_details(
     engine: &DockerCompatibleEngine,
     image_id: &str,
-) -> Result<ImageSummaryRow, String> {
-    let id =
-        ImageId::new(image_id.to_owned()).map_err(|_| "image id must not be empty".to_owned())?;
-    let image = engine
-        .image_details(&id)
+) -> Result<DetailLookup<ImageSummaryRow>, String> {
+    let capabilities = engine
+        .capabilities()
         .await
         .map_err(|error| error.to_string())?;
-    Ok(image_summary_row(&image))
+    let capability = enum_label(capabilities.supports_image_inventory);
+    if !capabilities.supports_image_inventory.is_supported() {
+        return Ok(DetailLookup::Unsupported { capability });
+    }
+
+    let id =
+        ImageId::new(image_id.to_owned()).map_err(|_| "image id must not be empty".to_owned())?;
+    match engine.image_details(&id).await {
+        Ok(image) => Ok(DetailLookup::Found(image_summary_row(&image))),
+        Err(EngineError::NotFound { .. }) => Ok(DetailLookup::NotFound),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// Build-cache capability plus a non-destructive usage estimate, reusing the
@@ -289,10 +349,10 @@ pub async fn build_cache_status(
     let support = enum_label(capabilities.supports_build_cache);
 
     let scope = if capabilities.supports_build_cache.is_supported() {
-        crate::susun_integration::cleanup_preview(engine, &["build_cache".to_owned()], false)
-            .await
-            .ok()
-            .and_then(|preview| preview.scopes.into_iter().next())
+        let preview =
+            crate::susun_integration::cleanup_preview(engine, &["build_cache".to_owned()], false)
+                .await?;
+        preview.scopes.into_iter().next()
     } else {
         None
     };

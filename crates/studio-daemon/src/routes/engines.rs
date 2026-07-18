@@ -19,6 +19,53 @@ use crate::{
     susun_integration,
 };
 
+/// A Studio-owned, server-confirmed engine identity. `id` names a row in the
+/// `engines` table — a logical, Studio-registered engine — never a
+/// connection endpoint. It exists purely so responses, logs, and plans carry
+/// an id the daemon has actually checked, instead of an unvalidated path
+/// segment a caller could set to anything.
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedEngineId {
+    pub id: String,
+}
+
+/// Confirms `engine_id` names a real, enabled row in the `engines` table.
+/// Every route that accepts an `{id}` path segment must call this before
+/// doing anything else with it (including connecting to an engine, mutating
+/// state, or minting a plan), so a fabricated id can never surface real
+/// engine-wide data or trigger a real operation under a false label.
+///
+/// This deliberately never touches the `runtime_profiles` table or engine
+/// connection logic: the validated id identifies *which registered engine
+/// row* the caller means, it never selects a connection endpoint or
+/// overrides the selected/bound runtime profile. Engine connection stays
+/// governed entirely by `runtime::attribution_for` /
+/// `susun_integration::connect_engine_for_profile`, exactly as before.
+pub(crate) async fn validate_engine_id(
+    state: &AppState,
+    engine_id: &str,
+) -> Result<ValidatedEngineId, ApiError> {
+    let conn = state.db.connect()?;
+    let mut rows = conn
+        .query(
+            "SELECT enabled FROM engines WHERE id = ?1",
+            params![engine_id.to_owned()],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Err(ApiError::EngineNotFound);
+    };
+    let enabled: i64 = row.get(0)?;
+    if enabled == 0 {
+        return Err(ApiError::ActionUnavailable(format!(
+            "engine `{engine_id}` is disabled"
+        )));
+    }
+    Ok(ValidatedEngineId {
+        id: engine_id.to_owned(),
+    })
+}
+
 #[derive(Debug, Serialize)]
 pub struct EngineResponse {
     pub id: String,
@@ -98,6 +145,7 @@ pub async fn engine_health(
     Path(engine_id): Path<String>,
 ) -> Result<Json<EngineHealthResponse>, ApiError> {
     authorize(&state, &headers)?;
+    let engine_id = validate_engine_id(&state, &engine_id).await?.id;
     logging::info("engine_health_started", &[("engine_id", engine_id.clone())]);
 
     // Connect and check Docker (no DB cursor open here).
@@ -154,9 +202,10 @@ pub async fn engine_health(
 pub async fn engine_capabilities(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(_engine_id): Path<String>,
+    Path(engine_id): Path<String>,
 ) -> Result<Json<EngineCapabilitiesResponse>, ApiError> {
     authorize(&state, &headers)?;
+    validate_engine_id(&state, &engine_id).await?;
 
     let engine = susun_integration::connect_engine(&state.db, None)
         .await
@@ -387,6 +436,7 @@ pub async fn preview_prune(
     Json(request): Json<PruneRequest>,
 ) -> Result<Json<PrunePreview>, ApiError> {
     authorize(&state, &headers)?;
+    let engine_id = validate_engine_id(&state, &engine_id).await?.id;
     let owner = runtime::stable_suffix(&state.auth_token);
 
     if request.scopes.is_empty()
@@ -744,4 +794,115 @@ fn now_ms() -> Result<i64, ApiError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ApiError::Clock)?;
     i64::try_from(duration.as_millis()).map_err(|_| ApiError::Clock)
+}
+
+#[cfg(test)]
+mod tests {
+    use turso::params;
+
+    use super::*;
+    use crate::test_support::{authorized_headers, fresh_db, test_state};
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    /// Migration 0005 always seeds exactly this row on a fresh database.
+    const SEEDED_ENGINE_ID: &str = "engine-docker-local";
+
+    async fn disable_seeded_engine(state: &AppState) -> TestResult {
+        let conn = state.db.connect()?;
+        conn.execute(
+            "UPDATE engines SET enabled = 0 WHERE id = ?1",
+            params![SEEDED_ENGINE_ID.to_owned()],
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn validate_engine_id_rejects_an_unknown_id() -> TestResult {
+        let state = test_state(fresh_db("engines-validate-unknown").await?);
+
+        let result = validate_engine_id(&state, "fake-engine").await;
+
+        assert!(matches!(result, Err(ApiError::EngineNotFound)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn validate_engine_id_rejects_a_disabled_engine() -> TestResult {
+        let state = test_state(fresh_db("engines-validate-disabled").await?);
+        disable_seeded_engine(&state).await?;
+
+        let result = validate_engine_id(&state, SEEDED_ENGINE_ID).await;
+
+        assert!(matches!(result, Err(ApiError::ActionUnavailable(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn validate_engine_id_accepts_a_known_enabled_engine() -> TestResult {
+        let state = test_state(fresh_db("engines-validate-known").await?);
+
+        let validated = validate_engine_id(&state, SEEDED_ENGINE_ID).await?;
+
+        assert_eq!(validated.id, SEEDED_ENGINE_ID);
+        Ok(())
+    }
+
+    /// A fabricated `engine_id` must be rejected before the handler touches
+    /// the real engine at all — no health probe, no persisted write. This is
+    /// the regression this whole helper exists to prevent: a caller passing
+    /// a fake id used to still get back the real, currently-selected
+    /// engine's reachability data with the fake id echoed alongside it.
+    #[tokio::test]
+    async fn engine_health_rejects_fake_engine_id_without_writing_health_state() -> TestResult {
+        let state = test_state(fresh_db("engines-health-fake").await?);
+
+        let result = engine_health(
+            State(state.clone()),
+            authorized_headers(),
+            Path("fake-engine".to_owned()),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::EngineNotFound)));
+
+        let conn = state.db.connect()?;
+        let mut rows = conn
+            .query(
+                "SELECT last_health_json, last_health_at_ms FROM engines WHERE id = ?1",
+                params![SEEDED_ENGINE_ID.to_owned()],
+            )
+            .await?;
+        let row = rows.next().await?.ok_or("seeded engine row missing")?;
+        let last_health_json: Option<String> = row.get(0)?;
+        let last_health_at_ms: Option<i64> = row.get(1)?;
+        assert_eq!(last_health_json, None);
+        assert_eq!(last_health_at_ms, None);
+        Ok(())
+    }
+
+    /// A fabricated `engine_id` must be rejected before any prune inventory
+    /// is derived or a commit plan is minted — `validate_engine_id` runs
+    /// before scope validation, runtime attribution, and engine connection,
+    /// so an error here structurally guarantees `state.action_plans.prepare`
+    /// was never reached.
+    #[tokio::test]
+    async fn preview_prune_rejects_fake_engine_id_before_minting_a_plan() -> TestResult {
+        let state = test_state(fresh_db("engines-prune-fake").await?);
+
+        let result = preview_prune(
+            State(state.clone()),
+            authorized_headers(),
+            Path("fake-engine".to_owned()),
+            Json(PruneRequest {
+                scopes: vec!["containers".to_owned()],
+                all_images: false,
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::EngineNotFound)));
+        Ok(())
+    }
 }

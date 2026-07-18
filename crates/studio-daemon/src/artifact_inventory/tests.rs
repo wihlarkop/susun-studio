@@ -157,7 +157,7 @@ async fn runtime_context_passes_through_built_in_classification_unchanged() -> T
     let db = fresh_db().await?;
     insert_runtime_profile(&db, "profile-built-in", "built_in", true).await?;
 
-    let context = runtime_context(&db, Some("profile-built-in")).await;
+    let context = runtime_context(&db, Some("profile-built-in")).await?;
 
     assert_eq!(
         context.runtime_profile_id.as_deref(),
@@ -176,7 +176,7 @@ async fn runtime_context_never_upgrades_an_external_profile_to_built_in() -> Tes
     let db = fresh_db().await?;
     insert_runtime_profile(&db, "profile-external", "external_local", false).await?;
 
-    let context = runtime_context(&db, Some("profile-external")).await;
+    let context = runtime_context(&db, Some("profile-external")).await?;
 
     assert_eq!(context.runtime_class.as_deref(), Some("external_local"));
     assert_ne!(context.runtime_class.as_deref(), Some("built_in"));
@@ -187,10 +187,25 @@ async fn runtime_context_never_upgrades_an_external_profile_to_built_in() -> Tes
 async fn runtime_context_reports_platform_default_when_no_profile_selected() -> TestResult {
     let db = fresh_db().await?;
 
-    let context = runtime_context(&db, None).await;
+    let context = runtime_context(&db, None).await?;
 
     assert_eq!(context.runtime_profile_id, None);
     assert_eq!(context.runtime_class, None);
     assert_eq!(context.display_name, None);
+    Ok(())
+}
+
+/// A database fault must never look identical to "no such profile" — the
+/// caller needs to tell a daemon fault apart from a normal missing-profile
+/// state.
+#[tokio::test]
+async fn runtime_context_propagates_database_errors_instead_of_hiding_them() -> TestResult {
+    let db = fresh_db().await?;
+    let conn = db.connect()?;
+    conn.execute("DROP TABLE runtime_profiles", ()).await?;
+
+    let result = runtime_context(&db, Some("profile-1")).await;
+
+    assert!(result.is_err());
     Ok(())
 }

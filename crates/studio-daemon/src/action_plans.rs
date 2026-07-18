@@ -111,6 +111,9 @@ pub struct DestructivePlan {
 
 #[derive(Debug, Clone)]
 pub struct EnginePrunePlan {
+    /// Server-validated at preview time (`validate_engine_id`), never a raw,
+    /// unchecked path segment. Commit trusts this stored value and never
+    /// re-reads an id from a request.
     pub engine_id: String,
     /// Exact runtime profile selected at preview. `None` means the platform
     /// default was selected because no profile existed.

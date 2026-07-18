@@ -1043,7 +1043,13 @@ export async function readEngineContainers(
 export type ContainerArtifactDetailResponse = {
   engine_id: string;
   runtime: ArtifactRuntimeContext;
-  container: ContainerArtifactSummary;
+  /**
+   * SDK support level for engine-wide container inventory. `container` is
+   * only ever null when this reads "unsupported" — a missing id on a
+   * supported provider is a 404 (thrown), not a null field.
+   */
+  capability: string;
+  container: ContainerArtifactSummary | null;
 };
 
 export async function readEngineContainer(
@@ -1087,7 +1093,13 @@ export async function readEngineImages(
 export type ImageArtifactDetailResponse = {
   engine_id: string;
   runtime: ArtifactRuntimeContext;
-  image: ImageArtifactSummary;
+  /**
+   * SDK support level for engine-wide image inventory. `image` is only ever
+   * null when this reads "unsupported" — a missing id on a supported
+   * provider is a 404 (thrown), not a null field.
+   */
+  capability: string;
+  image: ImageArtifactSummary | null;
 };
 
 export async function readEngineImage(
