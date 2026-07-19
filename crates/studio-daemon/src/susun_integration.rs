@@ -1,10 +1,12 @@
 use std::{path::PathBuf, sync::Arc, time::SystemTime};
 
 use susun::{
-    CancellationToken, ContainerEngine, DownPlanOptions, EngineCapabilities, EngineEndpoint,
-    EngineSnapshot, EventSink, ExecutionPlan, ExecutionReport, ImageRef, ImageRemoveRequest,
-    ImageSelector, ImageTagRequest, PlanOutcome, ProjectSummary, Runtime, SdkProject,
-    SusunWorkspace, UpPlanOptions, render_diagnostics_json, render_plan_json,
+    BuildCancellationToken, BuildDefinition, BuildEngine, BuildEventSink, BuildInputManifest,
+    BuildRequest, BuildResult, BuildxProcessBuildEngine, CancellationToken, ContainerEngine,
+    DownPlanOptions, EngineCapabilities, EngineEndpoint, EngineSnapshot, EventSink, ExecutionPlan,
+    ExecutionReport, ImageRef, ImageRemoveRequest, ImageSelector, ImageTagRequest, PlanOutcome,
+    ProjectSummary, Runtime, SdkProject, SusunWorkspace, UpPlanOptions, render_diagnostics_json,
+    render_plan_json, resolve_build_inputs, validate_dockerfile_source,
 };
 use susun_engine_bollard::BollardEngine;
 use turso::Database;
@@ -37,6 +39,19 @@ fn build_workspace(
         workspace = workspace.with_profiles(profiles.to_vec());
     }
     workspace
+}
+
+/// Analyzes a project's already-persisted Compose files and returns the full
+/// SDK project (service definitions included), for callers that need more
+/// than the display-oriented [`analyze_project`] summary — currently, build
+/// target discovery.
+pub fn analyze_sdk_project(
+    files: &[PathBuf],
+    env_file: Option<&PathBuf>,
+    project_name: Option<&str>,
+    profiles: &[String],
+) -> Result<SdkProject, susun::Error> {
+    build_workspace(files, env_file, project_name, profiles).analyze()
 }
 
 pub fn analyze_project(
@@ -815,5 +830,364 @@ pub fn resolve_dockerignore(root: &std::path::Path) -> susun::Dockerignore {
     match std::fs::read_to_string(root.join(".dockerignore")) {
         Ok(contents) => susun::Dockerignore::parse(&contents),
         Err(_) => susun::Dockerignore::default(),
+    }
+}
+
+/// One build-declared service in a project, server-resolved from its already
+/// analyzed Compose files — never accepted as free-form input from the
+/// frontend.
+pub struct BuildableServiceRow {
+    pub service_name: String,
+    /// Whether the service also declares `image:` — Compose builds and tags
+    /// as that reference when both are present; Studio synthesizes a name
+    /// otherwise (see [`default_build_image_tag`]).
+    pub has_image: bool,
+    /// Whether this build declares secrets or SSH forwarding — both require
+    /// resolving local file paths or agent details Studio does not handle
+    /// in this phase, so builds requesting them are rejected up front
+    /// rather than silently started without them.
+    pub requires_unsupported_build_inputs: bool,
+}
+
+/// Lists every service with a `build:` declaration in an already-analyzed
+/// project. Server-side only: the caller must have obtained `project` via
+/// the project's own persisted Compose files, never from client input.
+pub fn buildable_services(project: &susun::Project) -> Vec<BuildableServiceRow> {
+    project
+        .services
+        .iter()
+        .filter_map(|(name, service)| {
+            service.build.as_ref().map(|build| BuildableServiceRow {
+                service_name: name.as_str().to_owned(),
+                has_image: service.image.is_some(),
+                requires_unsupported_build_inputs: !build.secrets.is_empty()
+                    || !build.ssh.is_empty(),
+            })
+        })
+        .collect()
+}
+
+/// The image reference a build for `service_name` will be tagged as: the
+/// service's own `image:` when set (matching Compose's own build+image
+/// semantics — the built image replaces what that reference points to),
+/// otherwise a Studio-owned `{project}-{service}:latest` convention. This is
+/// Studio's own naming choice, not derived from any Compose default-naming
+/// spec — services without an explicit `image:` have no other stable
+/// identity to build under.
+pub fn default_build_image_tag(
+    project_name: &str,
+    service_name: &str,
+    image: Option<&ImageRef>,
+) -> String {
+    match image {
+        Some(image) => image.as_str().to_owned(),
+        None => format!("{project_name}-{service_name}:latest"),
+    }
+}
+
+/// Server-resolved, validated build inputs ready to hand to a `BuildEngine`.
+/// Every path here has already been canonicalized and confirmed to stay
+/// within the project directory — never derived from unchecked client input.
+pub struct PreparedBuild {
+    pub context_dir: PathBuf,
+    pub dockerfile: PathBuf,
+    pub manifest: BuildInputManifest,
+}
+
+/// Bounded, redacted reason a build could not be prepared — never wraps the
+/// underlying SDK error types directly, since their `Display` output can
+/// legitimately contain raw host paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrepareBuildError {
+    /// `resolve_build_inputs` rejected the context or Dockerfile location —
+    /// an IO failure, or (the security-relevant case) the resolved path
+    /// escaped the project directory, including via a symlink or reparse
+    /// point that `canonicalize` resolved to somewhere outside it.
+    PathResolution,
+    /// `validate_dockerfile_source` rejected the resolved Dockerfile (not a
+    /// regular file, or an invalid target stage name).
+    DockerfileInvalid,
+    /// `BuildInputManifest::from_context` could not enumerate or hash the
+    /// build context.
+    ManifestFailed,
+}
+
+impl PrepareBuildError {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::PathResolution => "build_path_resolution_failed",
+            Self::DockerfileInvalid => "build_dockerfile_invalid",
+            Self::ManifestFailed => "build_context_unreadable",
+        }
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::PathResolution => {
+                "The build context or Dockerfile location could not be resolved within the project."
+            }
+            Self::DockerfileInvalid => "The resolved Dockerfile is invalid.",
+            Self::ManifestFailed => "The build context could not be read.",
+        }
+    }
+}
+
+/// Resolves and validates a service's build context and Dockerfile against
+/// `project_dir` (the project's own canonical root, never a client-supplied
+/// path) using the Susun facade's own path-containment and Dockerfile
+/// validation helpers, then hashes the context into a deterministic
+/// manifest. This is deliberately synchronous and potentially slow (it walks
+/// and hashes the whole context directory) — callers run it from within a
+/// spawned job task, after the job already exists in a `queued` state, never
+/// inline in the HTTP handler that creates it.
+pub fn prepare_build(
+    project_dir: &std::path::Path,
+    definition: &BuildDefinition,
+) -> Result<PreparedBuild, PrepareBuildError> {
+    let paths = resolve_build_inputs(project_dir, definition)
+        .map_err(|_| PrepareBuildError::PathResolution)?;
+    validate_dockerfile_source(&paths.dockerfile, definition.target.as_deref())
+        .map_err(|_| PrepareBuildError::DockerfileInvalid)?;
+    let dockerignore = resolve_dockerignore(&paths.context_dir);
+    let manifest = BuildInputManifest::from_context(&paths.context_dir, &dockerignore)
+        .map_err(|_| PrepareBuildError::ManifestFailed)?;
+    Ok(PreparedBuild {
+        context_dir: paths.context_dir,
+        dockerfile: paths.dockerfile,
+        manifest,
+    })
+}
+
+/// Display-safe, redacted outcome of a completed image build.
+pub struct BuildResultRow {
+    pub image_reference: String,
+    pub image_digest: Option<String>,
+}
+
+impl From<BuildResult> for BuildResultRow {
+    fn from(result: BuildResult) -> Self {
+        Self {
+            image_reference: result.image.reference,
+            image_digest: result.image.digest,
+        }
+    }
+}
+
+/// Runs an image build through the buildx process adapter — the only
+/// concrete `BuildEngine` the public facade exposes. Bound to whatever
+/// `docker` CLI context is ambient in the daemon's own process environment;
+/// it does not accept or route through a specific `EngineEndpoint`, so a
+/// build may not exactly target a non-default selected runtime profile (see
+/// the Phase 15d PR notes). Never reports success until the provider itself
+/// returns a result.
+pub async fn run_build(
+    prepared: &PreparedBuild,
+    definition: &BuildDefinition,
+    image_tag: &str,
+    events: BuildEventSink,
+    cancellation: BuildCancellationToken,
+) -> Result<BuildResultRow, susun::BuildError> {
+    let engine = BuildxProcessBuildEngine::default();
+    let request = BuildRequest {
+        definition: definition.clone(),
+        context_dir: prepared.context_dir.clone(),
+        dockerfile: prepared.dockerfile.clone(),
+        manifest: prepared.manifest.clone(),
+        image_tag: Some(image_tag.to_owned()),
+        // Secrets/SSH are rejected up front by `buildable_services`'
+        // `requires_unsupported_build_inputs` gate — never reached here.
+        secrets: Vec::new(),
+        ssh: Vec::new(),
+        cache_from: Vec::new(),
+        cache_to: Vec::new(),
+        insecure_entitlements: susun::InsecureEntitlements::default(),
+        labels: indexmap::IndexMap::new(),
+    };
+    let result = engine.build(request, events, cancellation).await?;
+    Ok(BuildResultRow::from(result))
+}
+
+#[cfg(test)]
+mod build_tests {
+    use super::*;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    fn unique_temp_dir_early(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("studio-{label}-{}", uuid::Uuid::new_v4().simple()))
+    }
+
+    /// Builds a real `Project` by writing a small Compose fixture to disk
+    /// and running it through the facade's own analyzer — `susun::Service`
+    /// is not re-exported (only `Project`/`BuildDefinition`/etc. are, since
+    /// production code never needs to construct one, only read fields off
+    /// values the analyzer already produced), so this is the only way test
+    /// code can produce project fixtures with build declarations without
+    /// reaching past the facade.
+    fn analyzed_sample_project(dir: &std::path::Path) -> TestResult<susun::SdkProject> {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(
+            dir.join("docker-compose.yml"),
+            r#"
+services:
+  web:
+    build:
+      context: .
+    image: myapp-web:latest
+  worker:
+    build:
+      context: .
+      secrets:
+        - api_key
+  db:
+    image: postgres:16
+secrets:
+  api_key:
+    environment: API_KEY
+"#,
+        )?;
+        Ok(analyze_sdk_project(
+            &[dir.join("docker-compose.yml")],
+            None,
+            Some("myapp"),
+            &[],
+        )?)
+    }
+
+    /// `db` has no `build:` at all and must be excluded entirely; `worker`
+    /// declares a build secret Studio does not resolve in this phase and
+    /// must be flagged unsupported rather than silently started without it;
+    /// `web` is the plain, fully-supported case.
+    #[test]
+    fn buildable_services_excludes_non_build_services_and_flags_unsupported_inputs() -> TestResult {
+        let dir = unique_temp_dir_early("buildable-services");
+        let sdk_project = analyzed_sample_project(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        let sdk_project = sdk_project?;
+        let project = sdk_project
+            .project()
+            .ok_or("analysis did not produce a project")?;
+
+        let mut rows = buildable_services(project);
+        rows.sort_by(|a, b| a.service_name.cmp(&b.service_name));
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.service_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["web", "worker"]
+        );
+        assert!(rows[0].has_image);
+        assert!(!rows[0].requires_unsupported_build_inputs);
+        assert!(!rows[1].has_image);
+        assert!(rows[1].requires_unsupported_build_inputs);
+        Ok(())
+    }
+
+    #[test]
+    fn default_build_image_tag_prefers_the_declared_image() {
+        let image = ImageRef::new("myapp-web:latest");
+        assert_eq!(
+            default_build_image_tag("myapp", "web", Some(&image)),
+            "myapp-web:latest"
+        );
+    }
+
+    #[test]
+    fn default_build_image_tag_synthesizes_a_name_when_no_image_is_declared() {
+        assert_eq!(
+            default_build_image_tag("myapp", "worker", None),
+            "myapp-worker:latest"
+        );
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("studio-{label}-{}", uuid::Uuid::new_v4().simple()))
+    }
+
+    fn write_file(path: &std::path::Path, contents: &str) -> TestResult {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, contents)?;
+        Ok(())
+    }
+
+    /// The happy path, end to end against a real filesystem: a normal
+    /// context resolves, the Dockerfile validates, and the manifest hashes
+    /// every included file.
+    #[test]
+    fn prepare_build_accepts_a_context_within_the_project_directory() -> TestResult {
+        let dir = unique_temp_dir("build-ok");
+        write_file(&dir.join("Dockerfile"), "FROM scratch\n")?;
+        write_file(&dir.join("app.txt"), "hello\n")?;
+
+        let result = prepare_build(&dir, &BuildDefinition::default());
+        std::fs::remove_dir_all(&dir).ok();
+
+        let prepared = result.map_err(|error| format!("{error:?}"))?;
+        assert!(prepared.dockerfile.ends_with("Dockerfile"));
+        assert!(
+            prepared
+                .manifest
+                .entries
+                .iter()
+                .any(|entry| entry.path == "app.txt")
+        );
+        Ok(())
+    }
+
+    /// The security-critical case: a `build.context` that resolves (after
+    /// canonicalization, so this also covers a symlink pointing the same
+    /// way) outside the project directory must be rejected, never silently
+    /// followed.
+    #[test]
+    fn prepare_build_rejects_a_context_that_escapes_the_project_directory() -> TestResult {
+        let root = unique_temp_dir("build-escape");
+        let project_dir = root.join("project");
+        let outside_dir = root.join("outside");
+        std::fs::create_dir_all(&project_dir)?;
+        write_file(&outside_dir.join("Dockerfile"), "FROM scratch\n")?;
+
+        let definition = BuildDefinition {
+            context: Some("../outside".to_owned()),
+            ..Default::default()
+        };
+        let result = prepare_build(&project_dir, &definition);
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(result.err(), Some(PrepareBuildError::PathResolution));
+        Ok(())
+    }
+
+    /// Same rejection path, reached via a missing Dockerfile instead of an
+    /// escaping context — `resolve_build_inputs` itself fails to canonicalize
+    /// a path that doesn't exist, before `validate_dockerfile_source` is
+    /// ever reached.
+    #[test]
+    fn prepare_build_rejects_a_missing_dockerfile() -> TestResult {
+        let dir = unique_temp_dir("build-missing-dockerfile");
+        std::fs::create_dir_all(&dir)?;
+
+        let result = prepare_build(&dir, &BuildDefinition::default());
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(result.err(), Some(PrepareBuildError::PathResolution));
+        Ok(())
+    }
+
+    /// `validate_dockerfile_source` itself is reached and rejects a
+    /// `Dockerfile` path that resolves but is not a regular file (here, a
+    /// directory of that name).
+    #[test]
+    fn prepare_build_rejects_a_dockerfile_that_is_not_a_regular_file() -> TestResult {
+        let dir = unique_temp_dir("build-dockerfile-not-a-file");
+        std::fs::create_dir_all(dir.join("Dockerfile"))?;
+
+        let result = prepare_build(&dir, &BuildDefinition::default());
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(result.err(), Some(PrepareBuildError::DockerfileInvalid));
+        Ok(())
     }
 }

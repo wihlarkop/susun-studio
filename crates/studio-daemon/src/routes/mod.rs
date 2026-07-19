@@ -207,6 +207,14 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/projects/{id}/actions/down", post(jobs::action_down))
         .route("/v1/projects/{id}/actions/clean", post(jobs::action_clean))
         .route("/v1/projects/{id}/actions/build", post(jobs::action_build))
+        .route(
+            "/v1/projects/{id}/build-targets",
+            get(jobs::read_project_build_targets),
+        )
+        .route(
+            "/v1/projects/{id}/services/{service}/build",
+            post(jobs::start_image_build),
+        )
         .route("/v1/jobs", get(jobs::list_jobs))
         .route("/v1/projects/{id}/jobs", get(jobs::list_project_jobs))
         .route(
