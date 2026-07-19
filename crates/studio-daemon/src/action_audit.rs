@@ -375,6 +375,43 @@ mod tests {
         Ok(())
     }
 
+    /// Migration 0014 rebuilt this table specifically to widen its
+    /// `action_kind`/`domain` CHECK constraints for image tag/remove; this
+    /// confirms the rebuilt schema actually accepts them, not just that the
+    /// Rust-side `ActionKind` enum knows the strings.
+    #[tokio::test]
+    async fn record_accepts_the_new_artifact_domain_action_kinds() -> TestResult {
+        let (db, path) = fixture().await?;
+        for kind in [ActionKind::ImageTag, ActionKind::ImageRemove] {
+            record(
+                &db,
+                AuditEntry {
+                    kind,
+                    profile_id: None,
+                    runtime_class: None,
+                    ownership_result: "authorized".to_owned(),
+                    command_kind: Some("provider_image_tag".to_owned()),
+                    elevation_mode: Some("none".to_owned()),
+                    terminal_status: STATUS_COMPLETED.to_owned(),
+                    affected: vec![AffectedCount {
+                        category: "images_tagged".to_owned(),
+                        count: 1,
+                    }],
+                    failure_code: None,
+                    correlation_token: None,
+                    started_at_ms: 10,
+                    completed_at_ms: Some(20),
+                },
+            )
+            .await?;
+        }
+        let rows = list(&db, 50).await?;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.domain == "artifact"));
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn restore_finalization_requires_a_staged_token_and_is_single_use() -> TestResult {
         let (db, path) = fixture().await?;
