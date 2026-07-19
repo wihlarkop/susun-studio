@@ -2,25 +2,24 @@ import { describe, expect, it } from "vitest";
 import {
   applyLoadError,
   applyLoadSuccess,
-  applyNotConnected,
   initialScopedFetchState,
   resetForNewEngine,
   withLoading,
 } from "./scoped-fetch";
 
 describe("resetForNewEngine", () => {
-  it("clears data, loading, and error, and bumps the generation", () => {
-    const loaded = applyLoadSuccess(withLoading(initialScopedFetchState<{ id: string }>()), 0, {
-      id: "runtime-a-data",
-    });
-    expect(loaded.data).not.toBeNull();
+  it("builds a cleared state from a plain generation number, not a previous state value", () => {
+    // The whole point of taking a plain number instead of a
+    // ScopedFetchState is that this must be callable without reading any
+    // reactive value - callers pass an already-advanced counter in.
+    const reset = resetForNewEngine<{ id: string }>(3, true);
 
-    const reset = resetForNewEngine(loaded);
+    expect(reset).toEqual({ data: null, loading: true, error: null, generation: 3 });
+  });
 
-    expect(reset.data).toBeNull();
+  it("supports constructing a non-loading cleared state (the not-connected branch)", () => {
+    const reset = resetForNewEngine<{ id: string }>(1, false);
     expect(reset.loading).toBe(false);
-    expect(reset.error).toBeNull();
-    expect(reset.generation).toBe(loaded.generation + 1);
   });
 });
 
@@ -33,10 +32,10 @@ describe("applyLoadSuccess / applyLoadError", () => {
   });
 
   it("ignores a late completion from a superseded (previous engine's) generation", () => {
-    // Simulates: request started under generation 0, user switches engines
-    // (bumping to generation 1) before the response for generation 0 lands.
-    const initial = initialScopedFetchState<string>();
-    const afterSwitch = resetForNewEngine(initial); // now generation 1, for engine B
+    // Simulates: a request started under generation 0, the user switches
+    // engines (advancing to generation 1) before the response for
+    // generation 0 lands.
+    const afterSwitch = resetForNewEngine<string>(1, true);
 
     const result = applyLoadSuccess(
       afterSwitch,
@@ -49,8 +48,7 @@ describe("applyLoadSuccess / applyLoadError", () => {
   });
 
   it("ignores a late error completion from a superseded generation the same way", () => {
-    const initial = initialScopedFetchState<string>();
-    const afterSwitch = resetForNewEngine(initial);
+    const afterSwitch = resetForNewEngine<string>(1, true);
 
     const result = applyLoadError(afterSwitch, 0, { status: 502, message: "unreachable" });
 
@@ -69,17 +67,16 @@ describe("applyLoadSuccess / applyLoadError", () => {
   });
 });
 
-describe("applyNotConnected", () => {
-  it("clears loading for the current generation", () => {
-    const state = withLoading(initialScopedFetchState<string>());
-    const next = applyNotConnected(state, state.generation);
-    expect(next.loading).toBe(false);
-  });
-
-  it("ignores a stale not-connected completion the same way as success/error", () => {
-    const initial = withLoading(initialScopedFetchState<string>());
-    const afterSwitch = resetForNewEngine(initial);
-    const result = applyNotConnected(afterSwitch, initial.generation);
-    expect(result).toBe(afterSwitch);
+describe("withLoading", () => {
+  it("marks loading without clearing existing data or error", () => {
+    const state = applyLoadError(
+      applyLoadSuccess(initialScopedFetchState<string>(), 0, "data"),
+      0,
+      { status: 502, message: "unreachable" },
+    );
+    const next = withLoading(state);
+    expect(next.loading).toBe(true);
+    expect(next.data).toBe("data");
+    expect(next.error).toEqual({ status: 502, message: "unreachable" });
   });
 });

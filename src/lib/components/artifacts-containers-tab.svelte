@@ -17,7 +17,6 @@
   import {
     applyLoadError,
     applyLoadSuccess,
-    applyNotConnected,
     initialScopedFetchState,
     resetForNewEngine,
     withLoading,
@@ -39,20 +38,24 @@
   let expandedId = $state<string | null>(null);
   let detailCache = $state<Record<string, ScopedDetailEntry<ContainerArtifactSummary>>>({});
   let detailController: AbortController | null = null;
+  // Plain (non-reactive) counter: bumped synchronously inside the effect
+  // below and never read back out of `fetchState` there, so the effect's
+  // only tracked dependencies stay `engineId`/`connected`. See
+  // `resetForNewEngine`'s doc comment for why reading `fetchState` inside
+  // the same effect that assigns it would self-trigger indefinitely.
+  let generation = 0;
 
-  async function load(id: string, isConnected: boolean, signal: AbortSignal, generation: number) {
-    if (!isConnected) {
-      fetchState = applyNotConnected(fetchState, generation);
-      return;
-    }
-    fetchState = withLoading(fetchState);
+  // Runs only in an async continuation, after the request's first `await` —
+  // never synchronously inside the effect — so its `fetchState` reads/writes
+  // are plain reactive updates, not effect dependencies.
+  async function load(id: string, signal: AbortSignal, requestGeneration: number) {
     try {
       const result = await readEngineContainers(id, { signal });
       if (signal.aborted) return;
-      fetchState = applyLoadSuccess(fetchState, generation, result);
+      fetchState = applyLoadSuccess(fetchState, requestGeneration, result);
     } catch (caught) {
       if (signal.aborted) return;
-      fetchState = applyLoadError(fetchState, generation, toArtifactRequestError(caught));
+      fetchState = applyLoadError(fetchState, requestGeneration, toArtifactRequestError(caught));
     }
   }
 
@@ -60,20 +63,24 @@
     const id = engineId;
     const isConnected = connected;
 
-    // Engine changed (or this is the first run): every piece of state scoped
-    // to the previous engine is cleared synchronously, before the new
-    // engine's data is requested, so the old engine's containers, errors,
-    // expanded row, and cached detail can never render underneath the new
-    // engine's header.
-    fetchState = resetForNewEngine(fetchState);
+    // Engine changed (or this is the first run): every piece of state
+    // scoped to the previous engine is cleared synchronously, before the
+    // new engine's data is requested, so the old engine's containers,
+    // errors, expanded row, and cached detail can never render underneath
+    // the new engine's header. The next state is built from the plain
+    // counter, not read back from `fetchState` — see `generation` above.
+    generation += 1;
+    const myGeneration = generation;
     detailController?.abort();
     detailController = null;
     detailCache = {};
     expandedId = null;
-    const generation = fetchState.generation;
 
     const controller = new AbortController();
-    void load(id, isConnected, controller.signal, generation);
+    fetchState = resetForNewEngine(myGeneration, isConnected);
+    if (isConnected) {
+      void load(id, controller.signal, myGeneration);
+    }
     return () => controller.abort();
   });
 
@@ -82,6 +89,14 @@
   $effect(() => {
     return () => detailController?.abort();
   });
+
+  // Safe to read/write `fetchState` here: this only ever runs from a
+  // button click, never synchronously inside an `$effect`.
+  function refresh() {
+    fetchState = withLoading(fetchState);
+    const controller = new AbortController();
+    void load(engineId, controller.signal, fetchState.generation);
+  }
 
   const viewState = $derived(
     resolveArtifactViewState({
@@ -143,12 +158,7 @@
           />
         {/if}
       </div>
-      <Button
-        size="sm"
-        variant="outline"
-        disabled={fetchState.loading}
-        onclick={() => load(engineId, connected, new AbortController().signal, fetchState.generation)}
-      >
+      <Button size="sm" variant="outline" disabled={fetchState.loading} onclick={refresh}>
         <RefreshCw class={fetchState.loading ? "animate-spin" : undefined} />
         Refresh
       </Button>
@@ -249,9 +259,5 @@
     </Table.Root>
   </div>
 {:else}
-  <ArtifactsStateBanner
-    state={viewState}
-    itemNoun="containers"
-    onRetry={() => load(engineId, connected, new AbortController().signal, fetchState.generation)}
-  />
+  <ArtifactsStateBanner state={viewState} itemNoun="containers" onRetry={refresh} />
 {/if}

@@ -22,22 +22,39 @@ export function initialScopedFetchState<T>(): ScopedFetchState<T> {
 }
 
 /**
- * Produces the state for a newly-selected engine: every piece of the
- * previous engine's data, loading flag, and error is cleared immediately —
- * never shown, even briefly, underneath the new engine's header — and the
- * generation is bumped so any still-in-flight request from the old engine
- * is recognized as stale once it completes.
+ * Constructs the state for a newly-selected engine (or an initial load),
+ * from a plain generation number the caller already advanced itself -
+ * never derived from a `ScopedFetchState` value.
+ *
+ * This must be callable from inside a Svelte `$effect` without reading the
+ * component's live `fetchState`: an effect that reads a piece of `$state`
+ * and then assigns that same `$state` variable becomes a dependency of its
+ * own write, which re-triggers itself indefinitely
+ * (`effect_update_depth_exceeded`). Callers should keep the generation
+ * counter as a plain, non-reactive `let` bumped synchronously inside the
+ * effect, and pass the new value here directly.
  */
-export function resetForNewEngine<T>(previous: ScopedFetchState<T>): ScopedFetchState<T> {
-  return { data: null, loading: false, error: null, generation: previous.generation + 1 };
+export function resetForNewEngine<T>(generation: number, loading: boolean): ScopedFetchState<T> {
+  return { data: null, loading, error: null, generation };
 }
 
+/**
+ * Marks a manual refresh/retry as in flight, keeping any existing data and
+ * error in place (the view-state resolver already treats "has data and an
+ * error" as `stale`, ahead of `refreshing`, so a retry doesn't flash the
+ * old error away before the new attempt actually completes). Reads the
+ * live state, so this is only safe to call from an event handler (a
+ * button's `onclick`) - never from inside an `$effect`.
+ */
 export function withLoading<T>(state: ScopedFetchState<T>): ScopedFetchState<T> {
   return { ...state, loading: true };
 }
 
 /** Applies a successful completion, unless a newer engine switch has
- * already superseded the request that produced it. */
+ * already superseded the request that produced it. Always called after an
+ * `await`, in the async continuation - never synchronously inside an
+ * `$effect` - so reading `state` here does not create an effect
+ * dependency. */
 export function applyLoadSuccess<T>(
   state: ScopedFetchState<T>,
   requestGeneration: number,
@@ -48,7 +65,8 @@ export function applyLoadSuccess<T>(
 }
 
 /** Applies a failed completion, unless a newer engine switch has already
- * superseded the request that produced it. */
+ * superseded the request that produced it. Same after-await-only
+ * requirement as `applyLoadSuccess`. */
 export function applyLoadError<T>(
   state: ScopedFetchState<T>,
   requestGeneration: number,
@@ -56,14 +74,4 @@ export function applyLoadError<T>(
 ): ScopedFetchState<T> {
   if (requestGeneration !== state.generation) return state;
   return { ...state, error, loading: false };
-}
-
-/** For the "daemon not connected" branch: only clears the loading flag if
- * this request is still the current one for its engine. */
-export function applyNotConnected<T>(
-  state: ScopedFetchState<T>,
-  requestGeneration: number,
-): ScopedFetchState<T> {
-  if (requestGeneration !== state.generation) return state;
-  return { ...state, loading: false };
 }

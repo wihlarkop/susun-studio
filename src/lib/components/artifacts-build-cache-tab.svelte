@@ -10,7 +10,6 @@
   import {
     applyLoadError,
     applyLoadSuccess,
-    applyNotConnected,
     initialScopedFetchState,
     resetForNewEngine,
     withLoading,
@@ -20,20 +19,20 @@
   let { engineId, connected }: { engineId: string; connected: boolean } = $props();
 
   let fetchState = $state(initialScopedFetchState<BuildCacheStatusResponse>());
+  // Plain (non-reactive) counter — see the containers tab for why this must
+  // never be read back out of `fetchState` inside the effect below.
+  let generation = 0;
 
-  async function load(id: string, isConnected: boolean, signal: AbortSignal, generation: number) {
-    if (!isConnected) {
-      fetchState = applyNotConnected(fetchState, generation);
-      return;
-    }
-    fetchState = withLoading(fetchState);
+  // Runs only in an async continuation, after the request's first `await` —
+  // never synchronously inside the effect.
+  async function load(id: string, signal: AbortSignal, requestGeneration: number) {
     try {
       const result = await readEngineBuildCacheStatus(id, { signal });
       if (signal.aborted) return;
-      fetchState = applyLoadSuccess(fetchState, generation, result);
+      fetchState = applyLoadSuccess(fetchState, requestGeneration, result);
     } catch (caught) {
       if (signal.aborted) return;
-      fetchState = applyLoadError(fetchState, generation, toArtifactRequestError(caught));
+      fetchState = applyLoadError(fetchState, requestGeneration, toArtifactRequestError(caught));
     }
   }
 
@@ -43,14 +42,24 @@
 
     // Engine changed (or first run): clear the previous engine's status
     // before requesting the new one's, so it can never render underneath
-    // the new engine's header.
-    fetchState = resetForNewEngine(fetchState);
-    const generation = fetchState.generation;
+    // the new engine's header. Built from the plain counter, never read
+    // back from `fetchState`.
+    generation += 1;
+    const myGeneration = generation;
 
     const controller = new AbortController();
-    void load(id, isConnected, controller.signal, generation);
+    fetchState = resetForNewEngine(myGeneration, isConnected);
+    if (isConnected) {
+      void load(id, controller.signal, myGeneration);
+    }
     return () => controller.abort();
   });
+
+  function refresh() {
+    fetchState = withLoading(fetchState);
+    const controller = new AbortController();
+    void load(engineId, controller.signal, fetchState.generation);
+  }
 
   const viewState = $derived(
     resolveArtifactViewState({
@@ -76,12 +85,7 @@
           />
         {/if}
       </div>
-      <Button
-        size="sm"
-        variant="outline"
-        disabled={fetchState.loading}
-        onclick={() => load(engineId, connected, new AbortController().signal, fetchState.generation)}
-      >
+      <Button size="sm" variant="outline" disabled={fetchState.loading} onclick={refresh}>
         <RefreshCw class={fetchState.loading ? "animate-spin" : undefined} />
         Refresh
       </Button>
@@ -131,9 +135,5 @@
     </p>
   </div>
 {:else}
-  <ArtifactsStateBanner
-    state={viewState}
-    itemNoun="build-cache status"
-    onRetry={() => load(engineId, connected, new AbortController().signal, fetchState.generation)}
-  />
+  <ArtifactsStateBanner state={viewState} itemNoun="build-cache status" onRetry={refresh} />
 {/if}

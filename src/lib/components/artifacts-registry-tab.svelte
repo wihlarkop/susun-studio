@@ -10,7 +10,6 @@
   import {
     applyLoadError,
     applyLoadSuccess,
-    applyNotConnected,
     initialScopedFetchState,
     resetForNewEngine,
     withLoading,
@@ -19,20 +18,20 @@
   let { engineId, connected }: { engineId: string; connected: boolean } = $props();
 
   let fetchState = $state(initialScopedFetchState<RegistryCapabilityResponse>());
+  // Plain (non-reactive) counter — see the containers tab for why this must
+  // never be read back out of `fetchState` inside the effect below.
+  let generation = 0;
 
-  async function load(id: string, isConnected: boolean, signal: AbortSignal, generation: number) {
-    if (!isConnected) {
-      fetchState = applyNotConnected(fetchState, generation);
-      return;
-    }
-    fetchState = withLoading(fetchState);
+  // Runs only in an async continuation, after the request's first `await` —
+  // never synchronously inside the effect.
+  async function load(id: string, signal: AbortSignal, requestGeneration: number) {
     try {
       const result = await readEngineRegistryCapability(id, { signal });
       if (signal.aborted) return;
-      fetchState = applyLoadSuccess(fetchState, generation, result);
+      fetchState = applyLoadSuccess(fetchState, requestGeneration, result);
     } catch (caught) {
       if (signal.aborted) return;
-      fetchState = applyLoadError(fetchState, generation, toArtifactRequestError(caught));
+      fetchState = applyLoadError(fetchState, requestGeneration, toArtifactRequestError(caught));
     }
   }
 
@@ -42,14 +41,24 @@
 
     // Engine changed (or first run): clear the previous engine's
     // capabilities before requesting the new one's, so they can never
-    // render underneath the new engine's header.
-    fetchState = resetForNewEngine(fetchState);
-    const generation = fetchState.generation;
+    // render underneath the new engine's header. Built from the plain
+    // counter, never read back from `fetchState`.
+    generation += 1;
+    const myGeneration = generation;
 
     const controller = new AbortController();
-    void load(id, isConnected, controller.signal, generation);
+    fetchState = resetForNewEngine(myGeneration, isConnected);
+    if (isConnected) {
+      void load(id, controller.signal, myGeneration);
+    }
     return () => controller.abort();
   });
+
+  function refresh() {
+    fetchState = withLoading(fetchState);
+    const controller = new AbortController();
+    void load(engineId, controller.signal, fetchState.generation);
+  }
 
   // Registry has no single top-level capability — pull/push/auth are three
   // independent flags, each rendered on its own. `capability: null` means
@@ -81,12 +90,7 @@
   <div class="flex flex-col gap-3">
     <div class="flex items-center justify-between gap-2">
       <span class="text-sm font-medium">Registry capabilities</span>
-      <Button
-        size="sm"
-        variant="outline"
-        disabled={fetchState.loading}
-        onclick={() => load(engineId, connected, new AbortController().signal, fetchState.generation)}
-      >
+      <Button size="sm" variant="outline" disabled={fetchState.loading} onclick={refresh}>
         <RefreshCw class={fetchState.loading ? "animate-spin" : undefined} />
         Refresh
       </Button>
@@ -113,9 +117,5 @@
     </p>
   </div>
 {:else}
-  <ArtifactsStateBanner
-    state={viewState}
-    itemNoun="registry capabilities"
-    onRetry={() => load(engineId, connected, new AbortController().signal, fetchState.generation)}
-  />
+  <ArtifactsStateBanner state={viewState} itemNoun="registry capabilities" onRetry={refresh} />
 {/if}
