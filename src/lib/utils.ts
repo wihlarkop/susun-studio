@@ -23,6 +23,18 @@ export function formatTimestamp(ms: number): string {
   return new Date(ms).toLocaleString();
 }
 
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(1)} ${units[unitIndex]}`;
+}
+
 const relativeTimeFormat = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
 const relativeTimeSteps: [limit: number, divisor: number, unit: Intl.RelativeTimeFormatUnit][] = [
   [60_000, 1_000, "second"],

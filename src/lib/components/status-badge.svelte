@@ -18,6 +18,12 @@
     safe: "success",
     caution: "warning",
     destructive: "destructive",
+    // SDK capability levels (SupportLevel)
+    supported: "success",
+    supported_subset: "info",
+    experimental: "warning",
+    unsupported: "muted",
+    unknown: "muted",
   };
 
   let { status, label }: { status: string; label?: string } = $props();

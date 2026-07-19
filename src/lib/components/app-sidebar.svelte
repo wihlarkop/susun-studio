@@ -1,12 +1,12 @@
 <script lang="ts">
   import * as Sidebar from "$lib/components/ui/sidebar/index.js";
   import { Badge } from "$lib/components/ui/badge/index.js";
-  import { FileText, LayoutGrid, ListChecks, Server, Settings } from "@lucide/svelte";
+  import { Boxes, FileText, LayoutGrid, ListChecks, Server, Settings } from "@lucide/svelte";
   import { displayPath } from "$lib/utils";
   import type { StudioSettings } from "$lib/daemon/client";
   import type { HealthState } from "$lib/daemon/daemon-state.svelte";
 
-  type View = "projects" | "jobs" | "runtime" | "settings";
+  type View = "projects" | "jobs" | "runtime" | "artifacts" | "settings";
 
   type NavItem = {
     label: string;
@@ -34,6 +34,12 @@
       description: "Managed runtime setup and status",
       icon: Server,
       view: "runtime",
+    },
+    {
+      label: "Artifacts",
+      description: "Containers, images, build cache, and registry on the active engine",
+      icon: Boxes,
+      view: "artifacts",
     },
     {
       label: "Reports",

@@ -1452,6 +1452,22 @@ export async function updateSettings(
   });
 }
 
+/**
+ * Thrown by `readJson` for any non-2xx daemon response. Carries the HTTP
+ * status so callers can distinguish, for example, a 502 "engine
+ * unreachable" from a 404 "not found" or a 500 daemon fault, instead of
+ * only having an opaque message string to pattern-match on.
+ */
+export class DaemonRequestError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "DaemonRequestError";
+    this.status = status;
+  }
+}
+
 async function readJson<T>(path: string, options: DaemonRequestOptions = {}): Promise<T> {
   const baseUrl = options.baseUrl ?? daemonBaseUrl;
   const headers = new Headers({ accept: "application/json" });
@@ -1472,7 +1488,14 @@ async function readJson<T>(path: string, options: DaemonRequestOptions = {}): Pr
   });
 
   if (!response.ok) {
-    throw new Error(`Daemon request to ${path} failed with HTTP ${response.status}`);
+    let message = `Daemon request to ${path} failed with HTTP ${response.status}`;
+    try {
+      const body = (await response.json()) as { error?: string };
+      if (body?.error) message = body.error;
+    } catch {
+      // Response body wasn't JSON (or was empty) — keep the generic message.
+    }
+    throw new DaemonRequestError(response.status, message);
   }
 
   return (await response.json()) as T;
