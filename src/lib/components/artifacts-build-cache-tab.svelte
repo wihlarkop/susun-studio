@@ -3,6 +3,7 @@
   import { RefreshCw } from "@lucide/svelte";
   import StatusBadge from "./status-badge.svelte";
   import ArtifactsStateBanner from "./artifacts-state-banner.svelte";
+  import ScopePruneControl from "./scope-prune-control.svelte";
   import { readEngineBuildCacheStatus, type BuildCacheStatusResponse } from "$lib/daemon/client";
   import { resolveArtifactViewState } from "$lib/artifacts/workspace-state";
   import { toArtifactRequestError } from "$lib/artifacts/fetch-error";
@@ -85,10 +86,19 @@
           />
         {/if}
       </div>
-      <Button size="sm" variant="outline" disabled={fetchState.loading} onclick={refresh}>
-        <RefreshCw class={fetchState.loading ? "animate-spin" : undefined} />
-        Refresh
-      </Button>
+      <div class="flex items-center gap-2">
+        <ScopePruneControl
+          {engineId}
+          scope="build_cache"
+          label="Prune build cache"
+          disabled={fetchState.loading}
+          oncompleted={refresh}
+        />
+        <Button size="sm" variant="outline" disabled={fetchState.loading} onclick={refresh}>
+          <RefreshCw class={fetchState.loading ? "animate-spin" : undefined} />
+          Refresh
+        </Button>
+      </div>
     </div>
 
     {#if viewState.kind === "stale"}
@@ -129,10 +139,6 @@
         No usage estimate is available from this engine right now.
       </p>
     {/if}
-
-    <p class="text-xs text-muted-foreground">
-      This is a read-only view. Reclaiming build cache isn't available from Studio yet.
-    </p>
   </div>
 {:else}
   <ArtifactsStateBanner state={viewState} itemNoun="build-cache status" onRetry={refresh} />

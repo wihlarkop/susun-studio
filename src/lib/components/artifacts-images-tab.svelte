@@ -4,6 +4,9 @@
   import { RefreshCw } from "@lucide/svelte";
   import StatusBadge from "./status-badge.svelte";
   import ArtifactsStateBanner from "./artifacts-state-banner.svelte";
+  import ImageTagDialog from "./image-tag-dialog.svelte";
+  import ImageRemoveDialog from "./image-remove-dialog.svelte";
+  import ScopePruneControl from "./scope-prune-control.svelte";
   import {
     readEngineImages,
     readEngineImage,
@@ -32,6 +35,20 @@
   // Plain (non-reactive) counter — see the containers tab for why this must
   // never be read back out of `fetchState` inside the effect below.
   let generation = 0;
+
+  let selectedImage = $state<ImageArtifactSummary | null>(null);
+  let tagOpen = $state(false);
+  let removeOpen = $state(false);
+
+  function openTag(image: ImageArtifactSummary) {
+    selectedImage = image;
+    tagOpen = true;
+  }
+
+  function openRemove(image: ImageArtifactSummary) {
+    selectedImage = image;
+    removeOpen = true;
+  }
 
   // Runs only in an async continuation, after the request's first `await` —
   // never synchronously inside the effect.
@@ -137,10 +154,19 @@
           />
         {/if}
       </div>
-      <Button size="sm" variant="outline" disabled={fetchState.loading} onclick={refresh}>
-        <RefreshCw class={fetchState.loading ? "animate-spin" : undefined} />
-        Refresh
-      </Button>
+      <div class="flex items-center gap-2">
+        <ScopePruneControl
+          {engineId}
+          scope="images"
+          label="Prune images"
+          disabled={fetchState.loading}
+          oncompleted={refresh}
+        />
+        <Button size="sm" variant="outline" disabled={fetchState.loading} onclick={refresh}>
+          <RefreshCw class={fetchState.loading ? "animate-spin" : undefined} />
+          Refresh
+        </Button>
+      </div>
     </div>
 
     {#if viewState.kind === "stale"}
@@ -157,6 +183,7 @@
           <Table.Head>Created</Table.Head>
           <Table.Head class="text-right">Size</Table.Head>
           <Table.Head class="text-right">Containers</Table.Head>
+          <Table.Head class="text-right">Actions</Table.Head>
         </Table.Row>
       </Table.Header>
       <Table.Body>
@@ -179,10 +206,34 @@
             <Table.Cell class="text-right text-muted-foreground tabular-nums">
               {image.container_count ?? "—"}
             </Table.Cell>
+            <Table.Cell class="text-right">
+              <div class="flex justify-end gap-1">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onclick={(event) => {
+                    event.stopPropagation();
+                    openTag(image);
+                  }}
+                >
+                  Tag
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onclick={(event) => {
+                    event.stopPropagation();
+                    openRemove(image);
+                  }}
+                >
+                  Remove
+                </Button>
+              </div>
+            </Table.Cell>
           </Table.Row>
           {#if expandedId === image.id}
             <Table.Row>
-              <Table.Cell colspan={5} class="bg-muted/40 whitespace-normal">
+              <Table.Cell colspan={6} class="bg-muted/40 whitespace-normal">
                 {@const entry = detailCache[scopedDetailKey(engineId, image.id)]}
                 <div class="flex flex-col gap-2 py-1 text-xs">
                   {#if entry === undefined}
@@ -239,4 +290,9 @@
   </div>
 {:else}
   <ArtifactsStateBanner state={viewState} itemNoun="images" onRetry={refresh} />
+{/if}
+
+{#if selectedImage}
+  <ImageTagDialog {engineId} image={selectedImage} bind:open={tagOpen} oncompleted={refresh} />
+  <ImageRemoveDialog {engineId} image={selectedImage} bind:open={removeOpen} oncompleted={refresh} />
 {/if}

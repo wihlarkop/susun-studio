@@ -939,7 +939,7 @@ export async function adoptRuntimeProfile(
   });
 }
 
-export type PruneScope = "containers" | "networks" | "volumes" | "images";
+export type PruneScope = "containers" | "networks" | "volumes" | "images" | "build_cache";
 
 export type PruneReport = {
   containers_removed: string[];
@@ -1111,6 +1111,108 @@ export async function readEngineImage(
     `/v1/engines/${encodeURIComponent(engineId)}/images/${encodeURIComponent(imageId)}`,
     options,
   );
+}
+
+/**
+ * Non-mutating tag preview. A commit plan is minted only when the provider
+ * supports image tagging, the source image is found, and nothing is
+ * actively running against the engine.
+ */
+export type ImageTagPreview = {
+  engine_id: string;
+  runtime: ArtifactRuntimeContext;
+  /** SDK support level for image tagging on this provider. */
+  capability: string;
+  source_image_id: string;
+  source_references: string[];
+  target_reference: string;
+  active_jobs: number;
+  active_watch_sessions: number;
+  commit_enabled: boolean;
+  plan_id: string | null;
+  expires_in_seconds: number | null;
+};
+
+export type ImageTagResult = {
+  source: string;
+  target: string;
+};
+
+export async function previewTagImage(
+  engineId: string,
+  imageId: string,
+  targetReference: string,
+  options: DaemonRequestOptions = {},
+): Promise<ImageTagPreview> {
+  return readJson(
+    `/v1/engines/${encodeURIComponent(engineId)}/images/${encodeURIComponent(imageId)}/tag/preview`,
+    {
+      ...options,
+      method: "POST",
+      body: { target_reference: targetReference },
+    },
+  );
+}
+
+/** Commit a previewed tag by its opaque plan id. The server derives source/target. */
+export async function commitTagImage(
+  planId: string,
+  options: DaemonRequestOptions = {},
+): Promise<ImageTagResult> {
+  return readJson(`/v1/engines/images/tag/commit/${encodeURIComponent(planId)}`, {
+    ...options,
+    method: "POST",
+  });
+}
+
+/**
+ * Non-mutating remove preview. `estimated_reclaim_bytes` is the image's own
+ * reported size — a best-effort estimate, since shared layers may not all
+ * be reclaimed. A commit plan is minted only when the provider supports
+ * image removal, the image is found, and nothing is actively running
+ * against the engine.
+ */
+export type ImageRemovePreview = {
+  engine_id: string;
+  runtime: ArtifactRuntimeContext;
+  /** SDK support level for image removal on this provider. */
+  capability: string;
+  image_id: string;
+  references: string[];
+  digests: string[];
+  estimated_reclaim_bytes: number | null;
+  active_jobs: number;
+  active_watch_sessions: number;
+  commit_enabled: boolean;
+  plan_id: string | null;
+  expires_in_seconds: number | null;
+};
+
+export type ImageRemoveResult = {
+  deleted: string[];
+  untagged: string[];
+};
+
+export async function previewRemoveImage(
+  engineId: string,
+  imageId: string,
+  options: DaemonRequestOptions = {},
+): Promise<ImageRemovePreview> {
+  return readJson(
+    `/v1/engines/${encodeURIComponent(engineId)}/images/${encodeURIComponent(imageId)}/remove/preview`,
+    { ...options, method: "POST" },
+  );
+}
+
+/** Commit a previewed removal by its opaque plan id. The server derives the target. */
+export async function commitRemoveImage(
+  planId: string,
+  options: DaemonRequestOptions = {},
+): Promise<ImageRemoveResult> {
+  return readJson(`/v1/engines/images/remove/commit/${encodeURIComponent(planId)}`, {
+    ...options,
+    method: "POST",
+  });
 }
 
 export type BuildCacheScopeStatus = {
