@@ -1628,4 +1628,150 @@ mod commit_plan_validation_tests {
         assert!(matches!(result, Err(ApiError::ActionUnavailable(_))));
         Ok(())
     }
+
+    /// A plan whose stored `identity_fingerprint` no longer matches what the
+    /// engine resolves to right now (selection swap, endpoint change,
+    /// re-observation) must never reach the provider call — this is the
+    /// "engine/profile race" gate, exercised through the real commit
+    /// handler with a deliberately wrong fingerprint rather than trying to
+    /// force an actual selection change mid-request.
+    #[tokio::test]
+    async fn commit_tag_image_rejects_when_engine_identity_has_changed_since_preview() -> TestResult
+    {
+        let state = test_state(fresh_db("artifacts-tag-identity-changed").await?);
+        let owner = crate::runtime::stable_suffix(&state.auth_token);
+        let ticket = state.action_plans.prepare(
+            &owner,
+            ActionKind::ImageTag,
+            ActionPlanPayload::ImageTag(ImageTagPlan {
+                engine_id: engines::PLATFORM_DEFAULT_ENGINE_ID.to_owned(),
+                runtime_profile_id: None,
+                source_image_id: "sha256:abc".to_owned(),
+                target_reference: "myapp:latest".to_owned(),
+                identity_fingerprint: "stale-fingerprint-from-a-superseded-preview".to_owned(),
+                source_fingerprint: "irrelevant".to_owned(),
+            }),
+        );
+
+        let result = commit_tag_image(
+            State(state),
+            authorized_headers(),
+            Path(ticket.plan_id),
+            axum::body::Bytes::new(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::ActionUnavailable(_))));
+        Ok(())
+    }
+
+    /// Mirrors the tag-side regression for image removal.
+    #[tokio::test]
+    async fn commit_remove_image_rejects_when_engine_identity_has_changed_since_preview()
+    -> TestResult {
+        let state = test_state(fresh_db("artifacts-remove-identity-changed").await?);
+        let owner = crate::runtime::stable_suffix(&state.auth_token);
+        let ticket = state.action_plans.prepare(
+            &owner,
+            ActionKind::ImageRemove,
+            ActionPlanPayload::ImageRemove(ImageRemovePlan {
+                engine_id: engines::PLATFORM_DEFAULT_ENGINE_ID.to_owned(),
+                runtime_profile_id: None,
+                image_id: "sha256:abc".to_owned(),
+                force: false,
+                identity_fingerprint: "stale-fingerprint-from-a-superseded-preview".to_owned(),
+                source_fingerprint: "irrelevant".to_owned(),
+            }),
+        );
+
+        let result = commit_remove_image(
+            State(state),
+            authorized_headers(),
+            Path(ticket.plan_id),
+            axum::body::Bytes::new(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::ActionUnavailable(_))));
+        Ok(())
+    }
+
+    /// Once the identity check passes, a plan naming a source image that no
+    /// longer exists (or a provider that has gone unreachable — the two
+    /// collapse to the same rejection path here, since both come back
+    /// through `image_for_mutation`) must still be rejected, never silently
+    /// treated as success. Uses the real, current identity fingerprint (via
+    /// the same helper `commit_tag_image` itself calls) so this exercises
+    /// the revalidation step *after* identity, not identity itself.
+    #[tokio::test]
+    async fn commit_tag_image_rejects_a_plan_whose_source_image_is_gone_or_unreachable()
+    -> TestResult {
+        let state = test_state(fresh_db("artifacts-tag-source-gone").await?);
+        let owner = crate::runtime::stable_suffix(&state.auth_token);
+        let engine = susun_integration::connect_engine_for_profile(&state.db, None)
+            .await
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        let identity_fingerprint =
+            engines::engine_identity_fingerprint(&state.db, &engine, None).await;
+
+        let ticket = state.action_plans.prepare(
+            &owner,
+            ActionKind::ImageTag,
+            ActionPlanPayload::ImageTag(ImageTagPlan {
+                engine_id: engines::PLATFORM_DEFAULT_ENGINE_ID.to_owned(),
+                runtime_profile_id: None,
+                source_image_id: "sha256:this-image-does-not-exist".to_owned(),
+                target_reference: "myapp:latest".to_owned(),
+                identity_fingerprint,
+                source_fingerprint: "irrelevant".to_owned(),
+            }),
+        );
+
+        let result = commit_tag_image(
+            State(state),
+            authorized_headers(),
+            Path(ticket.plan_id),
+            axum::body::Bytes::new(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::ActionUnavailable(_))));
+        Ok(())
+    }
+
+    /// Mirrors the tag-side regression for image removal.
+    #[tokio::test]
+    async fn commit_remove_image_rejects_a_plan_whose_image_is_gone_or_unreachable() -> TestResult {
+        let state = test_state(fresh_db("artifacts-remove-source-gone").await?);
+        let owner = crate::runtime::stable_suffix(&state.auth_token);
+        let engine = susun_integration::connect_engine_for_profile(&state.db, None)
+            .await
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        let identity_fingerprint =
+            engines::engine_identity_fingerprint(&state.db, &engine, None).await;
+
+        let ticket = state.action_plans.prepare(
+            &owner,
+            ActionKind::ImageRemove,
+            ActionPlanPayload::ImageRemove(ImageRemovePlan {
+                engine_id: engines::PLATFORM_DEFAULT_ENGINE_ID.to_owned(),
+                runtime_profile_id: None,
+                image_id: "sha256:this-image-does-not-exist".to_owned(),
+                force: false,
+                identity_fingerprint,
+                source_fingerprint: "irrelevant".to_owned(),
+            }),
+        );
+
+        let result = commit_remove_image(
+            State(state),
+            authorized_headers(),
+            Path(ticket.plan_id),
+            axum::body::Bytes::new(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::ActionUnavailable(_))));
+        Ok(())
+    }
 }

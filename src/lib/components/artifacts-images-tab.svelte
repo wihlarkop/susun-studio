@@ -73,6 +73,16 @@
     detailController = null;
     detailCache = {};
     expandedId = null;
+    // A tag/remove dialog holds confirmation data (source id, target
+    // reference, active-work counts) scoped to the engine it was opened
+    // against. Close it on an engine switch rather than let it keep
+    // showing that data — now labeled for a different engine — on screen;
+    // the dialogs' own effects would reject a stale plan at commit time
+    // either way, but the UI shouldn't invite committing against data that
+    // no longer describes the selected engine.
+    tagOpen = false;
+    removeOpen = false;
+    selectedImage = null;
 
     const controller = new AbortController();
     fetchState = resetForNewEngine(myGeneration, isConnected);

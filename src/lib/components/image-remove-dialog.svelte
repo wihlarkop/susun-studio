@@ -45,17 +45,19 @@
   // never be read back out of `mutationState` inside the effect below.
   let generation = 0;
 
-  // Re-arms the dialog whenever it opens or the target image changes, so a
-  // preview/commit response for a row the user has since navigated away
-  // from can never be applied to this one.
+  // Re-arms the dialog whenever it opens, the target image changes, or the
+  // engine changes, so a preview/commit response for a row (or engine) the
+  // user has since navigated away from can never be applied to this one.
   $effect(() => {
     const isOpen = open;
     const id = image.id;
+    const engine = engineId;
     generation += 1;
     mutationState = resetMutation(generation);
     confirmText = "";
     void isOpen;
     void id;
+    void engine;
   });
 
   const primaryReference = $derived(image.references[0] ?? image.id);
@@ -87,7 +89,14 @@
 
   async function confirm() {
     const planId = mutationState.preview?.plan_id;
-    if (!mutationState.preview?.commit_enabled || !planId || confirmText !== "remove") return;
+    if (
+      mutationState.phase !== "previewed" ||
+      !mutationState.preview?.commit_enabled ||
+      !planId ||
+      confirmText !== "remove"
+    ) {
+      return;
+    }
     mutationState = startCommitting(mutationState);
     const requestGeneration = mutationState.generation;
     try {

@@ -46,12 +46,17 @@
   // never be read back out of `mutationState` inside the effect below.
   let generation = 0;
 
+  // Re-arms the dialog whenever it opens or the engine changes, so a
+  // preview/commit response for an engine the user has since switched away
+  // from can never be applied to this one.
   $effect(() => {
     const isOpen = open;
+    const engine = engineId;
     generation += 1;
     mutationState = resetMutation(generation);
     confirmText = "";
     void isOpen;
+    void engine;
   });
 
   async function preview() {
@@ -71,7 +76,14 @@
 
   async function confirm() {
     const planId = mutationState.preview?.plan_id;
-    if (!mutationState.preview?.commit_enabled || !planId || confirmText !== "prune") return;
+    if (
+      mutationState.phase !== "previewed" ||
+      !mutationState.preview?.commit_enabled ||
+      !planId ||
+      confirmText !== "prune"
+    ) {
+      return;
+    }
     mutationState = startCommitting(mutationState);
     const requestGeneration = mutationState.generation;
     try {
@@ -94,6 +106,17 @@
       report.volumes_removed.length +
       report.images_removed.length
     );
+  }
+
+  // Build-cache reclaim has no per-resource removed list in `PruneReport`
+  // (unlike containers/networks/volumes/images) — reporting "Removed 0
+  // resource(s)" for it would be misleading even when bytes were reclaimed,
+  // so this scope gets its own wording keyed off bytes instead of a count.
+  function successMessage(report: PruneReport): string {
+    if (scope === "build_cache") {
+      return `Build cache pruned. Reclaimed ${formatBytes(report.space_reclaimed_bytes)}.`;
+    }
+    return `Removed ${totalRemoved(report)} resource(s). Reclaimed ${formatBytes(report.space_reclaimed_bytes)}.`;
   }
 
   const scopeNoun = $derived(scope === "build_cache" ? "build cache" : scope);
@@ -148,10 +171,7 @@
 
     {#if mutationState.result}
       <div class="bg-muted/40 rounded-md border p-2 text-sm">
-        <p>Removed {totalRemoved(mutationState.result)} resource(s).</p>
-        <p class="text-muted-foreground">
-          Reclaimed {formatBytes(mutationState.result.space_reclaimed_bytes)}.
-        </p>
+        <p>{successMessage(mutationState.result)}</p>
       </div>
     {:else}
       <label class="flex flex-col gap-1 text-sm">

@@ -37,6 +37,12 @@
   } = $props();
 
   let targetReference = $state("");
+  // The exact reference string that produced the current preview/plan — not
+  // necessarily `targetReference`'s live value. Committing must be gated on
+  // these still matching: otherwise the user could preview `app:v1`, edit
+  // the input to `app:v2` without re-previewing, and Tag would still commit
+  // the server-held `app:v1` plan while the input shows `app:v2`.
+  let previewedTargetReference = $state<string | null>(null);
   let mutationState = $state<MutationState<ImageTagPreview, ImageTagResult>>(
     resetMutation(0),
   );
@@ -44,17 +50,20 @@
   // never be read back out of `mutationState` inside the effect below.
   let generation = 0;
 
-  // Re-arms the dialog whenever it opens or the target image changes, so a
-  // preview/commit response for a row the user has since navigated away
-  // from can never be applied to this one.
+  // Re-arms the dialog whenever it opens, the target image changes, or the
+  // engine changes, so a preview/commit response for a row (or engine) the
+  // user has since navigated away from can never be applied to this one.
   $effect(() => {
     const isOpen = open;
     const id = image.id;
+    const engine = engineId;
     generation += 1;
     mutationState = resetMutation(generation);
     targetReference = "";
+    previewedTargetReference = null;
     void isOpen;
     void id;
+    void engine;
   });
 
   const primaryReference = $derived(image.references[0] ?? image.id);
@@ -68,10 +77,14 @@
         })
       : null,
   );
+  const inputDiverged = $derived(
+    mutationState.phase === "previewed" && targetReference.trim() !== previewedTargetReference,
+  );
 
   async function preview() {
     const reference = targetReference.trim();
     if (!reference) return;
+    previewedTargetReference = reference;
     mutationState = startPreviewing(mutationState);
     const requestGeneration = mutationState.generation;
     try {
@@ -88,7 +101,14 @@
 
   async function confirm() {
     const planId = mutationState.preview?.plan_id;
-    if (!mutationState.preview?.commit_enabled || !planId) return;
+    if (
+      mutationState.phase !== "previewed" ||
+      !mutationState.preview?.commit_enabled ||
+      !planId ||
+      inputDiverged
+    ) {
+      return;
+    }
     mutationState = startCommitting(mutationState);
     const requestGeneration = mutationState.generation;
     try {
@@ -150,6 +170,12 @@
       </div>
     {/if}
 
+    {#if inputDiverged}
+      <p class="text-muted-foreground text-sm">
+        The reference changed since preview. Preview again before tagging.
+      </p>
+    {/if}
+
     {#if mutationState.result}
       <div class="bg-muted/40 rounded-md border p-2 text-sm">
         Tagged as <span class="font-mono">{mutationState.result.target}</span>.
@@ -170,7 +196,9 @@
       </Button>
       <Button
         type="button"
-        disabled={mutationState.phase !== "previewed" || !mutationState.preview?.commit_enabled}
+        disabled={mutationState.phase !== "previewed" ||
+          !mutationState.preview?.commit_enabled ||
+          inputDiverged}
         onclick={confirm}
       >
         {mutationState.phase === "committing" ? "Tagging…" : "Tag"}

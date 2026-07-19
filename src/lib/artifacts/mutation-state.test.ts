@@ -108,18 +108,31 @@ describe("commit flow", () => {
     expect(result.result).toBeNull();
   });
 
-  it("falls back to previewed (not idle) on a same-generation commit error, keeping the plan's preview on screen", () => {
+  it("falls back to commit_failed (not previewed, not idle) on a same-generation commit error, keeping the plan's preview on screen", () => {
     const state = startCommitting(previewed());
     const next = applyCommitError(state, state.generation, {
       status: 422,
       message: "This request could not be completed right now.",
     });
-    expect(next.phase).toBe("previewed");
+    expect(next.phase).toBe("commit_failed");
     expect(next.preview).toEqual(state.preview);
     expect(next.error).toEqual({
       status: 422,
       message: "This request could not be completed right now.",
     });
+  });
+
+  it('commit_failed is distinct from previewed so a caller gating commit on phase === "previewed" can never replay a rejected plan', () => {
+    const state = startCommitting(previewed());
+    const next = applyCommitError(state, state.generation, {
+      status: 422,
+      message: "plan already consumed",
+    });
+    expect(next.phase).not.toBe("previewed");
+    // The preview's own commit_enabled flag is still true (it reflects what
+    // the daemon reported at preview time, not the plan's current spent
+    // state) — callers must gate on `phase`, not on this field alone.
+    expect(next.preview?.commit_enabled).toBe(true);
   });
 
   it("ignores a commit error from a superseded generation", () => {

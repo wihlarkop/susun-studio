@@ -7,7 +7,13 @@ import type { ArtifactRequestError } from "./workspace-state";
  * types — so the confirmation flow's state transitions can be tested once,
  * directly, without mounting a component or a live daemon.
  */
-export type MutationPhase = "idle" | "previewing" | "previewed" | "committing" | "succeeded";
+export type MutationPhase =
+  | "idle"
+  | "previewing"
+  | "previewed"
+  | "committing"
+  | "succeeded"
+  | "commit_failed";
 
 export type MutationState<TPreview, TResult> = {
   phase: MutationPhase;
@@ -92,20 +98,24 @@ export function applyCommitSuccess<TPreview, TResult>(
   return { ...state, phase: "succeeded", result, error: null };
 }
 
-/** Applies a failed commit, unless superseded. Falls back to `previewed`
- * (not `idle`): the daemon rejects a stale/consumed/mismatched plan with a
- * specific reason, and the user should see that reason next to the preview
- * that produced it rather than have it silently discarded. The preview
- * itself is no longer valid for a retry — the caller must re-preview to get
- * a fresh plan — but keeping it on screen is what lets the user see what
- * they were trying to do. */
+/** Applies a failed commit, unless superseded. Falls back to `commit_failed`
+ * (not `previewed`, and not `idle`): the daemon rejects a stale/consumed/
+ * mismatched plan with a specific reason, and the user should see that
+ * reason next to the preview that produced it rather than have it silently
+ * discarded. It is deliberately a distinct phase from `previewed` — the
+ * plan the daemon just rejected (or, on a real rejection, already
+ * consumed) can never be committed again, so every caller's "is commit
+ * enabled" check must gate on `phase === "previewed"` specifically, not on
+ * `preview.commit_enabled` alone, or a retry would replay the same spent
+ * plan id and fail every time. The caller must re-preview to get a fresh
+ * plan; the stale preview stays on screen only for context. */
 export function applyCommitError<TPreview, TResult>(
   state: MutationState<TPreview, TResult>,
   requestGeneration: number,
   error: ArtifactRequestError,
 ): MutationState<TPreview, TResult> {
   if (requestGeneration !== state.generation) return state;
-  return { ...state, phase: "previewed", error };
+  return { ...state, phase: "commit_failed", error };
 }
 
 /**
