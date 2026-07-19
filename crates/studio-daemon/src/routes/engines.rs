@@ -315,7 +315,7 @@ pub struct PruneResponse {
 }
 
 /// Commit endpoints carry no body; the executable policy lives in the plan.
-fn reject_commit_body(body: &Bytes) -> Result<(), ApiError> {
+pub(crate) fn reject_commit_body(body: &Bytes) -> Result<(), ApiError> {
     if body.is_empty() {
         Ok(())
     } else {
@@ -327,7 +327,7 @@ fn reject_commit_body(body: &Bytes) -> Result<(), ApiError> {
 /// profile's identity (or `platform_default`) plus the engine API version. Any
 /// selection swap, endpoint change, re-observation, or provider version change
 /// changes this, so a plan cannot be committed against a different engine.
-async fn engine_identity_fingerprint(
+pub(crate) async fn engine_identity_fingerprint(
     db: &turso::Database,
     engine: &susun_engine_bollard::BollardEngine,
     profile_id: Option<&str>,
@@ -371,7 +371,7 @@ async fn engine_identity_fingerprint(
 /// database fault propagates as `Err` (a 500, via `ApiError`'s existing
 /// `From<turso::Error>`) instead: the two must not collapse into the same
 /// "reject the plan" outcome, since one is a daemon fault, not a stale plan.
-async fn revalidate_engine_still_selected(
+pub(crate) async fn revalidate_engine_still_selected(
     db: &turso::Database,
     plan_engine_id: &str,
 ) -> Result<bool, ApiError> {
@@ -425,7 +425,7 @@ fn estimated_reclaim(preview: &susun_integration::CleanupPreviewRow) -> Option<u
 
 /// Active work attributed to the exact runtime profile. Prune affects the whole
 /// engine behind that profile, so any matching job or watch session blocks it.
-async fn engine_active_work(
+pub(crate) async fn engine_active_work(
     db: &turso::Database,
     profile_id: Option<&str>,
 ) -> Result<(i64, i64), turso::Error> {
@@ -874,7 +874,7 @@ pub async fn commit_prune(
     Ok(Json(response))
 }
 
-fn now_ms() -> Result<i64, ApiError> {
+pub(crate) fn now_ms() -> Result<i64, ApiError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ApiError::Clock)?;

@@ -2,8 +2,9 @@ use std::{path::PathBuf, sync::Arc, time::SystemTime};
 
 use susun::{
     CancellationToken, ContainerEngine, DownPlanOptions, EngineCapabilities, EngineEndpoint,
-    EngineSnapshot, EventSink, ExecutionPlan, ExecutionReport, PlanOutcome, ProjectSummary,
-    Runtime, SdkProject, SusunWorkspace, UpPlanOptions, render_diagnostics_json, render_plan_json,
+    EngineSnapshot, EventSink, ExecutionPlan, ExecutionReport, ImageRef, ImageRemoveRequest,
+    ImageSelector, ImageTagRequest, PlanOutcome, ProjectSummary, Runtime, SdkProject,
+    SusunWorkspace, UpPlanOptions, render_diagnostics_json, render_plan_json,
 };
 use susun_engine_bollard::BollardEngine;
 use turso::Database;
@@ -753,6 +754,59 @@ pub async fn system_prune(
             .map(ToString::to_string)
             .collect(),
         space_reclaimed_bytes: report.space_reclaimed_bytes,
+    })
+}
+
+/// Display-safe result of adding a new reference to an existing image.
+pub struct ImageTagRow {
+    pub source: String,
+    pub target: String,
+}
+
+/// Adds `target` (a `repository:tag` reference) to the image identified by
+/// `source` (an opaque engine id or existing reference). Never removes or
+/// replaces any existing reference.
+pub async fn tag_image(
+    engine: &BollardEngine,
+    source: &str,
+    target: &str,
+) -> Result<ImageTagRow, String> {
+    let source = ImageSelector::new(source.to_owned()).map_err(|error| error.to_string())?;
+    let target = ImageRef::new(target.to_owned());
+    let request = ImageTagRequest::new(source, target);
+    let result = engine
+        .tag_image(request)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(ImageTagRow {
+        source: result.source.as_str().to_owned(),
+        target: result.target.as_str().to_owned(),
+    })
+}
+
+/// Display-safe result of removing one image.
+pub struct ImageRemoveRow {
+    pub deleted: Vec<String>,
+    pub untagged: Vec<String>,
+}
+
+/// Removes one image, identified by an opaque engine id or existing
+/// reference. `force` allows removal of an image still referenced by a
+/// stopped container; untagged parent layers are left alone.
+pub async fn remove_image(
+    engine: &BollardEngine,
+    image: &str,
+    force: bool,
+) -> Result<ImageRemoveRow, String> {
+    let image = ImageSelector::new(image.to_owned()).map_err(|error| error.to_string())?;
+    let request = ImageRemoveRequest::new(image).with_force(force);
+    let result = engine
+        .remove_image(request)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(ImageRemoveRow {
+        deleted: result.deleted.iter().map(ToString::to_string).collect(),
+        untagged: result.untagged.iter().map(ToString::to_string).collect(),
     })
 }
 

@@ -1,7 +1,9 @@
 //! Engine-wide artifact inventory (images, containers, build cache, and
 //! registry capability) sourced entirely from the public Susun facade.
-//! Everything here is read-only: nothing pulls, pushes, builds, tags, or
-//! prunes. Mutating artifact workflows are Phase 15b+.
+//! Listing and detail lookups here are read-only. [`image_for_mutation`] is
+//! the one exception: it looks up a single image to gate and fingerprint a
+//! tag/remove mutation handled in `routes::artifacts` — it never itself
+//! pulls, pushes, builds, tags, or prunes.
 
 use susun::{
     ContainerEngine, ContainerId, DockerCompatibleEngine, EngineError, ImageId, ProjectName,
@@ -334,6 +336,35 @@ pub async fn image_details(
         .map_err(|error| ArtifactError::Provider(error.to_string()))?;
     let capability = enum_label(capabilities.supports_image_inventory);
     if !capabilities.supports_image_inventory.is_supported() {
+        return Ok(DetailLookup::Unsupported { capability });
+    }
+
+    let id = ImageId::new(image_id.to_owned())
+        .map_err(|_| ArtifactError::Provider("image id must not be empty".to_owned()))?;
+    match engine.image_details(&id).await {
+        Ok(image) => Ok(DetailLookup::Found {
+            capability,
+            value: image_summary_row(&image),
+        }),
+        Err(EngineError::NotFound { .. }) => Ok(DetailLookup::NotFound),
+        Err(error) => Err(ArtifactError::Provider(error.to_string())),
+    }
+}
+
+/// Capability-gated lookup of one image for a tag/remove mutation preview or
+/// commit revalidation. Distinct from [`image_details`]'s gate: mutations are
+/// gated on `supports_image_management`, never `supports_image_inventory` —
+/// a provider can list images without supporting tag/remove, or vice versa.
+pub async fn image_for_mutation(
+    engine: &DockerCompatibleEngine,
+    image_id: &str,
+) -> Result<DetailLookup<ImageSummaryRow>, ArtifactError> {
+    let capabilities = engine
+        .capabilities()
+        .await
+        .map_err(|error| ArtifactError::Provider(error.to_string()))?;
+    let capability = enum_label(capabilities.supports_image_management);
+    if !capabilities.supports_image_management.is_supported() {
         return Ok(DetailLookup::Unsupported { capability });
     }
 

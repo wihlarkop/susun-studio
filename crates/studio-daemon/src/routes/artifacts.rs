@@ -1,20 +1,31 @@
-//! Read-only, capability-gated endpoints for engine-wide artifacts: images,
-//! containers, build cache, and registry capability. Nothing here mutates,
-//! pulls, pushes, builds, tags, or prunes — that is Phase 15b+ scope.
+//! Capability-gated endpoints for engine-wide artifacts: images, containers,
+//! build cache, and registry capability. Listing and detail routes are
+//! read-only. Image tag and remove are opaque-plan mutations mirroring
+//! `routes::engines`'s prune preview/commit envelope exactly: a preview
+//! mints a commit plan only when the capability is supported and nothing is
+//! actively running, and commit revalidates engine identity, image
+//! inventory, and active work immediately before calling the provider.
+//! Image and build-cache pruning reuse `routes::engines`'s existing prune
+//! preview/commit endpoints directly (scopes `"images"` / `"build_cache"`)
+//! rather than duplicating that envelope here. Build execution, pull, push,
+//! and container lifecycle mutations remain out of scope.
 
 use axum::{
     Json,
+    body::Bytes,
     extract::{Path, State},
     http::HeaderMap,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use super::engines::resolve_and_validate_engine;
+use super::engines::{self, resolve_and_validate_engine};
 use crate::{
+    action_audit::{self, AffectedCount, AuditEntry},
+    action_plans::{ActionKind, ActionPlanPayload, ImageRemovePlan, ImageTagPlan, PlanState},
     artifact_inventory::{self, DetailLookup, RuntimeContextRow},
     auth::authorize,
     error::ApiError,
-    logging,
+    logging, runtime,
     state::AppState,
     susun_integration,
 };
@@ -337,6 +348,761 @@ pub async fn read_engine_image(
     Ok(Json(image_detail_response(engine_id, runtime_ctx, lookup)?))
 }
 
+/// Fingerprints an image's engine-reported identity (references, digests,
+/// size) at preview time so a commit can detect any change since preview.
+fn image_fingerprint(image: &artifact_inventory::ImageSummaryRow) -> String {
+    let mut canonical = format!(
+        "id={};size={};shared_size={};",
+        image.id,
+        image.size_bytes.unwrap_or_default(),
+        image.shared_size_bytes.unwrap_or_default()
+    );
+    for reference in &image.references {
+        canonical.push_str(reference);
+        canonical.push('|');
+    }
+    for digest in &image.digests {
+        canonical.push_str(digest);
+        canonical.push('|');
+    }
+    runtime::stable_suffix(&canonical)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TagImageRequest {
+    pub target_reference: String,
+}
+
+/// Non-mutating tag preview: confirms the provider advertises tagging
+/// support and the source image still exists, then mints a commit plan
+/// pinned to both. A commit plan is minted only when the capability is
+/// supported, the source image is found, and nothing is actively running
+/// against this engine.
+#[derive(Debug, Serialize)]
+pub struct ImageTagPreview {
+    pub engine_id: String,
+    pub runtime: ArtifactRuntimeContext,
+    /// SDK support level for image tagging on this provider.
+    pub capability: String,
+    pub source_image_id: String,
+    pub source_references: Vec<String>,
+    pub target_reference: String,
+    pub active_jobs: i64,
+    pub active_watch_sessions: i64,
+    pub commit_enabled: bool,
+    pub plan_id: Option<String>,
+    pub expires_in_seconds: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImageTagResponse {
+    pub source: String,
+    pub target: String,
+}
+
+pub async fn preview_tag_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((engine_id, image_id)): Path<(String, String)>,
+    Json(request): Json<TagImageRequest>,
+) -> Result<Json<ImageTagPreview>, ApiError> {
+    authorize(&state, &headers)?;
+    let resolved = resolve_and_validate_engine(&state, &engine_id).await?;
+    let engine_id = resolved.engine_id;
+    let runtime_profile_id = resolved.runtime_profile_id;
+    let owner = runtime::stable_suffix(&state.auth_token);
+
+    let target_reference = request.target_reference.trim().to_owned();
+    if target_reference.is_empty() {
+        return Err(ApiError::ActionUnavailable(
+            "A target repository:tag reference is required.".to_owned(),
+        ));
+    }
+
+    // Connect using the exact profile just resolved above — never
+    // re-resolve selection here, for the same race-avoidance reason as the
+    // read-only artifact routes.
+    let engine =
+        susun_integration::connect_engine_for_profile(&state.db, runtime_profile_id.as_deref())
+            .await
+            .map_err(ApiError::EngineUnavailable)?;
+    let runtime_ctx = artifact_inventory::runtime_context(&state.db, runtime_profile_id.as_deref())
+        .await?
+        .into();
+
+    let lookup = artifact_inventory::image_for_mutation(&engine, &image_id).await?;
+    let (active_jobs, active_watch_sessions) =
+        engines::engine_active_work(&state.db, runtime_profile_id.as_deref()).await?;
+    let has_active_work = active_jobs > 0 || active_watch_sessions > 0;
+
+    let (capability, source) = match lookup {
+        DetailLookup::Unsupported { capability } => {
+            logging::warn(
+                "image_tag_previewed",
+                &[
+                    ("engine_id", engine_id.clone()),
+                    ("capability", capability.clone()),
+                ],
+            );
+            return Ok(Json(ImageTagPreview {
+                engine_id,
+                runtime: runtime_ctx,
+                capability,
+                source_image_id: image_id,
+                source_references: Vec::new(),
+                target_reference,
+                active_jobs,
+                active_watch_sessions,
+                commit_enabled: false,
+                plan_id: None,
+                expires_in_seconds: None,
+            }));
+        }
+        DetailLookup::NotFound => return Err(ApiError::ArtifactNotFound),
+        DetailLookup::Found { capability, value } => (capability, value),
+    };
+
+    let (plan_id, expires_in_seconds, commit_enabled) = if has_active_work {
+        (None, None, false)
+    } else {
+        let identity_fingerprint =
+            engines::engine_identity_fingerprint(&state.db, &engine, runtime_profile_id.as_deref())
+                .await;
+        let ticket = state.action_plans.prepare(
+            &owner,
+            ActionKind::ImageTag,
+            ActionPlanPayload::ImageTag(ImageTagPlan {
+                engine_id: engine_id.clone(),
+                runtime_profile_id: runtime_profile_id.clone(),
+                source_image_id: source.id.clone(),
+                target_reference: target_reference.clone(),
+                identity_fingerprint,
+                source_fingerprint: image_fingerprint(&source),
+            }),
+        );
+        (Some(ticket.plan_id), Some(ticket.expires_in_seconds), true)
+    };
+
+    logging::warn(
+        "image_tag_previewed",
+        &[
+            ("engine_id", engine_id.clone()),
+            ("commit_enabled", commit_enabled.to_string()),
+        ],
+    );
+
+    Ok(Json(ImageTagPreview {
+        engine_id,
+        runtime: runtime_ctx,
+        capability,
+        source_image_id: source.id,
+        source_references: source.references,
+        target_reference,
+        active_jobs,
+        active_watch_sessions,
+        commit_enabled,
+        plan_id,
+        expires_in_seconds,
+    }))
+}
+
+pub async fn commit_tag_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(plan_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<ImageTagResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    engines::reject_commit_body(&body)?;
+    let owner = runtime::stable_suffix(&state.auth_token);
+    let started = engines::now_ms()?;
+
+    let claimed = state
+        .action_plans
+        .claim(&plan_id, &owner, &[ActionKind::ImageTag])
+        .map_err(|error| ApiError::ActionUnavailable(error.to_string()))?;
+    let ActionPlanPayload::ImageTag(plan) = claimed.payload else {
+        state
+            .action_plans
+            .finish(&claimed.plan_id, PlanState::Failed);
+        return Err(ApiError::ActionUnavailable(
+            "Plan did not match an image tag.".to_owned(),
+        ));
+    };
+
+    logging::warn(
+        "image_tag_started",
+        &[("engine_id", plan.engine_id.clone())],
+    );
+
+    async fn reject(
+        state: &AppState,
+        plan_id: &str,
+        profile_id: Option<String>,
+        code: &'static str,
+        message: String,
+    ) -> ApiError {
+        state.action_plans.finish(plan_id, PlanState::Failed);
+        let _ = action_audit::record_rejection(
+            &state.db,
+            ActionKind::ImageTag,
+            profile_id,
+            "rejected_state",
+            code,
+        )
+        .await;
+        ApiError::ActionUnavailable(message)
+    }
+
+    let engine = match susun_integration::connect_engine_for_profile(
+        &state.db,
+        plan.runtime_profile_id.as_deref(),
+    )
+    .await
+    {
+        Ok(engine) => engine,
+        Err(error) => {
+            state
+                .action_plans
+                .finish(&claimed.plan_id, PlanState::Failed);
+            let _ = action_audit::record_rejection(
+                &state.db,
+                ActionKind::ImageTag,
+                plan.runtime_profile_id.clone(),
+                "rejected_state",
+                "provider_unreachable",
+            )
+            .await;
+            return Err(ApiError::EngineUnavailable(error));
+        }
+    };
+
+    if engines::engine_identity_fingerprint(&state.db, &engine, plan.runtime_profile_id.as_deref())
+        .await
+        != plan.identity_fingerprint
+    {
+        return Err(reject(
+            &state,
+            &claimed.plan_id,
+            plan.runtime_profile_id.clone(),
+            "engine_identity_changed",
+            "The selected engine or its endpoint changed since preview. Preview the tag again."
+                .to_owned(),
+        )
+        .await);
+    }
+
+    let lookup = match artifact_inventory::image_for_mutation(&engine, &plan.source_image_id).await
+    {
+        Ok(lookup) => lookup,
+        Err(_) => {
+            return Err(reject(
+                &state,
+                &claimed.plan_id,
+                plan.runtime_profile_id.clone(),
+                "inventory_unavailable",
+                "Image inventory is no longer available. Preview the tag again.".to_owned(),
+            )
+            .await);
+        }
+    };
+    let source = match lookup {
+        DetailLookup::Found { value, .. } => value,
+        DetailLookup::NotFound => {
+            return Err(reject(
+                &state,
+                &claimed.plan_id,
+                plan.runtime_profile_id.clone(),
+                "source_image_missing",
+                "The source image no longer exists. Preview the tag again.".to_owned(),
+            )
+            .await);
+        }
+        DetailLookup::Unsupported { .. } => {
+            return Err(reject(
+                &state,
+                &claimed.plan_id,
+                plan.runtime_profile_id.clone(),
+                "capability_withdrawn",
+                "Image tagging is no longer supported on this engine.".to_owned(),
+            )
+            .await);
+        }
+    };
+    if image_fingerprint(&source) != plan.source_fingerprint {
+        return Err(reject(
+            &state,
+            &claimed.plan_id,
+            plan.runtime_profile_id.clone(),
+            "stale_inventory",
+            "The source image changed since preview. Preview the tag again.".to_owned(),
+        )
+        .await);
+    }
+
+    let (jobs, watch) =
+        match engines::engine_active_work(&state.db, plan.runtime_profile_id.as_deref()).await {
+            Ok(active) => active,
+            Err(_) => {
+                return Err(reject(
+                    &state,
+                    &claimed.plan_id,
+                    plan.runtime_profile_id.clone(),
+                    "active_work_unavailable",
+                    "Active work could not be verified. Preview the tag again.".to_owned(),
+                )
+                .await);
+            }
+        };
+    if jobs > 0 || watch > 0 {
+        return Err(reject(
+            &state,
+            &claimed.plan_id,
+            plan.runtime_profile_id.clone(),
+            "active_work",
+            "A job or watch session is running. Stop it and preview the tag again.".to_owned(),
+        )
+        .await);
+    }
+
+    match engines::revalidate_engine_still_selected(&state.db, &plan.engine_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(reject(
+                &state,
+                &claimed.plan_id,
+                plan.runtime_profile_id.clone(),
+                "engine_removed_or_changed",
+                "The selected engine changed or is no longer available since preview. Preview the tag again."
+                    .to_owned(),
+            )
+            .await);
+        }
+        Err(error) => {
+            state
+                .action_plans
+                .finish(&claimed.plan_id, PlanState::Failed);
+            return Err(error);
+        }
+    }
+
+    let result =
+        match susun_integration::tag_image(&engine, &plan.source_image_id, &plan.target_reference)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                state
+                    .action_plans
+                    .finish(&claimed.plan_id, PlanState::Failed);
+                let _ = action_audit::record_rejection(
+                    &state.db,
+                    ActionKind::ImageTag,
+                    plan.runtime_profile_id.clone(),
+                    "failed",
+                    "tag_failed",
+                )
+                .await;
+                return Err(ApiError::EngineUnavailable(error));
+            }
+        };
+
+    state
+        .action_plans
+        .finish(&claimed.plan_id, PlanState::Succeeded);
+    let _ = action_audit::record(
+        &state.db,
+        AuditEntry {
+            kind: ActionKind::ImageTag,
+            profile_id: plan.runtime_profile_id,
+            runtime_class: None,
+            ownership_result: "authorized".to_owned(),
+            command_kind: Some("provider_image_tag".to_owned()),
+            elevation_mode: Some("none".to_owned()),
+            terminal_status: action_audit::STATUS_COMPLETED.to_owned(),
+            affected: vec![AffectedCount {
+                category: "images_tagged".to_owned(),
+                count: 1,
+            }],
+            failure_code: None,
+            correlation_token: None,
+            started_at_ms: started,
+            completed_at_ms: Some(engines::now_ms()?),
+        },
+    )
+    .await;
+
+    logging::warn(
+        "image_tag_finished",
+        &[("engine_id", plan.engine_id.clone())],
+    );
+
+    Ok(Json(ImageTagResponse {
+        source: result.source,
+        target: result.target,
+    }))
+}
+
+/// Non-mutating remove preview: confirms the provider advertises removal
+/// support and the image still exists, then mints a commit plan pinned to
+/// it. `estimated_reclaim_bytes` is the image's own reported size — a
+/// best-effort estimate, since shared layers may not all be reclaimed.
+#[derive(Debug, Serialize)]
+pub struct ImageRemovePreview {
+    pub engine_id: String,
+    pub runtime: ArtifactRuntimeContext,
+    /// SDK support level for image removal on this provider.
+    pub capability: String,
+    pub image_id: String,
+    pub references: Vec<String>,
+    pub digests: Vec<String>,
+    pub estimated_reclaim_bytes: Option<u64>,
+    pub active_jobs: i64,
+    pub active_watch_sessions: i64,
+    pub commit_enabled: bool,
+    pub plan_id: Option<String>,
+    pub expires_in_seconds: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImageRemoveResponse {
+    pub deleted: Vec<String>,
+    pub untagged: Vec<String>,
+}
+
+pub async fn preview_remove_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((engine_id, image_id)): Path<(String, String)>,
+) -> Result<Json<ImageRemovePreview>, ApiError> {
+    authorize(&state, &headers)?;
+    let resolved = resolve_and_validate_engine(&state, &engine_id).await?;
+    let engine_id = resolved.engine_id;
+    let runtime_profile_id = resolved.runtime_profile_id;
+    let owner = runtime::stable_suffix(&state.auth_token);
+
+    let engine =
+        susun_integration::connect_engine_for_profile(&state.db, runtime_profile_id.as_deref())
+            .await
+            .map_err(ApiError::EngineUnavailable)?;
+    let runtime_ctx = artifact_inventory::runtime_context(&state.db, runtime_profile_id.as_deref())
+        .await?
+        .into();
+
+    let lookup = artifact_inventory::image_for_mutation(&engine, &image_id).await?;
+    let (active_jobs, active_watch_sessions) =
+        engines::engine_active_work(&state.db, runtime_profile_id.as_deref()).await?;
+    let has_active_work = active_jobs > 0 || active_watch_sessions > 0;
+
+    let (capability, target) = match lookup {
+        DetailLookup::Unsupported { capability } => {
+            logging::warn(
+                "image_remove_previewed",
+                &[
+                    ("engine_id", engine_id.clone()),
+                    ("capability", capability.clone()),
+                ],
+            );
+            return Ok(Json(ImageRemovePreview {
+                engine_id,
+                runtime: runtime_ctx,
+                capability,
+                image_id,
+                references: Vec::new(),
+                digests: Vec::new(),
+                estimated_reclaim_bytes: None,
+                active_jobs,
+                active_watch_sessions,
+                commit_enabled: false,
+                plan_id: None,
+                expires_in_seconds: None,
+            }));
+        }
+        DetailLookup::NotFound => return Err(ApiError::ArtifactNotFound),
+        DetailLookup::Found { capability, value } => (capability, value),
+    };
+
+    let (plan_id, expires_in_seconds, commit_enabled) = if has_active_work {
+        (None, None, false)
+    } else {
+        let identity_fingerprint =
+            engines::engine_identity_fingerprint(&state.db, &engine, runtime_profile_id.as_deref())
+                .await;
+        let ticket = state.action_plans.prepare(
+            &owner,
+            ActionKind::ImageRemove,
+            ActionPlanPayload::ImageRemove(ImageRemovePlan {
+                engine_id: engine_id.clone(),
+                runtime_profile_id: runtime_profile_id.clone(),
+                image_id: target.id.clone(),
+                force: false,
+                identity_fingerprint,
+                source_fingerprint: image_fingerprint(&target),
+            }),
+        );
+        (Some(ticket.plan_id), Some(ticket.expires_in_seconds), true)
+    };
+
+    logging::warn(
+        "image_remove_previewed",
+        &[
+            ("engine_id", engine_id.clone()),
+            ("commit_enabled", commit_enabled.to_string()),
+        ],
+    );
+
+    Ok(Json(ImageRemovePreview {
+        engine_id,
+        runtime: runtime_ctx,
+        capability,
+        image_id: target.id,
+        references: target.references,
+        digests: target.digests,
+        estimated_reclaim_bytes: target.size_bytes,
+        active_jobs,
+        active_watch_sessions,
+        commit_enabled,
+        plan_id,
+        expires_in_seconds,
+    }))
+}
+
+pub async fn commit_remove_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(plan_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<ImageRemoveResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    engines::reject_commit_body(&body)?;
+    let owner = runtime::stable_suffix(&state.auth_token);
+    let started = engines::now_ms()?;
+
+    let claimed = state
+        .action_plans
+        .claim(&plan_id, &owner, &[ActionKind::ImageRemove])
+        .map_err(|error| ApiError::ActionUnavailable(error.to_string()))?;
+    let ActionPlanPayload::ImageRemove(plan) = claimed.payload else {
+        state
+            .action_plans
+            .finish(&claimed.plan_id, PlanState::Failed);
+        return Err(ApiError::ActionUnavailable(
+            "Plan did not match an image removal.".to_owned(),
+        ));
+    };
+
+    logging::warn(
+        "image_remove_started",
+        &[("engine_id", plan.engine_id.clone())],
+    );
+
+    async fn reject(
+        state: &AppState,
+        plan_id: &str,
+        profile_id: Option<String>,
+        code: &'static str,
+        message: String,
+    ) -> ApiError {
+        state.action_plans.finish(plan_id, PlanState::Failed);
+        let _ = action_audit::record_rejection(
+            &state.db,
+            ActionKind::ImageRemove,
+            profile_id,
+            "rejected_state",
+            code,
+        )
+        .await;
+        ApiError::ActionUnavailable(message)
+    }
+
+    let engine = match susun_integration::connect_engine_for_profile(
+        &state.db,
+        plan.runtime_profile_id.as_deref(),
+    )
+    .await
+    {
+        Ok(engine) => engine,
+        Err(error) => {
+            state
+                .action_plans
+                .finish(&claimed.plan_id, PlanState::Failed);
+            let _ = action_audit::record_rejection(
+                &state.db,
+                ActionKind::ImageRemove,
+                plan.runtime_profile_id.clone(),
+                "rejected_state",
+                "provider_unreachable",
+            )
+            .await;
+            return Err(ApiError::EngineUnavailable(error));
+        }
+    };
+
+    if engines::engine_identity_fingerprint(&state.db, &engine, plan.runtime_profile_id.as_deref())
+        .await
+        != plan.identity_fingerprint
+    {
+        return Err(reject(
+            &state,
+            &claimed.plan_id,
+            plan.runtime_profile_id.clone(),
+            "engine_identity_changed",
+            "The selected engine or its endpoint changed since preview. Preview the removal again."
+                .to_owned(),
+        )
+        .await);
+    }
+
+    let lookup = match artifact_inventory::image_for_mutation(&engine, &plan.image_id).await {
+        Ok(lookup) => lookup,
+        Err(_) => {
+            return Err(reject(
+                &state,
+                &claimed.plan_id,
+                plan.runtime_profile_id.clone(),
+                "inventory_unavailable",
+                "Image inventory is no longer available. Preview the removal again.".to_owned(),
+            )
+            .await);
+        }
+    };
+    let target = match lookup {
+        DetailLookup::Found { value, .. } => value,
+        DetailLookup::NotFound => {
+            return Err(reject(
+                &state,
+                &claimed.plan_id,
+                plan.runtime_profile_id.clone(),
+                "image_already_gone",
+                "The image no longer exists. Preview the removal again.".to_owned(),
+            )
+            .await);
+        }
+        DetailLookup::Unsupported { .. } => {
+            return Err(reject(
+                &state,
+                &claimed.plan_id,
+                plan.runtime_profile_id.clone(),
+                "capability_withdrawn",
+                "Image removal is no longer supported on this engine.".to_owned(),
+            )
+            .await);
+        }
+    };
+    if image_fingerprint(&target) != plan.source_fingerprint {
+        return Err(reject(
+            &state,
+            &claimed.plan_id,
+            plan.runtime_profile_id.clone(),
+            "stale_inventory",
+            "The image changed since preview. Preview the removal again.".to_owned(),
+        )
+        .await);
+    }
+
+    let (jobs, watch) =
+        match engines::engine_active_work(&state.db, plan.runtime_profile_id.as_deref()).await {
+            Ok(active) => active,
+            Err(_) => {
+                return Err(reject(
+                    &state,
+                    &claimed.plan_id,
+                    plan.runtime_profile_id.clone(),
+                    "active_work_unavailable",
+                    "Active work could not be verified. Preview the removal again.".to_owned(),
+                )
+                .await);
+            }
+        };
+    if jobs > 0 || watch > 0 {
+        return Err(reject(
+            &state,
+            &claimed.plan_id,
+            plan.runtime_profile_id.clone(),
+            "active_work",
+            "A job or watch session is running. Stop it and preview the removal again.".to_owned(),
+        )
+        .await);
+    }
+
+    match engines::revalidate_engine_still_selected(&state.db, &plan.engine_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(reject(
+                &state,
+                &claimed.plan_id,
+                plan.runtime_profile_id.clone(),
+                "engine_removed_or_changed",
+                "The selected engine changed or is no longer available since preview. Preview the removal again."
+                    .to_owned(),
+            )
+            .await);
+        }
+        Err(error) => {
+            state
+                .action_plans
+                .finish(&claimed.plan_id, PlanState::Failed);
+            return Err(error);
+        }
+    }
+
+    let result = match susun_integration::remove_image(&engine, &plan.image_id, plan.force).await {
+        Ok(result) => result,
+        Err(error) => {
+            state
+                .action_plans
+                .finish(&claimed.plan_id, PlanState::Failed);
+            let _ = action_audit::record_rejection(
+                &state.db,
+                ActionKind::ImageRemove,
+                plan.runtime_profile_id.clone(),
+                "failed",
+                "remove_failed",
+            )
+            .await;
+            return Err(ApiError::EngineUnavailable(error));
+        }
+    };
+
+    state
+        .action_plans
+        .finish(&claimed.plan_id, PlanState::Succeeded);
+    let _ = action_audit::record(
+        &state.db,
+        AuditEntry {
+            kind: ActionKind::ImageRemove,
+            profile_id: plan.runtime_profile_id,
+            runtime_class: None,
+            ownership_result: "authorized".to_owned(),
+            command_kind: Some("provider_image_remove".to_owned()),
+            elevation_mode: Some("none".to_owned()),
+            terminal_status: action_audit::STATUS_COMPLETED.to_owned(),
+            affected: vec![AffectedCount {
+                category: "images_removed".to_owned(),
+                count: result.deleted.len() as i64,
+            }],
+            failure_code: None,
+            correlation_token: None,
+            started_at_ms: started,
+            completed_at_ms: Some(engines::now_ms()?),
+        },
+    )
+    .await;
+
+    logging::warn(
+        "image_remove_finished",
+        &[
+            ("engine_id", plan.engine_id.clone()),
+            ("deleted_count", result.deleted.len().to_string()),
+        ],
+    );
+
+    Ok(Json(ImageRemoveResponse {
+        deleted: result.deleted,
+        untagged: result.untagged,
+    }))
+}
+
 /// Mirrors `PruneScopeInventory`'s support/estimate vocabulary so the
 /// frontend reads one consistent capability language across prune and
 /// build-cache status.
@@ -635,6 +1401,50 @@ mod tests {
         assert!(response.image.is_some());
         Ok(())
     }
+
+    fn sample_image_row() -> artifact_inventory::ImageSummaryRow {
+        artifact_inventory::ImageSummaryRow {
+            id: "sha256:abc".to_owned(),
+            references: vec!["myapp:latest".to_owned()],
+            digests: vec!["sha256:def".to_owned()],
+            label_keys: Vec::new(),
+            created_at_epoch_seconds: Some(1_700_000_000),
+            size_bytes: Some(1024),
+            shared_size_bytes: Some(512),
+            container_count: Some(0),
+        }
+    }
+
+    /// A commit must be able to detect that the previewed image changed —
+    /// gained/lost a reference, a different digest, a different size — so an
+    /// identical fingerprint over identical input, and a *different* one
+    /// after any of those fields change, is the whole safety property.
+    #[test]
+    fn image_fingerprint_is_stable_for_identical_input_and_changes_with_the_image() {
+        let base = sample_image_row();
+        assert_eq!(
+            image_fingerprint(&base),
+            image_fingerprint(&sample_image_row())
+        );
+
+        let mut different_reference = sample_image_row();
+        different_reference.references = vec!["myapp:v2".to_owned()];
+        assert_ne!(
+            image_fingerprint(&base),
+            image_fingerprint(&different_reference)
+        );
+
+        let mut different_digest = sample_image_row();
+        different_digest.digests = vec!["sha256:changed".to_owned()];
+        assert_ne!(
+            image_fingerprint(&base),
+            image_fingerprint(&different_digest)
+        );
+
+        let mut different_size = sample_image_row();
+        different_size.size_bytes = Some(2048);
+        assert_ne!(image_fingerprint(&base), image_fingerprint(&different_size));
+    }
 }
 
 #[cfg(test)]
@@ -661,6 +1471,307 @@ mod engine_id_validation_tests {
         .await;
 
         assert!(matches!(result, Err(ApiError::EngineNotFound)));
+        Ok(())
+    }
+
+    /// A fabricated `engine_id` must be rejected before a tag commit plan is
+    /// ever minted — no capability probe, no image lookup, nothing an
+    /// attacker could use to enumerate real inventory under a made-up id.
+    #[tokio::test]
+    async fn preview_tag_image_rejects_fake_engine_id_before_minting_a_plan() -> TestResult {
+        let state = test_state(fresh_db("artifacts-tag-fake-engine").await?);
+
+        let result = preview_tag_image(
+            State(state),
+            authorized_headers(),
+            Path(("fake-engine".to_owned(), "sha256:abc".to_owned())),
+            Json(TagImageRequest {
+                target_reference: "myapp:latest".to_owned(),
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::EngineNotFound)));
+        Ok(())
+    }
+
+    /// Mirrors the tag-side regression: a fabricated `engine_id` must be
+    /// rejected before a remove commit plan is minted.
+    #[tokio::test]
+    async fn preview_remove_image_rejects_fake_engine_id_before_minting_a_plan() -> TestResult {
+        let state = test_state(fresh_db("artifacts-remove-fake-engine").await?);
+
+        let result = preview_remove_image(
+            State(state),
+            authorized_headers(),
+            Path(("fake-engine".to_owned(), "sha256:abc".to_owned())),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::EngineNotFound)));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod commit_plan_validation_tests {
+    use super::*;
+    use crate::test_support::{authorized_headers, fresh_db, test_state};
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    /// Commit endpoints carry no body; the executable policy lives entirely
+    /// in the server-held plan. A non-empty body must be rejected before the
+    /// plan store is ever touched — this runs the check ahead of `claim`, so
+    /// even a well-formed-looking JSON body cannot smuggle a substitute
+    /// target in at commit time.
+    #[tokio::test]
+    async fn commit_tag_image_rejects_a_non_empty_body() -> TestResult {
+        let state = test_state(fresh_db("artifacts-tag-commit-body").await?);
+
+        let result = commit_tag_image(
+            State(state),
+            authorized_headers(),
+            Path("rap_whatever".to_owned()),
+            axum::body::Bytes::from_static(b"{\"target_reference\":\"evil:latest\"}"),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::TrustedPlanContentRejected)));
+        Ok(())
+    }
+
+    /// Mirrors the tag-side regression for image removal.
+    #[tokio::test]
+    async fn commit_remove_image_rejects_a_non_empty_body() -> TestResult {
+        let state = test_state(fresh_db("artifacts-remove-commit-body").await?);
+
+        let result = commit_remove_image(
+            State(state),
+            authorized_headers(),
+            Path("rap_whatever".to_owned()),
+            axum::body::Bytes::from_static(b"{}"),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::TrustedPlanContentRejected)));
+        Ok(())
+    }
+
+    /// An unknown, expired-looking, or never-issued plan id must be rejected
+    /// as `ActionUnavailable`, not panic or fall through to a live engine
+    /// call — `claim` runs, and fails, before any connection is attempted.
+    #[tokio::test]
+    async fn commit_tag_image_rejects_an_unknown_plan_id() -> TestResult {
+        let state = test_state(fresh_db("artifacts-tag-commit-unknown-plan").await?);
+
+        let result = commit_tag_image(
+            State(state),
+            authorized_headers(),
+            Path("rap_does_not_exist".to_owned()),
+            axum::body::Bytes::new(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::ActionUnavailable(_))));
+        Ok(())
+    }
+
+    /// Mirrors the tag-side regression for image removal.
+    #[tokio::test]
+    async fn commit_remove_image_rejects_an_unknown_plan_id() -> TestResult {
+        let state = test_state(fresh_db("artifacts-remove-commit-unknown-plan").await?);
+
+        let result = commit_remove_image(
+            State(state),
+            authorized_headers(),
+            Path("rap_does_not_exist".to_owned()),
+            axum::body::Bytes::new(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::ActionUnavailable(_))));
+        Ok(())
+    }
+
+    /// A plan minted by prune (or any other domain) must never be spendable
+    /// through the tag/remove commit endpoints — `claim`'s `allowed` list is
+    /// the enforcement point, and this exercises it through the real route
+    /// handlers rather than the plan store directly.
+    #[tokio::test]
+    async fn commit_tag_image_rejects_a_plan_from_a_different_domain() -> TestResult {
+        let state = test_state(fresh_db("artifacts-tag-commit-wrong-domain").await?);
+        let owner = crate::runtime::stable_suffix(&state.auth_token);
+        let ticket = state.action_plans.prepare(
+            &owner,
+            crate::action_plans::ActionKind::EnginePrune,
+            crate::action_plans::ActionPlanPayload::EnginePrune(
+                crate::action_plans::EnginePrunePlan {
+                    engine_id: "engine-docker-local".to_owned(),
+                    runtime_profile_id: None,
+                    scopes: vec!["images".to_owned()],
+                    all_images: false,
+                    identity_fingerprint: "fp".to_owned(),
+                    inventory_fingerprint: "fp".to_owned(),
+                },
+            ),
+        );
+
+        let result = commit_tag_image(
+            State(state),
+            authorized_headers(),
+            Path(ticket.plan_id),
+            axum::body::Bytes::new(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::ActionUnavailable(_))));
+        Ok(())
+    }
+
+    /// A plan whose stored `identity_fingerprint` no longer matches what the
+    /// engine resolves to right now (selection swap, endpoint change,
+    /// re-observation) must never reach the provider call — this is the
+    /// "engine/profile race" gate, exercised through the real commit
+    /// handler with a deliberately wrong fingerprint rather than trying to
+    /// force an actual selection change mid-request.
+    #[tokio::test]
+    async fn commit_tag_image_rejects_when_engine_identity_has_changed_since_preview() -> TestResult
+    {
+        let state = test_state(fresh_db("artifacts-tag-identity-changed").await?);
+        let owner = crate::runtime::stable_suffix(&state.auth_token);
+        let ticket = state.action_plans.prepare(
+            &owner,
+            ActionKind::ImageTag,
+            ActionPlanPayload::ImageTag(ImageTagPlan {
+                engine_id: engines::PLATFORM_DEFAULT_ENGINE_ID.to_owned(),
+                runtime_profile_id: None,
+                source_image_id: "sha256:abc".to_owned(),
+                target_reference: "myapp:latest".to_owned(),
+                identity_fingerprint: "stale-fingerprint-from-a-superseded-preview".to_owned(),
+                source_fingerprint: "irrelevant".to_owned(),
+            }),
+        );
+
+        let result = commit_tag_image(
+            State(state),
+            authorized_headers(),
+            Path(ticket.plan_id),
+            axum::body::Bytes::new(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::ActionUnavailable(_))));
+        Ok(())
+    }
+
+    /// Mirrors the tag-side regression for image removal.
+    #[tokio::test]
+    async fn commit_remove_image_rejects_when_engine_identity_has_changed_since_preview()
+    -> TestResult {
+        let state = test_state(fresh_db("artifacts-remove-identity-changed").await?);
+        let owner = crate::runtime::stable_suffix(&state.auth_token);
+        let ticket = state.action_plans.prepare(
+            &owner,
+            ActionKind::ImageRemove,
+            ActionPlanPayload::ImageRemove(ImageRemovePlan {
+                engine_id: engines::PLATFORM_DEFAULT_ENGINE_ID.to_owned(),
+                runtime_profile_id: None,
+                image_id: "sha256:abc".to_owned(),
+                force: false,
+                identity_fingerprint: "stale-fingerprint-from-a-superseded-preview".to_owned(),
+                source_fingerprint: "irrelevant".to_owned(),
+            }),
+        );
+
+        let result = commit_remove_image(
+            State(state),
+            authorized_headers(),
+            Path(ticket.plan_id),
+            axum::body::Bytes::new(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::ActionUnavailable(_))));
+        Ok(())
+    }
+
+    /// Once the identity check passes, a plan naming a source image that no
+    /// longer exists (or a provider that has gone unreachable — the two
+    /// collapse to the same rejection path here, since both come back
+    /// through `image_for_mutation`) must still be rejected, never silently
+    /// treated as success. Uses the real, current identity fingerprint (via
+    /// the same helper `commit_tag_image` itself calls) so this exercises
+    /// the revalidation step *after* identity, not identity itself.
+    #[tokio::test]
+    async fn commit_tag_image_rejects_a_plan_whose_source_image_is_gone_or_unreachable()
+    -> TestResult {
+        let state = test_state(fresh_db("artifacts-tag-source-gone").await?);
+        let owner = crate::runtime::stable_suffix(&state.auth_token);
+        let engine = susun_integration::connect_engine_for_profile(&state.db, None)
+            .await
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        let identity_fingerprint =
+            engines::engine_identity_fingerprint(&state.db, &engine, None).await;
+
+        let ticket = state.action_plans.prepare(
+            &owner,
+            ActionKind::ImageTag,
+            ActionPlanPayload::ImageTag(ImageTagPlan {
+                engine_id: engines::PLATFORM_DEFAULT_ENGINE_ID.to_owned(),
+                runtime_profile_id: None,
+                source_image_id: "sha256:this-image-does-not-exist".to_owned(),
+                target_reference: "myapp:latest".to_owned(),
+                identity_fingerprint,
+                source_fingerprint: "irrelevant".to_owned(),
+            }),
+        );
+
+        let result = commit_tag_image(
+            State(state),
+            authorized_headers(),
+            Path(ticket.plan_id),
+            axum::body::Bytes::new(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::ActionUnavailable(_))));
+        Ok(())
+    }
+
+    /// Mirrors the tag-side regression for image removal.
+    #[tokio::test]
+    async fn commit_remove_image_rejects_a_plan_whose_image_is_gone_or_unreachable() -> TestResult {
+        let state = test_state(fresh_db("artifacts-remove-source-gone").await?);
+        let owner = crate::runtime::stable_suffix(&state.auth_token);
+        let engine = susun_integration::connect_engine_for_profile(&state.db, None)
+            .await
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        let identity_fingerprint =
+            engines::engine_identity_fingerprint(&state.db, &engine, None).await;
+
+        let ticket = state.action_plans.prepare(
+            &owner,
+            ActionKind::ImageRemove,
+            ActionPlanPayload::ImageRemove(ImageRemovePlan {
+                engine_id: engines::PLATFORM_DEFAULT_ENGINE_ID.to_owned(),
+                runtime_profile_id: None,
+                image_id: "sha256:this-image-does-not-exist".to_owned(),
+                force: false,
+                identity_fingerprint,
+                source_fingerprint: "irrelevant".to_owned(),
+            }),
+        );
+
+        let result = commit_remove_image(
+            State(state),
+            authorized_headers(),
+            Path(ticket.plan_id),
+            axum::body::Bytes::new(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::ActionUnavailable(_))));
         Ok(())
     }
 }

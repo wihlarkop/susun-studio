@@ -68,6 +68,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "runtime_action_audit",
         sql: include_str!("../migrations/0013_runtime_action_audit.sql"),
     },
+    Migration {
+        version: 14,
+        name: "runtime_action_audit_artifact_actions",
+        sql: include_str!("../migrations/0014_runtime_action_audit_artifact_actions.sql"),
+    },
 ];
 
 #[derive(Debug, thiserror::Error)]

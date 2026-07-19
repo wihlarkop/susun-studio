@@ -109,6 +109,22 @@ pub fn app(state: AppState) -> Router {
             get(artifacts::read_engine_image),
         )
         .route(
+            "/v1/engines/{id}/images/{image_id}/tag/preview",
+            post(artifacts::preview_tag_image),
+        )
+        .route(
+            "/v1/engines/images/tag/commit/{plan_id}",
+            post(artifacts::commit_tag_image),
+        )
+        .route(
+            "/v1/engines/{id}/images/{image_id}/remove/preview",
+            post(artifacts::preview_remove_image),
+        )
+        .route(
+            "/v1/engines/images/remove/commit/{plan_id}",
+            post(artifacts::commit_remove_image),
+        )
+        .route(
             "/v1/engines/{id}/build-cache",
             get(artifacts::engine_build_cache_status),
         )

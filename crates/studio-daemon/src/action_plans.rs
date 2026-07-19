@@ -41,6 +41,8 @@ pub enum ActionKind {
     DestructiveRemoveBuiltInRuntime,
     EnginePrune,
     MetadataRestore,
+    ImageTag,
+    ImageRemove,
 }
 
 impl ActionKind {
@@ -53,6 +55,8 @@ impl ActionKind {
             Self::DestructiveRemoveBuiltInRuntime => "destructive_remove_built_in_runtime",
             Self::EnginePrune => "engine_prune",
             Self::MetadataRestore => "metadata_restore",
+            Self::ImageTag => "image_tag",
+            Self::ImageRemove => "image_remove",
         }
     }
 
@@ -64,6 +68,7 @@ impl ActionKind {
             | Self::DestructiveRemoveBuiltInRuntime => "destructive",
             Self::EnginePrune => "prune",
             Self::MetadataRestore => "restore",
+            Self::ImageTag | Self::ImageRemove => "artifact",
         }
     }
 }
@@ -77,6 +82,8 @@ pub enum ActionPlanPayload {
     Destructive(DestructivePlan),
     EnginePrune(EnginePrunePlan),
     MetadataRestore(MetadataRestorePlan),
+    ImageTag(ImageTagPlan),
+    ImageRemove(ImageRemovePlan),
 }
 
 /// The resolved, server-owned project binding move. Captured at preview so the
@@ -131,6 +138,50 @@ pub struct EnginePrunePlan {
     /// candidate counts, reclaimable bytes). Recomputed at commit to reject stale
     /// inventory.
     pub inventory_fingerprint: String,
+}
+
+/// Server-validated intent to add a new tag/reference to an existing image.
+/// The commit path never accepts a source or target from the frontend — both
+/// are pinned here at preview time.
+#[derive(Debug, Clone)]
+pub struct ImageTagPlan {
+    /// Server-validated at preview time (`resolve_and_validate_engine`).
+    pub engine_id: String,
+    /// Exact runtime profile selected at preview. `None` means the platform
+    /// default was selected because no profile existed.
+    pub runtime_profile_id: Option<String>,
+    /// Opaque engine-reported id of the image being tagged, resolved and
+    /// confirmed to exist at preview time.
+    pub source_image_id: String,
+    /// The new `repository:tag` reference to create.
+    pub target_reference: String,
+    /// Fingerprint of the engine identity the preview ran against. Recomputed
+    /// at commit; a mismatch means selection/endpoint/provider state changed.
+    pub identity_fingerprint: String,
+    /// Fingerprint of the source image's inventory row (references, digests)
+    /// at preview time. Recomputed at commit to reject a stale preview.
+    pub source_fingerprint: String,
+}
+
+/// Server-validated intent to remove one image. The commit path never
+/// accepts an image id from the frontend — it is pinned here at preview time.
+#[derive(Debug, Clone)]
+pub struct ImageRemovePlan {
+    /// Server-validated at preview time (`resolve_and_validate_engine`).
+    pub engine_id: String,
+    /// Exact runtime profile selected at preview. `None` means the platform
+    /// default was selected because no profile existed.
+    pub runtime_profile_id: Option<String>,
+    /// Opaque engine-reported id of the image to remove, resolved and
+    /// confirmed to exist at preview time.
+    pub image_id: String,
+    pub force: bool,
+    /// Fingerprint of the engine identity the preview ran against. Recomputed
+    /// at commit; a mismatch means selection/endpoint/provider state changed.
+    pub identity_fingerprint: String,
+    /// Fingerprint of the target image's inventory row (references, digests,
+    /// size) at preview time. Recomputed at commit to reject a stale preview.
+    pub source_fingerprint: String,
 }
 
 #[derive(Debug, Clone)]
@@ -381,7 +432,7 @@ mod tests {
         let store = ActionPlanStore::default();
         let ticket = prepare(&store); // a MigrationCommit plan
 
-        // Attempt to spend it through the destructive/prune/restore domains.
+        // Attempt to spend it through the destructive/prune/restore/artifact domains.
         for wrong in [
             &[ActionKind::EnginePrune][..],
             &[ActionKind::MetadataRestore][..],
@@ -390,6 +441,7 @@ mod tests {
                 ActionKind::DestructiveResetEngineData,
                 ActionKind::DestructiveRemoveBuiltInRuntime,
             ][..],
+            &[ActionKind::ImageTag, ActionKind::ImageRemove][..],
         ] {
             assert_eq!(
                 store.claim(&ticket.plan_id, "owner-a", wrong).err(),
@@ -399,5 +451,70 @@ mod tests {
 
         // The plan was never consumed: its rightful domain can still claim it.
         assert!(store.claim(&ticket.plan_id, "owner-a", MIGRATION).is_ok());
+    }
+
+    fn image_tag_payload() -> ActionPlanPayload {
+        ActionPlanPayload::ImageTag(ImageTagPlan {
+            engine_id: "engine-docker-local".to_owned(),
+            runtime_profile_id: None,
+            source_image_id: "sha256:abc".to_owned(),
+            target_reference: "myapp:latest".to_owned(),
+            identity_fingerprint: "fp-identity".to_owned(),
+            source_fingerprint: "fp-source".to_owned(),
+        })
+    }
+
+    fn image_remove_payload() -> ActionPlanPayload {
+        ActionPlanPayload::ImageRemove(ImageRemovePlan {
+            engine_id: "engine-docker-local".to_owned(),
+            runtime_profile_id: None,
+            image_id: "sha256:abc".to_owned(),
+            force: false,
+            identity_fingerprint: "fp-identity".to_owned(),
+            source_fingerprint: "fp-source".to_owned(),
+        })
+    }
+
+    /// The image tag/remove plans must honor the exact same owner-binding,
+    /// single-use, and expiry properties as every other domain — nothing
+    /// about their payload shape should exempt them from the shared gate.
+    #[test]
+    fn image_tag_and_image_remove_plans_reject_wrong_owner_and_replay() {
+        let store = ActionPlanStore::default();
+        for (kind, payload, allowed) in [
+            (
+                ActionKind::ImageTag,
+                image_tag_payload(),
+                &[ActionKind::ImageTag][..],
+            ),
+            (
+                ActionKind::ImageRemove,
+                image_remove_payload(),
+                &[ActionKind::ImageRemove][..],
+            ),
+        ] {
+            let ticket = store.prepare("owner-a", kind, payload);
+            assert_eq!(
+                store.claim(&ticket.plan_id, "owner-b", allowed).err(),
+                Some(ActionPlanError::WrongOwner)
+            );
+            assert!(store.claim(&ticket.plan_id, "owner-a", allowed).is_ok());
+            assert_eq!(
+                store.claim(&ticket.plan_id, "owner-a", allowed).err(),
+                Some(ActionPlanError::AlreadyConsumed)
+            );
+        }
+    }
+
+    /// `as_str`/`domain` feed directly into the `runtime_action_audit` CHECK
+    /// constraints (see migration 0014). A typo here would make every image
+    /// tag/remove audit write fail at the database layer instead of at
+    /// compile time, so the exact strings are pinned by this test.
+    #[test]
+    fn image_action_kinds_report_the_artifact_domain_and_expected_audit_strings() {
+        assert_eq!(ActionKind::ImageTag.as_str(), "image_tag");
+        assert_eq!(ActionKind::ImageTag.domain(), "artifact");
+        assert_eq!(ActionKind::ImageRemove.as_str(), "image_remove");
+        assert_eq!(ActionKind::ImageRemove.domain(), "artifact");
     }
 }
