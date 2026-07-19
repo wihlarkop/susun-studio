@@ -8,6 +8,7 @@
     type StudioJob,
     type StudioProject,
   } from "$lib/daemon/client";
+  import { isImageBuildResult } from "$lib/jobs/build-job";
   import { relativeTime } from "$lib/utils";
 
   let { projects }: { projects: StudioProject[] } = $props();
@@ -82,6 +83,7 @@
       class="border-input rounded-md border bg-transparent bg-none px-2 py-1"
     >
       <option value="">All statuses</option>
+      <option value="queued">queued</option>
       <option value="running">running</option>
       <option value="succeeded">succeeded</option>
       <option value="failed">failed</option>
@@ -96,6 +98,7 @@
       <option value="down">down</option>
       <option value="build">build</option>
       <option value="clean">clean</option>
+      <option value="image_build">image_build</option>
     </select>
     <select
       bind:value={projectFilter}
@@ -183,72 +186,107 @@
                       </div>
 
                       {#if reportView === "pretty"}
-                        <div class="grid grid-cols-5 gap-2 text-xs">
-                          <div class="rounded-md border px-2 py-1">
-                            <div class="text-muted-foreground text-[0.65rem] tracking-wide uppercase">
-                              Total
+                        {#if isImageBuildResult(job.result)}
+                          {@const buildResult = job.result}
+                          <div class="rounded-md border px-2 py-1 text-xs">
+                            <div
+                              class="text-muted-foreground text-[0.65rem] tracking-wide uppercase"
+                            >
+                              Image
                             </div>
-                            <div class="font-semibold tabular-nums">
-                              {job.result.summary.total_actions}
+                            <div class="font-mono font-semibold break-all">
+                              {buildResult.image_reference}
                             </div>
+                            {#if buildResult.image_digest}
+                              <div class="text-muted-foreground mt-1 font-mono break-all">
+                                {buildResult.image_digest}
+                              </div>
+                            {/if}
                           </div>
-                          <div class="rounded-md border px-2 py-1">
-                            <div class="text-muted-foreground text-[0.65rem] tracking-wide uppercase">
-                              Succeeded
-                            </div>
-                            <div class="text-success font-semibold tabular-nums">
-                              {job.result.summary.succeeded}
-                            </div>
-                          </div>
-                          <div class="rounded-md border px-2 py-1">
-                            <div class="text-muted-foreground text-[0.65rem] tracking-wide uppercase">
-                              Failed
-                            </div>
-                            <div class="text-destructive font-semibold tabular-nums">
-                              {job.result.summary.failed}
-                            </div>
-                          </div>
-                          <div class="rounded-md border px-2 py-1">
-                            <div class="text-muted-foreground text-[0.65rem] tracking-wide uppercase">
-                              Skipped
-                            </div>
-                            <div class="font-semibold tabular-nums">
-                              {job.result.summary.skipped}
-                            </div>
-                          </div>
-                          <div class="rounded-md border px-2 py-1">
-                            <div class="text-muted-foreground text-[0.65rem] tracking-wide uppercase">
-                              Cancelled
-                            </div>
-                            <div class="font-semibold tabular-nums">
-                              {job.result.summary.cancelled}
-                            </div>
-                          </div>
-                        </div>
-
-                        {#if job.result.actions}
-                          <ul class="flex flex-col gap-1">
-                            {#each Object.values(job.result.actions) as action (action.action_id)}
-                              <li class="flex items-center gap-2 rounded-md border px-2 py-1 text-xs">
-                                <StatusBadge status={action.status} />
-                                <span class="min-w-0 flex-1 break-words">
-                                  {actionLabel(job, action.action_id)}
-                                </span>
-                                <span class="text-muted-foreground shrink-0 tabular-nums">
-                                  {actionDuration(action)}
-                                </span>
-                              </li>
-                              {#if action.error}
-                                <li class="text-destructive px-2 text-xs break-words">
-                                  {action.error}
-                                </li>
-                              {/if}
-                            {/each}
-                          </ul>
-                        {:else}
                           <p class="text-muted-foreground text-xs">
-                            No per-action detail available for this report.
+                            Progress history is on the Builds tab in Artifacts.
                           </p>
+                        {:else}
+                          {@const executionResult = job.result}
+                          <div class="grid grid-cols-5 gap-2 text-xs">
+                            <div class="rounded-md border px-2 py-1">
+                              <div
+                                class="text-muted-foreground text-[0.65rem] tracking-wide uppercase"
+                              >
+                                Total
+                              </div>
+                              <div class="font-semibold tabular-nums">
+                                {executionResult.summary.total_actions}
+                              </div>
+                            </div>
+                            <div class="rounded-md border px-2 py-1">
+                              <div
+                                class="text-muted-foreground text-[0.65rem] tracking-wide uppercase"
+                              >
+                                Succeeded
+                              </div>
+                              <div class="text-success font-semibold tabular-nums">
+                                {executionResult.summary.succeeded}
+                              </div>
+                            </div>
+                            <div class="rounded-md border px-2 py-1">
+                              <div
+                                class="text-muted-foreground text-[0.65rem] tracking-wide uppercase"
+                              >
+                                Failed
+                              </div>
+                              <div class="text-destructive font-semibold tabular-nums">
+                                {executionResult.summary.failed}
+                              </div>
+                            </div>
+                            <div class="rounded-md border px-2 py-1">
+                              <div
+                                class="text-muted-foreground text-[0.65rem] tracking-wide uppercase"
+                              >
+                                Skipped
+                              </div>
+                              <div class="font-semibold tabular-nums">
+                                {executionResult.summary.skipped}
+                              </div>
+                            </div>
+                            <div class="rounded-md border px-2 py-1">
+                              <div
+                                class="text-muted-foreground text-[0.65rem] tracking-wide uppercase"
+                              >
+                                Cancelled
+                              </div>
+                              <div class="font-semibold tabular-nums">
+                                {executionResult.summary.cancelled}
+                              </div>
+                            </div>
+                          </div>
+
+                          {#if executionResult.actions}
+                            <ul class="flex flex-col gap-1">
+                              {#each Object.values(executionResult.actions) as action (action.action_id)}
+                                <li
+                                  class="flex items-center gap-2 rounded-md border px-2 py-1 text-xs"
+                                >
+                                  <StatusBadge status={action.status} />
+                                  <span class="min-w-0 flex-1 break-words">
+                                    {actionLabel(job, action.action_id)}
+                                  </span>
+                                  <span class="text-muted-foreground shrink-0 tabular-nums">
+                                    {actionDuration(action)}
+                                  </span>
+                                </li>
+                                {#if action.error}
+                                  <li class="text-destructive px-2 text-xs break-words">
+                                    {action.error}
+                                  </li>
+                                {/if}
+                              {/each}
+                            </ul>
+                          {:else}
+                            <p class="text-muted-foreground text-xs">
+                              No per-action detail available for this report.
+                            </p>
+                          {/if}
                         {/if}
                       {:else}
                         <pre class="overflow-x-auto text-xs">{JSON.stringify(job.result, null, 2)}</pre>
