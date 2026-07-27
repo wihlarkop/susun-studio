@@ -253,8 +253,13 @@ const MAX_BUILD_PROGRESS_ROWS_PER_JOB: i64 = 500;
 /// redaction — never persist an unbounded provider payload.
 const MAX_BUILD_PROGRESS_TEXT_CHARS: usize = 2000;
 
-fn bound_text(text: &str) -> String {
-    let redacted = redact_paths(text);
+/// `redact_values` are literal build-argument values known ahead of time
+/// (e.g. `BuildDefinition::args`) — scrubbed unconditionally, since a value
+/// like this can carry a secret without ever containing one of
+/// `susun_secret`'s keyword markers.
+fn bound_text(text: &str, redact_values: &[String]) -> String {
+    let scrubbed = redact_known_values(text, redact_values);
+    let redacted = redact_paths(&scrubbed);
     if redacted.chars().count() <= MAX_BUILD_PROGRESS_TEXT_CHARS {
         redacted
     } else {
@@ -266,17 +271,57 @@ fn bound_text(text: &str) -> String {
     }
 }
 
+/// Literal substring scrub for known build-argument values. Deliberately
+/// simple (exact substring match, no tokenization) since these are known
+/// concrete strings, not a pattern to detect.
+fn redact_known_values(text: &str, redact_values: &[String]) -> String {
+    let mut result = text.to_owned();
+    for value in redact_values {
+        // Skip trivially short values — redacting e.g. "1" or "on" would
+        // mangle unrelated output far more than it protects anything.
+        if value.chars().count() >= 3 {
+            result = result.replace(value.as_str(), "<redacted-arg>");
+        }
+    }
+    result
+}
+
 /// Defensive scrub for raw filesystem paths in provider output. Build
 /// errors can interpolate the host path directly (e.g. a launch failure
 /// echoing the `docker` binary path, or a Dockerfile `COPY`/`ADD` error
 /// echoing the resolved context directory) — `susun_secret`'s own
 /// redaction only recognizes credential-marker keywords, not paths, so this
-/// is a Studio-side backstop on top of it, not a replacement for it.
+/// is a Studio-side backstop on top of it, not a replacement for it. Quoted
+/// spans (`"C:\Program Files\..."`) are treated as one token even though
+/// they contain spaces, so a quoted path isn't left half-redacted by a
+/// naive whitespace split.
 fn redact_paths(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut token = String::new();
-    for ch in text.chars() {
-        if ch.is_whitespace() {
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '"' || ch == '\'' {
+            flush_redacted_token(&mut out, &mut token);
+            let quote = ch;
+            let mut inner = String::new();
+            let mut closed = false;
+            for next in chars.by_ref() {
+                if next == quote {
+                    closed = true;
+                    break;
+                }
+                inner.push(next);
+            }
+            out.push(quote);
+            if looks_like_host_path(&inner) {
+                out.push_str("<redacted-path>");
+            } else {
+                out.push_str(&inner);
+            }
+            if closed {
+                out.push(quote);
+            }
+        } else if ch.is_whitespace() {
             flush_redacted_token(&mut out, &mut token);
             out.push(ch);
         } else {
@@ -329,7 +374,7 @@ struct FlatBuildEvent {
     total: Option<i64>,
 }
 
-fn flatten_build_event(event: susun::BuildEvent) -> FlatBuildEvent {
+fn flatten_build_event(event: susun::BuildEvent, redact_values: &[String]) -> FlatBuildEvent {
     match event {
         susun::BuildEvent::Started { .. } => FlatBuildEvent {
             kind: "started",
@@ -344,7 +389,7 @@ fn flatten_build_event(event: susun::BuildEvent) -> FlatBuildEvent {
             kind: "vertex_started",
             vertex_id: Some(vertex.0),
             log_stream: None,
-            text: Some(bound_text(&name)),
+            text: Some(bound_text(&name, redact_values)),
             status: None,
             current: None,
             total: None,
@@ -369,7 +414,7 @@ fn flatten_build_event(event: susun::BuildEvent) -> FlatBuildEvent {
                 susun::BuildLogStream::Stdout => "stdout",
                 susun::BuildLogStream::Stderr => "stderr",
             }),
-            text: Some(bound_text(&text)),
+            text: Some(bound_text(&text, redact_values)),
             status: None,
             current: None,
             total: None,
@@ -404,12 +449,13 @@ async fn persist_build_progress(
     job_id: &str,
     sequence: i64,
     event: susun::BuildEvent,
+    redact_values: &[String],
 ) {
     let Ok(conn) = db.connect() else {
         return;
     };
     let now = now_ms().unwrap_or_default();
-    let entry = flatten_build_event(event);
+    let entry = flatten_build_event(event, redact_values);
     let id = format!("bp_{}", uuid::Uuid::new_v4().simple());
     let _ = conn
         .execute(
@@ -445,15 +491,20 @@ async fn persist_build_progress(
         .await;
 }
 
-fn make_build_event_sink(db: Arc<Database>, job_id: String) -> susun::BuildEventSink {
+fn make_build_event_sink(
+    db: Arc<Database>,
+    job_id: String,
+    redact_values: Arc<Vec<String>>,
+) -> susun::BuildEventSink {
     let sequence = Arc::new(AtomicI64::new(0));
     susun::BuildEventSink::new(move |event: susun::BuildEvent| {
         let db = db.clone();
         let job_id = job_id.clone();
         let sequence = sequence.clone();
+        let redact_values = redact_values.clone();
         Box::pin(async move {
             let seq = sequence.fetch_add(1, Ordering::SeqCst);
-            persist_build_progress(&db, &job_id, seq, event).await;
+            persist_build_progress(&db, &job_id, seq, event, &redact_values).await;
         })
     })
 }
@@ -732,12 +783,14 @@ pub async fn start_image_build(
     let db = state.db.clone();
     let registry = state.build_jobs.clone();
     let spawn_job_id = job_id.clone();
+    let spawn_project_id = project_id.clone();
     let project_root = source.root.clone();
 
     tokio::spawn(async move {
         run_image_build(
             db.clone(),
             spawn_job_id.clone(),
+            spawn_project_id,
             project_root,
             definition,
             image_tag,
@@ -762,15 +815,24 @@ pub async fn start_image_build(
 /// `start_up_job`/`start_down_job` already use, adapted to `BuildEngine`'s
 /// own cancellation/event types. Never reports success until
 /// `BuildEngine::build` itself returns a result.
+#[allow(clippy::too_many_arguments)]
 async fn run_image_build(
     db: Arc<Database>,
     job_id: String,
+    project_id: String,
     project_root: std::path::PathBuf,
     definition: susun::BuildDefinition,
     image_tag: String,
     cancellation: susun::BuildCancellationToken,
     cancel_notify: Arc<tokio::sync::Notify>,
 ) {
+    let redact_values: Arc<Vec<String>> = Arc::new(
+        definition
+            .args
+            .values()
+            .filter_map(|value| value.clone())
+            .collect(),
+    );
     let prepare_definition = definition.clone();
     let prepared = tokio::select! {
         biased;
@@ -801,20 +863,30 @@ async fn run_image_build(
 
     update_build_job_status(&db, &job_id, "running").await;
 
-    let events = make_build_event_sink(db.clone(), job_id.clone());
+    let events = make_build_event_sink(db.clone(), job_id.clone(), redact_values);
+    let reconcile_image_tag = image_tag.clone();
     // `BuildxProcessBuildEngine` blocks on `docker buildx build` via a
-    // synchronous `Command::output()` call with no child-process handle to
+    // synchronous `Command::output()` call, with no child-process handle to
     // kill — cancellation/timeout below can only stop *this task's own
     // await*, never the subprocess itself (see `BuildJobRegistry::cancel`'s
-    // own docs). Spawned independently, rather than awaited inline, so that
-    // when we lose the race we can still let it run to completion in the
-    // background and correct the job's terminal record with the real
-    // outcome once it's known, instead of abandoning it and leaving a
-    // "cancelled"/"failed" status on record that may not match what
-    // actually happened (up to and including the image being built and
-    // loaded after Studio already reported the build as cancelled).
-    let mut build_handle = tokio::spawn(async move {
-        susun_integration::run_build(&prepared, &definition, &image_tag, events, cancellation).await
+    // own docs). Run on the blocking thread pool (not an async worker) via
+    // `spawn_blocking` + `block_on`, since that call ties up its thread for
+    // the whole build; the blocking pool is sized for exactly this, unlike
+    // the small async worker pool a naive `tokio::spawn` would tie up.
+    // Spawned independently of the race below (rather than awaited inline)
+    // so that when Studio loses the race, the abandoned build still runs to
+    // completion and its real result — once known — corrects the job's
+    // terminal record, instead of a "cancelled"/"failed" status silently
+    // diverging from what actually happened (up to and including the image
+    // being built and loaded after Studio already reported cancellation).
+    let mut build_handle = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(susun_integration::run_build(
+            &prepared,
+            &definition,
+            &image_tag,
+            events,
+            cancellation,
+        ))
     });
 
     let outcome = tokio::select! {
@@ -838,7 +910,7 @@ async fn run_image_build(
                 Some(BUILD_INTERRUPT_UNCERTAIN_MESSAGE),
             )
             .await;
-            spawn_late_build_correction(db, job_id, build_handle);
+            spawn_late_build_correction(db, job_id, project_id, reconcile_image_tag, build_handle);
         }
         BuildJobOutcome::TimedOut => {
             mark_build_interrupted(
@@ -849,7 +921,7 @@ async fn run_image_build(
                 Some(BUILD_INTERRUPT_UNCERTAIN_MESSAGE),
             )
             .await;
-            spawn_late_build_correction(db, job_id, build_handle);
+            spawn_late_build_correction(db, job_id, project_id, reconcile_image_tag, build_handle);
         }
     }
 }
@@ -863,15 +935,74 @@ async fn run_image_build(
 fn spawn_late_build_correction(
     db: Arc<Database>,
     job_id: String,
+    project_id: String,
+    image_tag: String,
     build_handle: tokio::task::JoinHandle<
         Result<susun_integration::BuildResultRow, susun::BuildError>,
     >,
 ) {
     tokio::spawn(async move {
-        if let Ok(result) = build_handle.await {
-            finish_build_job(&db, &job_id, result).await;
+        let Ok(result) = build_handle.await else {
+            return;
+        };
+        match result {
+            Ok(build_result) => finish_build_job(&db, &job_id, Ok(build_result)).await,
+            Err(build_error) => {
+                let (error_code, _) = classify_build_error(&build_error);
+                // The SDK's own cancellation check runs *after* `docker
+                // buildx build` exits and reports `Cancelled` purely from
+                // the token's flipped state — regardless of whether the
+                // subprocess actually completed and loaded the image
+                // first. Trusting that classification would just replace
+                // one confidently-wrong status with another, so reconcile
+                // against the engine's own image inventory instead of the
+                // SDK's classification.
+                if error_code == "cancelled" {
+                    match reconcile_cancelled_build(&db, &project_id, &image_tag).await {
+                        Some(build_result) => {
+                            finish_build_job(&db, &job_id, Ok(build_result)).await;
+                        }
+                        None => {
+                            // Confirmed: no image with this tag exists —
+                            // the honest "cancelled" record already written
+                            // stands.
+                        }
+                    }
+                } else {
+                    finish_build_job(&db, &job_id, Err(build_error)).await;
+                }
+            }
         }
     });
+}
+
+/// Checks whether an image tagged `image_tag` actually exists on the
+/// project's engine — the only way to tell a build that truly stopped from
+/// one that finished and loaded its image anyway before the SDK observed
+/// the cancellation token (see `spawn_late_build_correction`). Best-effort:
+/// any failure to connect or list images is treated as "can't confirm it
+/// landed", not as evidence either way.
+async fn reconcile_cancelled_build(
+    db: &Database,
+    project_id: &str,
+    image_tag: &str,
+) -> Option<susun_integration::BuildResultRow> {
+    let engine = susun_integration::connect_engine(db, Some(project_id))
+        .await
+        .ok()?;
+    let inventory = crate::artifact_inventory::image_inventory(&engine)
+        .await
+        .ok()?;
+    let matched = inventory.data?.images.into_iter().find(|image| {
+        image
+            .references
+            .iter()
+            .any(|reference| reference == image_tag)
+    })?;
+    Some(susun_integration::BuildResultRow {
+        image_reference: image_tag.to_owned(),
+        image_digest: matched.digests.into_iter().next(),
+    })
 }
 
 /// Shown on a build job's `cancelled`/`failed(timeout)` record when Studio
@@ -1498,31 +1629,51 @@ mod build_progress_tests {
 
     #[test]
     fn bound_text_passes_short_text_through_unchanged() {
-        assert_eq!(bound_text("hello"), "hello");
+        assert_eq!(bound_text("hello", &[]), "hello");
     }
 
     #[test]
     fn bound_text_redacts_windows_host_paths() {
         let text = r"open C:\Users\wihlarkop\Project\susun-studio\Dockerfile: no such file";
-        assert_eq!(bound_text(text), "open <redacted-path> no such file");
+        assert_eq!(bound_text(text, &[]), "open <redacted-path> no such file");
     }
 
     #[test]
     fn bound_text_redacts_unc_and_unix_host_paths() {
         assert_eq!(
-            bound_text(r"failed to stat \\wsl.localhost\Ubuntu\home\edo\app"),
+            bound_text(r"failed to stat \\wsl.localhost\Ubuntu\home\edo\app", &[]),
             "failed to stat <redacted-path>"
         );
         assert_eq!(
-            bound_text("lstat /home/edo/project/context: permission denied"),
+            bound_text("lstat /home/edo/project/context: permission denied", &[]),
             "lstat <redacted-path> permission denied"
+        );
+    }
+
+    #[test]
+    fn bound_text_redacts_a_quoted_windows_path_containing_spaces() {
+        let text =
+            r#"open "C:\Program Files\Docker\Docker\resources\bin\docker.exe": access denied"#;
+        assert_eq!(
+            bound_text(text, &[]),
+            r#"open "<redacted-path>": access denied"#
+        );
+    }
+
+    #[test]
+    fn bound_text_redacts_known_build_argument_values_without_a_marker_keyword() {
+        let text = "step 4/9: ARG API_KEY=sk-live-abc123 --build-arg";
+        let redact_values = vec!["sk-live-abc123".to_owned()];
+        assert_eq!(
+            bound_text(text, &redact_values),
+            "step 4/9: ARG API_KEY=<redacted-arg> --build-arg"
         );
     }
 
     #[test]
     fn bound_text_leaves_non_path_tokens_alone() {
         assert_eq!(
-            bound_text("step 3/10: RUN npm install"),
+            bound_text("step 3/10: RUN npm install", &[]),
             "step 3/10: RUN npm install"
         );
     }
@@ -1533,31 +1684,37 @@ mod build_progress_tests {
     #[test]
     fn bound_text_truncates_long_text_with_a_visible_marker() {
         let long = "a".repeat(MAX_BUILD_PROGRESS_TEXT_CHARS + 100);
-        let bounded = bound_text(&long);
+        let bounded = bound_text(&long, &[]);
         assert!(bounded.chars().count() < long.chars().count());
         assert!(bounded.ends_with("… [truncated]"));
     }
 
     #[test]
     fn flatten_build_event_covers_started_and_finished() {
-        let started = flatten_build_event(susun::BuildEvent::Started {
-            build_id: susun::BuildId("b1".to_owned()),
-        });
+        let started = flatten_build_event(
+            susun::BuildEvent::Started {
+                build_id: susun::BuildId("b1".to_owned()),
+            },
+            &[],
+        );
         assert_eq!(started.kind, "started");
         assert!(started.vertex_id.is_none());
 
-        let finished = flatten_build_event(susun::BuildEvent::Finished);
+        let finished = flatten_build_event(susun::BuildEvent::Finished, &[]);
         assert_eq!(finished.kind, "finished");
     }
 
     #[test]
     fn flatten_build_event_preserves_vertex_log_stream_and_bounds_its_text() {
         let long = "x".repeat(MAX_BUILD_PROGRESS_TEXT_CHARS + 50);
-        let flat = flatten_build_event(susun::BuildEvent::VertexLog {
-            vertex: susun::BuildVertexId("v1".to_owned()),
-            stream: susun::BuildLogStream::Stderr,
-            text: long,
-        });
+        let flat = flatten_build_event(
+            susun::BuildEvent::VertexLog {
+                vertex: susun::BuildVertexId("v1".to_owned()),
+                stream: susun::BuildLogStream::Stderr,
+                text: long,
+            },
+            &[],
+        );
         assert_eq!(flat.kind, "vertex_log");
         assert_eq!(flat.vertex_id.as_deref(), Some("v1"));
         assert_eq!(flat.log_stream, Some("stderr"));
@@ -1567,13 +1724,16 @@ mod build_progress_tests {
 
     #[test]
     fn flatten_build_event_preserves_progress_counts() {
-        let flat = flatten_build_event(susun::BuildEvent::VertexProgress {
-            vertex: susun::BuildVertexId("v1".to_owned()),
-            progress: susun::BuildProgress {
-                current: 10,
-                total: Some(100),
+        let flat = flatten_build_event(
+            susun::BuildEvent::VertexProgress {
+                vertex: susun::BuildVertexId("v1".to_owned()),
+                progress: susun::BuildProgress {
+                    current: 10,
+                    total: Some(100),
+                },
             },
-        });
+            &[],
+        );
         assert_eq!(flat.kind, "vertex_progress");
         assert_eq!(flat.current, Some(10));
         assert_eq!(flat.total, Some(100));
@@ -1581,10 +1741,13 @@ mod build_progress_tests {
 
     #[test]
     fn flatten_build_event_preserves_vertex_finished_status() {
-        let flat = flatten_build_event(susun::BuildEvent::VertexFinished {
-            vertex: susun::BuildVertexId("v1".to_owned()),
-            status: susun::BuildVertexStatus::Failed,
-        });
+        let flat = flatten_build_event(
+            susun::BuildEvent::VertexFinished {
+                vertex: susun::BuildVertexId("v1".to_owned()),
+                status: susun::BuildVertexStatus::Failed,
+            },
+            &[],
+        );
         assert_eq!(flat.kind, "vertex_finished");
         assert_eq!(flat.status, Some("failed"));
     }

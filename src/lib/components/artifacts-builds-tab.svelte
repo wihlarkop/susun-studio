@@ -110,6 +110,11 @@
     detailCache = {};
     expandedId = null;
     startError = null;
+    // A stale `startBuild` call's `finally` deliberately skips clearing
+    // this (it belongs to the old scope, not this one) — so the new scope
+    // must start from a clean slate itself, or every Build button would
+    // stay disabled forever after a project/engine switch mid-request.
+    startingService = null;
 
     const controller = new AbortController();
     const hasTarget = isConnected && projectId !== null;
