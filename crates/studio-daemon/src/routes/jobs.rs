@@ -103,7 +103,12 @@ enum JobOutcome {
 /// of adding a variant to `JobOutcome` so neither job kind's `match` needs
 /// an `unreachable!()` arm for the other's outcome shape.
 enum BuildJobOutcome {
-    Finished(Result<susun_integration::BuildResultRow, susun::BuildError>),
+    Finished(
+        Result<
+            Result<susun_integration::BuildResultRow, susun::BuildError>,
+            tokio::task::JoinError,
+        >,
+    ),
     Cancelled,
     TimedOut,
 }
@@ -249,12 +254,67 @@ const MAX_BUILD_PROGRESS_ROWS_PER_JOB: i64 = 500;
 const MAX_BUILD_PROGRESS_TEXT_CHARS: usize = 2000;
 
 fn bound_text(text: &str) -> String {
-    if text.chars().count() <= MAX_BUILD_PROGRESS_TEXT_CHARS {
-        text.to_owned()
+    let redacted = redact_paths(text);
+    if redacted.chars().count() <= MAX_BUILD_PROGRESS_TEXT_CHARS {
+        redacted
     } else {
-        let truncated: String = text.chars().take(MAX_BUILD_PROGRESS_TEXT_CHARS).collect();
+        let truncated: String = redacted
+            .chars()
+            .take(MAX_BUILD_PROGRESS_TEXT_CHARS)
+            .collect();
         format!("{truncated}… [truncated]")
     }
+}
+
+/// Defensive scrub for raw filesystem paths in provider output. Build
+/// errors can interpolate the host path directly (e.g. a launch failure
+/// echoing the `docker` binary path, or a Dockerfile `COPY`/`ADD` error
+/// echoing the resolved context directory) — `susun_secret`'s own
+/// redaction only recognizes credential-marker keywords, not paths, so this
+/// is a Studio-side backstop on top of it, not a replacement for it.
+fn redact_paths(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            flush_redacted_token(&mut out, &mut token);
+            out.push(ch);
+        } else {
+            token.push(ch);
+        }
+    }
+    flush_redacted_token(&mut out, &mut token);
+    out
+}
+
+fn flush_redacted_token(out: &mut String, token: &mut String) {
+    if !token.is_empty() {
+        if looks_like_host_path(token) {
+            out.push_str("<redacted-path>");
+        } else {
+            out.push_str(token);
+        }
+        token.clear();
+    }
+}
+
+fn looks_like_host_path(token: &str) -> bool {
+    let trimmed =
+        token.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '(' | ')' | ',' | ';' | ':'));
+    if trimmed.len() < 3 {
+        return false;
+    }
+    if trimmed.starts_with("\\\\") {
+        return true;
+    }
+    if trimmed.starts_with('/') && trimmed.matches('/').count() >= 2 {
+        return true;
+    }
+    let bytes = trimmed.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
 }
 
 /// One flattened, storable shape for a `susun::BuildEvent` — needed because
@@ -398,12 +458,21 @@ fn make_build_event_sink(db: Arc<Database>, job_id: String) -> susun::BuildEvent
     })
 }
 
+/// Inserts the job row using the exact `(runtime_profile_id, runtime_class)`
+/// resolved by the caller — never re-resolves attribution itself. Re-querying
+/// here would open a TOCTOU gap: the caller's own capability gate (which
+/// rejects any non-default profile — see `start_image_build`) could pass
+/// against one resolution while a concurrent runtime rebind changed the
+/// attribution actually persisted with the job.
+#[allow(clippy::too_many_arguments)]
 async fn insert_build_job(
     state: &AppState,
     job_id: &str,
     project_id: &str,
     service_name: &str,
     image_tag: &str,
+    runtime_profile_id: Option<&str>,
+    runtime_class: Option<&str>,
     now: i64,
 ) -> Result<(), ApiError> {
     let request_json = serde_json::to_string(&serde_json::json!({
@@ -412,8 +481,6 @@ async fn insert_build_job(
         "image_tag": image_tag,
     }))
     .unwrap_or_default();
-    let (runtime_profile_id, runtime_class) =
-        runtime::attribution_for(&state.db, Some(project_id)).await?;
     let conn = state.db.connect()?;
     conn.execute(
         "INSERT INTO jobs (id, kind, status, project_id, engine_id, request_json, manifest_json,
@@ -596,6 +663,26 @@ pub async fn start_image_build(
         ));
     }
 
+    // `BuildxProcessOptions` has no endpoint/socket override — the build
+    // subprocess always runs against whatever `docker` CLI context is
+    // ambient in the daemon's own process, never a specific engine endpoint.
+    // Building against a project bound to (or globally selected as) a
+    // non-default runtime profile would silently run through the wrong
+    // provider while Studio still attributes the job to the selected one,
+    // so reject before even attempting to connect. Resolved once here and
+    // threaded through to `insert_build_job` unchanged (never re-resolved)
+    // to avoid a TOCTOU gap against a concurrent rebind.
+    let (runtime_profile_id, runtime_class) =
+        runtime::attribution_for(&state.db, Some(&project_id)).await?;
+    if runtime_profile_id.is_some() {
+        return Err(ApiError::ActionUnavailable(
+            "Image builds currently only run through the default engine. This project is \
+             bound to an external runtime profile; unbind it (or clear the global runtime \
+             selection) before building."
+                .to_owned(),
+        ));
+    }
+
     // Capability check: confirm some engine is actually reachable before
     // minting a durable job. Revalidated implicitly by the build process
     // itself failing honestly if it cannot reach a provider by the time the
@@ -621,7 +708,17 @@ pub async fn start_image_build(
 
     let now = now_ms()?;
     let job_id = format!("job-{now}-image-build");
-    insert_build_job(&state, &job_id, &project_id, &service_name, &image_tag, now).await?;
+    insert_build_job(
+        &state,
+        &job_id,
+        &project_id,
+        &service_name,
+        &image_tag,
+        runtime_profile_id.as_deref(),
+        runtime_class.as_deref(),
+        now,
+    )
+    .await?;
     logging::info(
         "image_build_started",
         &[
@@ -705,24 +802,86 @@ async fn run_image_build(
     update_build_job_status(&db, &job_id, "running").await;
 
     let events = make_build_event_sink(db.clone(), job_id.clone());
+    // `BuildxProcessBuildEngine` blocks on `docker buildx build` via a
+    // synchronous `Command::output()` call with no child-process handle to
+    // kill — cancellation/timeout below can only stop *this task's own
+    // await*, never the subprocess itself (see `BuildJobRegistry::cancel`'s
+    // own docs). Spawned independently, rather than awaited inline, so that
+    // when we lose the race we can still let it run to completion in the
+    // background and correct the job's terminal record with the real
+    // outcome once it's known, instead of abandoning it and leaving a
+    // "cancelled"/"failed" status on record that may not match what
+    // actually happened (up to and including the image being built and
+    // loaded after Studio already reported the build as cancelled).
+    let mut build_handle = tokio::spawn(async move {
+        susun_integration::run_build(&prepared, &definition, &image_tag, events, cancellation).await
+    });
+
     let outcome = tokio::select! {
         biased;
         () = cancel_notify.notified() => BuildJobOutcome::Cancelled,
         () = tokio::time::sleep(JOB_TIMEOUT) => BuildJobOutcome::TimedOut,
-        result = susun_integration::run_build(&prepared, &definition, &image_tag, events, cancellation) =>
-            BuildJobOutcome::Finished(result),
+        joined = &mut build_handle => BuildJobOutcome::Finished(joined),
     };
 
     match outcome {
-        BuildJobOutcome::Finished(result) => finish_build_job(&db, &job_id, result).await,
+        BuildJobOutcome::Finished(Ok(result)) => finish_build_job(&db, &job_id, result).await,
+        BuildJobOutcome::Finished(Err(_join_error)) => {
+            mark_build_interrupted(&db, &job_id, "failed", "internal", None).await;
+        }
         BuildJobOutcome::Cancelled => {
-            mark_build_interrupted(&db, &job_id, "cancelled", "cancelled", None).await
+            mark_build_interrupted(
+                &db,
+                &job_id,
+                "cancelled",
+                "cancelled",
+                Some(BUILD_INTERRUPT_UNCERTAIN_MESSAGE),
+            )
+            .await;
+            spawn_late_build_correction(db, job_id, build_handle);
         }
         BuildJobOutcome::TimedOut => {
-            mark_build_interrupted(&db, &job_id, "failed", "timeout", None).await
+            mark_build_interrupted(
+                &db,
+                &job_id,
+                "failed",
+                "timeout",
+                Some(BUILD_INTERRUPT_UNCERTAIN_MESSAGE),
+            )
+            .await;
+            spawn_late_build_correction(db, job_id, build_handle);
         }
     }
 }
+
+/// Lets an abandoned build subprocess (Studio stopped waiting on it via
+/// cancel or timeout, but cannot kill it — see `run_image_build`) finish in
+/// the background, then corrects the job's terminal record to the real
+/// outcome once it's known. Never leaves a "cancelled"/"failed(timeout)"
+/// record standing as the final word when the build actually succeeded (or
+/// failed differently) after Studio stopped watching it.
+fn spawn_late_build_correction(
+    db: Arc<Database>,
+    job_id: String,
+    build_handle: tokio::task::JoinHandle<
+        Result<susun_integration::BuildResultRow, susun::BuildError>,
+    >,
+) {
+    tokio::spawn(async move {
+        if let Ok(result) = build_handle.await {
+            finish_build_job(&db, &job_id, result).await;
+        }
+    });
+}
+
+/// Shown on a build job's `cancelled`/`failed(timeout)` record when Studio
+/// stopped waiting but could not confirm the underlying `docker buildx
+/// build` subprocess actually stopped — this record may still be corrected
+/// automatically once the true outcome is known (see the follow-up
+/// `finish_build_job` call queued alongside it).
+const BUILD_INTERRUPT_UNCERTAIN_MESSAGE: &str = "Studio stopped waiting for this build, but the underlying build process cannot be killed \
+     and may still be running (and could still complete or load an image). This job's status \
+     will update automatically once the real outcome is known.";
 
 pub(crate) async fn start_up_job(
     state: AppState,
@@ -1342,6 +1501,32 @@ mod build_progress_tests {
         assert_eq!(bound_text("hello"), "hello");
     }
 
+    #[test]
+    fn bound_text_redacts_windows_host_paths() {
+        let text = r"open C:\Users\wihlarkop\Project\susun-studio\Dockerfile: no such file";
+        assert_eq!(bound_text(text), "open <redacted-path> no such file");
+    }
+
+    #[test]
+    fn bound_text_redacts_unc_and_unix_host_paths() {
+        assert_eq!(
+            bound_text(r"failed to stat \\wsl.localhost\Ubuntu\home\edo\app"),
+            "failed to stat <redacted-path>"
+        );
+        assert_eq!(
+            bound_text("lstat /home/edo/project/context: permission denied"),
+            "lstat <redacted-path> permission denied"
+        );
+    }
+
+    #[test]
+    fn bound_text_leaves_non_path_tokens_alone() {
+        assert_eq!(
+            bound_text("step 3/10: RUN npm install"),
+            "step 3/10: RUN npm install"
+        );
+    }
+
     /// Never persist an unbounded provider payload, even on top of
     /// `susun_build`'s own redaction — a single very long line must be
     /// truncated with a visible marker, not silently cut off unremarked.
@@ -1482,6 +1667,52 @@ mod build_route_tests {
 
         assert_eq!(response.0["cancelled"], true);
         assert!(cancellation.is_cancelled());
+        Ok(())
+    }
+
+    /// `BuildxProcessOptions` has no engine-endpoint override, so a build
+    /// always runs through the daemon's ambient `docker` CLI context. A
+    /// project bound to a non-default runtime profile must be rejected
+    /// before Studio ever attempts to connect or attribute a job to it —
+    /// otherwise a Podman/remote profile could be validated and recorded
+    /// while the build silently executes elsewhere.
+    #[tokio::test]
+    async fn start_image_build_rejects_a_project_bound_to_a_non_default_runtime_profile()
+    -> TestResult {
+        let state = test_state(fresh_db("jobs-start-build-non-default-runtime").await?);
+        let dir = std::env::temp_dir().join(format!(
+            "studio-jobs-non-default-runtime-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let compose_path = dir.join("docker-compose.yml");
+        std::fs::write(
+            &compose_path,
+            "services:\n  web:\n    build:\n      context: .\n    image: myapp-web:latest\n",
+        )?;
+
+        let conn = state.db.connect()?;
+        conn.execute(
+            "INSERT INTO projects (
+                id, name, path, created_at_ms, compose_files, runtime_profile_id
+            ) VALUES ('p1', 'Proj', ?1, 1, ?2, 'external-profile-1')",
+            params![
+                dir.to_string_lossy().into_owned(),
+                serde_json::to_string(&[compose_path.to_string_lossy().into_owned()])?,
+            ],
+        )
+        .await?;
+
+        let result = start_image_build(
+            State(state),
+            authorized_headers(),
+            Path(("p1".to_owned(), "web".to_owned())),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::ActionUnavailable(_))));
+
+        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 }

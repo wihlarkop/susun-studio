@@ -42,6 +42,16 @@
   // Plain (non-reactive) counter — see the other artifacts tabs for why this
   // must never be read back out of *State inside the effect below.
   let generation = 0;
+  // In-flight mutation requests (start/cancel/detail-load) — aborted
+  // together with the main load controller whenever the effect below tears
+  // down, so a project/engine switch can't leave one applying its result
+  // (or even just holding an open connection) against the new selection.
+  const mutationControllers = new Set<AbortController>();
+  function trackedController(): AbortController {
+    const controller = new AbortController();
+    mutationControllers.add(controller);
+    return controller;
+  }
 
   // Runs only in an async continuation, after the request's first `await` —
   // never synchronously inside the effect.
@@ -74,6 +84,22 @@
   // one interval, created and torn down together with everything else here,
   // so an engine/project switch can never leave an orphaned poll running
   // for the previous selection.
+  // Loads (or refreshes) one job's detail into `detailCache`, guarded by
+  // generation and abort signal the same way `loadTargets`/`loadBuilds`
+  // are — used both by `toggleDetail`'s first expand and by the poll below
+  // to keep an already-expanded, still-active job's progress from going
+  // stale (see the poll's own comment).
+  async function loadDetail(jobId: string, signal: AbortSignal, requestGeneration: number) {
+    try {
+      const detail = await readJob(jobId, { signal });
+      if (signal.aborted || requestGeneration !== generation) return;
+      detailCache = { ...detailCache, [jobId]: detail };
+    } catch {
+      // Leave undetailed/stale — the row still shows its list-level status;
+      // the user can retry by collapsing and re-expanding.
+    }
+  }
+
   $effect(() => {
     const id = engineId;
     const isConnected = connected;
@@ -95,18 +121,28 @@
     }
 
     // Poll only while at least one build for this project is still active
-    // (queued/running) — never an unconditional background loop.
+    // (queued/running) — never an unconditional background loop. Also
+    // refreshes the expanded job's cached detail while it's still active,
+    // so a running build's progress doesn't go stale behind an open detail
+    // row (only the list was being refreshed before).
     const timer = setInterval(() => {
       if (!isConnected || !projectId) return;
       if (!buildsState.data?.some((job) => isBuildJobActive(job.status))) return;
       const pollController = new AbortController();
       void loadBuilds(projectId, pollController.signal, myGeneration);
+      const expanded = expandedId;
+      const expandedJob = expanded ? buildsState.data?.find((job) => job.id === expanded) : null;
+      if (expanded && expandedJob && isBuildJobActive(expandedJob.status)) {
+        void loadDetail(expanded, pollController.signal, myGeneration);
+      }
     }, 4000);
 
     void id;
     return () => {
       controller.abort();
       clearInterval(timer);
+      for (const pending of mutationControllers) pending.abort();
+      mutationControllers.clear();
     };
   });
 
@@ -121,23 +157,32 @@
 
   async function startBuild(serviceName: string) {
     if (!selectedProjectId || startingService) return;
+    const myGeneration = generation;
+    const projectId = selectedProjectId;
+    const controller = trackedController();
     startingService = serviceName;
     startError = null;
     try {
-      await startImageBuild(selectedProjectId, serviceName);
+      await startImageBuild(projectId, serviceName, { signal: controller.signal });
+      if (myGeneration !== generation) return;
       refresh();
     } catch (caught) {
+      if (myGeneration !== generation) return;
       startError = toArtifactRequestError(caught).message;
     } finally {
-      startingService = null;
+      mutationControllers.delete(controller);
+      if (myGeneration === generation) startingService = null;
     }
   }
 
   async function cancelBuild(jobId: string) {
+    const myGeneration = generation;
+    const controller = trackedController();
     try {
-      await cancelJob(jobId);
+      await cancelJob(jobId, { signal: controller.signal });
     } finally {
-      refresh();
+      mutationControllers.delete(controller);
+      if (myGeneration === generation) refresh();
     }
   }
 
@@ -148,12 +193,12 @@
     }
     expandedId = jobId;
     if (detailCache[jobId]) return;
+    const myGeneration = generation;
+    const controller = trackedController();
     try {
-      const detail = await readJob(jobId);
-      detailCache = { ...detailCache, [jobId]: detail };
-    } catch {
-      // Leave undetailed — the row still shows its list-level status; the
-      // user can retry by collapsing and re-expanding.
+      await loadDetail(jobId, controller.signal, myGeneration);
+    } finally {
+      mutationControllers.delete(controller);
     }
   }
 
