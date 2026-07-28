@@ -408,6 +408,35 @@ export type ImageBuildResult = {
   image_digest: string | null;
 };
 
+export type ImagePullResult = {
+  image_reference: string;
+  requested_image: string;
+  registry: string;
+  engine_id: string;
+  runtime_profile_id: string | null;
+  authenticated: boolean;
+};
+
+export type ImagePushResult = {
+  image_reference: string;
+  registry: string;
+  engine_id: string;
+  runtime_profile_id: string | null;
+  authenticated: boolean;
+};
+
+export type ArtifactTransferResult = ImagePullResult | ImagePushResult;
+
+export type TransferProgressEntry = {
+  sequence: number;
+  operation: "pull" | "push";
+  stage: string;
+  current_units: number | null;
+  total_units: number | null;
+  message: string | null;
+  created_at_ms: number;
+};
+
 /**
  * One ordered, bounded progress entry for an `image_build` job — mirrors
  * `susun::BuildEvent`, flattened. `vertex_id`/`log_stream`/`text`/`status`/
@@ -434,19 +463,21 @@ export type BuildProgressEntry = {
 
 export type StudioJob = {
   id: string;
-  kind: "up" | "down" | "build" | "clean" | "image_build";
+  kind: "up" | "down" | "build" | "clean" | "image_build" | "image_pull" | "image_push";
   status: JobStatus;
   project_id: string;
   /** The build-declared service this job targets — only ever set for
    * `kind: "image_build"`. */
   service_name: string | null;
   actions: JobAction[];
-  result: JobExecutionResult | ImageBuildResult | null;
+  result: JobExecutionResult | ImageBuildResult | ArtifactTransferResult | null;
   error: string | null;
   error_code: string | null;
   /** Only ever populated for `kind: "image_build"`, and only by `readJob`
    * (the single-job detail read) — omitted by the list endpoints. */
   progress?: BuildProgressEntry[];
+  /** Populated only by `readJob` for image pull/push jobs. */
+  transfer_progress?: TransferProgressEntry[];
   created_at_ms: number;
   updated_at_ms: number;
 };
@@ -1354,6 +1385,23 @@ export async function deleteRegistryCredential(
   return readJson(`/v1/registry/credentials/${encodeURIComponent(id)}`, {
     ...options,
     method: "DELETE",
+  });
+}
+
+export type ImagePullJobRequest = {
+  image: string;
+  credential_id?: string | null;
+};
+
+export async function startImagePull(
+  engineId: string,
+  request: ImagePullJobRequest,
+  options: DaemonRequestOptions = {},
+): Promise<StudioJob> {
+  return readJson(`/v1/engines/${encodeURIComponent(engineId)}/images/pull`, {
+    ...options,
+    method: "POST",
+    body: request,
   });
 }
 

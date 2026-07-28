@@ -1,5 +1,6 @@
 import type {
   BuildProgressEntry,
+  ArtifactTransferResult,
   ImageBuildResult,
   JobExecutionResult,
   JobStatus,
@@ -13,9 +14,9 @@ import type {
  * either shape.
  */
 export function isImageBuildResult(
-  result: JobExecutionResult | ImageBuildResult | null,
+  result: JobExecutionResult | ImageBuildResult | ArtifactTransferResult | null,
 ): result is ImageBuildResult {
-  return result !== null && "image_reference" in result;
+  return result !== null && "image_digest" in result;
 }
 
 /** Whether an `image_build` job's status means it may still produce more

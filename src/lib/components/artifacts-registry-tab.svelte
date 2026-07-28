@@ -21,6 +21,7 @@
   import { toCredentialOperationError } from "$lib/registry/credential-state";
   import {
     KeyRound,
+    Download,
     LogIn,
     LogOut,
     RefreshCw,
@@ -31,6 +32,7 @@
   import StatusBadge from "./status-badge.svelte";
   import ArtifactsStateBanner from "./artifacts-state-banner.svelte";
   import RegistryCredentialDialog from "./registry-credential-dialog.svelte";
+  import ImagePullDialog from "./image-pull-dialog.svelte";
 
   let { engineId, connected }: { engineId: string; connected: boolean } = $props();
 
@@ -40,6 +42,7 @@
   let dialogOpen = $state(false);
   let dialogMode = $state<"create" | "rotate" | "delete">("create");
   let selectedCredential = $state<RegistryCredential | null>(null);
+  let pullOpen = $state(false);
 
   async function loadCapabilities(
     id: string,
@@ -88,6 +91,7 @@
       void loadCapabilities(id, controller.signal, requestGeneration);
     }
     void loadCredentials(controller.signal, requestGeneration);
+    pullOpen = false;
     return () => controller.abort();
   });
 
@@ -170,6 +174,10 @@
       </p>
     </div>
     <div class="flex items-center gap-2">
+      <Button size="sm" variant="outline" disabled={!connected} onclick={() => (pullOpen = true)}>
+        <Download />
+        Pull image
+      </Button>
       <Button size="sm" variant="outline" disabled={credentialState.loading} onclick={refresh}>
         <RefreshCw class={credentialState.loading ? "animate-spin" : undefined} />
         Refresh
@@ -292,3 +300,4 @@
   bind:open={dialogOpen}
   oncompleted={refreshCredentials}
 />
+<ImagePullDialog {engineId} {connected} bind:open={pullOpen} />
