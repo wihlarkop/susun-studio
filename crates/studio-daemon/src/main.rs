@@ -11,6 +11,7 @@ mod jobs;
 mod logging;
 mod plans_maintenance;
 mod project_source;
+mod registry;
 mod restore;
 mod routes;
 mod runtime;
