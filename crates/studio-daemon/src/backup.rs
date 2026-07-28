@@ -179,8 +179,9 @@ pub struct RestoreManifestSummary {
 /// versioned, checksummed manifest, returned as tar bytes ready to be written
 /// atomically by the caller.
 pub async fn create_backup_archive(db: &Database, db_path: &Path) -> Result<Vec<u8>, BackupError> {
-    let snapshot = SnapshotFile::create(db, db_path).await?;
-    let db_bytes = std::fs::read(&snapshot.path)?;
+    let raw_snapshot = SnapshotFile::create(db, db_path).await?;
+    let snapshot = SnapshotFile::sanitized_copy(&raw_snapshot.path, db_path).await?;
+    drop(raw_snapshot);
 
     // Summarize the snapshot itself, not the live database, so the manifest's
     // counts always describe exactly the bytes archived here. Reading the live
@@ -191,10 +192,13 @@ pub async fn create_backup_archive(db: &Database, db_path: &Path) -> Result<Vec<
         let snapshot_db = turso::Builder::new_local(&snapshot.path.to_string_lossy())
             .build()
             .await?;
-        collect_summary(&snapshot_db).await?
+        let summary = collect_summary(&snapshot_db).await?;
+        drop(snapshot_db);
+        summary
         // snapshot_db is dropped here, releasing the file handle before the
         // snapshot temp file (and its sidecars) are removed.
     };
+    let db_bytes = std::fs::read(&snapshot.path)?;
     // The snapshot temp file is no longer needed once read and summarized.
     drop(snapshot);
     let manifest = BackupManifest {
@@ -316,6 +320,25 @@ impl SnapshotFile {
             .replace('\'', "''");
         conn.execute(&format!("VACUUM INTO '{literal}'"), ())
             .await?;
+        Ok(Self { path })
+    }
+
+    async fn sanitized_copy(source: &Path, db_path: &Path) -> Result<Self, BackupError> {
+        let source_db = turso::Builder::new_local(&source.to_string_lossy())
+            .build()
+            .await?;
+        let conn = source_db.connect()?;
+        conn.execute("DELETE FROM registry_credentials", ()).await?;
+
+        let path = snapshot_temp_path(db_path);
+        let literal = path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('\'', "''");
+        conn.execute(&format!("VACUUM INTO '{literal}'"), ())
+            .await?;
+        drop(conn);
+        drop(source_db);
         Ok(Self { path })
     }
 }

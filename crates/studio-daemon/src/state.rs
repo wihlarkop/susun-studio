@@ -4,6 +4,7 @@ use turso::Database;
 
 use crate::{
     jobs::{build_registry::BuildJobRegistry, registry::JobRegistry, tickets::StreamTickets},
+    registry::credential_store::RegistryCredentialStore,
     restore::RestoreCoordinator,
     watch::registry::WatchRegistry,
 };
@@ -22,4 +23,5 @@ pub struct AppState {
     /// Shared security envelope for destructive data operations (migration,
     /// reset/remove/repair, engine prune, metadata restore).
     pub action_plans: Arc<crate::action_plans::ActionPlanStore>,
+    pub registry_credentials: Arc<dyn RegistryCredentialStore>,
 }

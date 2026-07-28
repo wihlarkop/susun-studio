@@ -124,6 +124,49 @@ async fn roundtrip_backup_validates_and_summarizes() -> TestResult {
 }
 
 #[tokio::test]
+async fn backup_snapshot_excludes_registry_credential_metadata_rows() -> TestResult {
+    let (db, path) = seeded_db().await?;
+    let conn = db.connect()?;
+    conn.execute(
+        "INSERT INTO registry_credentials (
+            id, registry_identity, username_label, created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        turso::params![
+            uuid::Uuid::new_v4().to_string(),
+            "registry.example",
+            "studio-user",
+            1_i64,
+            1_i64
+        ],
+    )
+    .await?;
+
+    let archive = create_backup_archive(&db, &path).await?;
+    let (_, snapshot_bytes) = validated_database(&archive, db::latest_migration_version())?;
+    let restored_path = unique_db_path();
+    std::fs::write(&restored_path, snapshot_bytes)?;
+    let snapshot_db = turso::Builder::new_local(&restored_path.to_string_lossy())
+        .build()
+        .await?;
+    let snapshot_conn = snapshot_db.connect()?;
+    let mut rows = snapshot_conn
+        .query("SELECT COUNT(*) FROM registry_credentials", ())
+        .await?;
+    let count = rows
+        .next()
+        .await?
+        .ok_or("missing count row")?
+        .get::<i64>(0)?;
+
+    assert_eq!(count, 0);
+    drop(snapshot_conn);
+    drop(snapshot_db);
+    let _ = std::fs::remove_file(&restored_path);
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+#[tokio::test]
 async fn tampered_database_fails_checksum() -> TestResult {
     let db_bytes = fake_db(b"-not-a-real-db-but-checksum-still-applies");
     let manifest = manifest_json(db::latest_migration_version(), &db_bytes)?;

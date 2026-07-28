@@ -80,6 +80,30 @@ pub enum ApiError {
     #[error("artifact not found")]
     ArtifactNotFound,
 
+    #[error("registry credential not found")]
+    RegistryCredentialNotFound,
+
+    #[error("registry identity is invalid")]
+    InvalidRegistryIdentity,
+
+    #[error("registry credential request is invalid")]
+    InvalidRegistryCredential,
+
+    #[error("a Studio credential already exists for this registry")]
+    RegistryCredentialConflict,
+
+    #[error("the operating system credential store is unavailable")]
+    CredentialStoreUnavailable,
+
+    #[error("the operating system denied credential-store access")]
+    CredentialStoreDenied,
+
+    #[error("the credential is too large for the operating system store")]
+    CredentialTooLarge,
+
+    #[error("registry credential operation failed")]
+    CredentialOperationFailed,
+
     #[error("planning failed: {0}")]
     PlanningFailed(String),
 
@@ -147,6 +171,8 @@ impl IntoResponse for ApiError {
             Self::MissingName
             | Self::MissingPath
             | Self::MissingComposeFiles
+            | Self::InvalidRegistryIdentity
+            | Self::InvalidRegistryCredential
             | Self::TrustedPlanContentRejected => StatusCode::BAD_REQUEST,
             Self::ProjectNotFound
             | Self::PlanNotFound
@@ -155,16 +181,23 @@ impl IntoResponse for ApiError {
             | Self::WatchNotFound
             | Self::RuntimeProfileNotFound
             | Self::EngineNotFound
-            | Self::ArtifactNotFound => StatusCode::NOT_FOUND,
+            | Self::ArtifactNotFound
+            | Self::RegistryCredentialNotFound => StatusCode::NOT_FOUND,
+            Self::RegistryCredentialConflict => StatusCode::CONFLICT,
+            Self::CredentialStoreDenied => StatusCode::FORBIDDEN,
             Self::EngineUnavailable(_) => StatusCode::BAD_GATEWAY,
             Self::InvalidImport(_)
             | Self::PlanningFailed(_)
             | Self::ActionUnavailable(_)
+            | Self::CredentialTooLarge
             | Self::RestoreArchiveInvalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::RestoreInProgress => StatusCode::SERVICE_UNAVAILABLE,
+            Self::RestoreInProgress | Self::CredentialStoreUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::Database(_)
             | Self::Json(_)
             | Self::Clock
+            | Self::CredentialOperationFailed
             | Self::BackupFailed(_)
             | Self::RestoreFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };

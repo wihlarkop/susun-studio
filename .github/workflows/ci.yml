@@ -72,3 +72,47 @@ jobs:
 
       - name: Test Rust workspace
         run: cargo test --workspace
+
+  credential-platform-check:
+    name: Credential platform (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Checkout susun (sibling path dependency)
+        uses: actions/checkout@v6
+        with:
+          repository: wihlarkop/susun
+          path: susun-src
+
+      - name: Link susun as a sibling directory
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ln -s "$GITHUB_WORKSPACE/susun-src" "$GITHUB_WORKSPACE/../susun"
+
+      - name: Link susun as a sibling directory (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item `
+            -ItemType Junction `
+            -Path (Join-Path $env:GITHUB_WORKSPACE "..\susun") `
+            -Target (Join-Path $env:GITHUB_WORKSPACE "susun-src")
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check credential integration
+        run: cargo check -p susun-studio-daemon
+
+      - name: Test credential modules
+        run: "cargo test -p susun-studio-daemon registry::"

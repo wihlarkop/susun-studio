@@ -78,6 +78,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "build_job_progress",
         sql: include_str!("../migrations/0015_build_job_progress.sql"),
     },
+    Migration {
+        version: 16,
+        name: "registry_credentials",
+        sql: include_str!("../migrations/0016_registry_credentials.sql"),
+    },
 ];
 
 #[derive(Debug, thiserror::Error)]
