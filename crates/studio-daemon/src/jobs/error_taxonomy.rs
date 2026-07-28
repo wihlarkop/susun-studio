@@ -62,6 +62,34 @@ pub fn classify_build_error(error: &susun::BuildError) -> (&'static str, &'stati
     }
 }
 
+pub fn classify_transfer_error(error: &susun::EngineError) -> (&'static str, &'static str) {
+    match error {
+        susun::EngineError::Connection(_) | susun::EngineError::Api { .. } => (
+            "engine_unavailable",
+            "The engine could not complete the registry transfer.",
+        ),
+        susun::EngineError::Unsupported { .. } => (
+            "capability_unsupported",
+            "The selected engine does not support this registry transfer.",
+        ),
+        susun::EngineError::InvalidRequest { .. } => {
+            ("invalid_image", "The image reference is invalid.")
+        }
+        susun::EngineError::Conflict { .. } => (
+            "resource_conflict",
+            "The engine reported a conflict while transferring the image.",
+        ),
+        susun::EngineError::NotFound { .. } => {
+            ("image_not_found", "The requested image was not found.")
+        }
+        susun::EngineError::Authentication { .. } => (
+            "registry_authentication_failed",
+            "Registry authentication failed. Update the saved credential and try again.",
+        ),
+        susun::EngineError::Cancelled => ("cancelled", "The registry transfer was cancelled."),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +162,16 @@ mod tests {
                 "classify_build_error leaked a path-shaped fragment for {code}: {message}"
             );
         }
+    }
+
+    #[test]
+    fn classify_transfer_error_never_forwards_provider_or_registry_details() {
+        let error = susun::EngineError::Authentication {
+            registry: "private.internal.example".to_owned(),
+        };
+        let (code, message) = classify_transfer_error(&error);
+        assert_eq!(code, "registry_authentication_failed");
+        assert!(!message.contains("private.internal.example"));
+        assert_ne!(message, error.to_string());
     }
 }

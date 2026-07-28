@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use turso::{Database, params};
 
+use crate::jobs::transfer_progress::{TransferProgressEntry, read_transfer_progress};
 use crate::{
     auth::authorize, error::ApiError, jobs::error_taxonomy::classify_build_error, logging,
     project_source::load_project_source, runtime, state::AppState, susun_integration,
@@ -67,6 +68,8 @@ pub struct JobResponse {
     /// hundreds of progress rows per entry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub progress: Vec<BuildProgressEntryResponse>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transfer_progress: Vec<TransferProgressEntry>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -588,6 +591,7 @@ fn queued_build_job_response(
         error: None,
         error_code: None,
         progress: Vec::new(),
+        transfer_progress: Vec::new(),
         created_at_ms: now,
         updated_at_ms: now,
     }
@@ -1221,6 +1225,7 @@ fn running_job_response(
         error: None,
         error_code: None,
         progress: Vec::new(),
+        transfer_progress: Vec::new(),
         created_at_ms: now,
         updated_at_ms: now,
     }
@@ -1379,7 +1384,9 @@ pub async fn cancel_job(
     // (`RuntimeEvent`-based up/down/build(declared) jobs vs. `BuildEvent`-based
     // image_build jobs) — try both rather than branching on `kind`, so this
     // stays correct even if that mapping changes.
-    let cancelled = state.jobs.cancel(&job_id) || state.build_jobs.cancel(&job_id);
+    let cancelled = state.jobs.cancel(&job_id)
+        || state.build_jobs.cancel(&job_id)
+        || state.transfer_jobs.cancel(&job_id);
     logging::warn(
         "job_cancel_requested",
         &[("job_id", job_id), ("cancelled", cancelled.to_string())],
@@ -1423,6 +1430,7 @@ pub async fn list_jobs(
             error: row.get(5)?,
             error_code: row.get(6)?,
             progress: Vec::new(),
+            transfer_progress: Vec::new(),
             created_at_ms: row.get(8)?,
             updated_at_ms: row.get(9)?,
         });
@@ -1468,6 +1476,7 @@ pub async fn list_project_jobs(
             error: row.get(5)?,
             error_code: row.get(6)?,
             progress: Vec::new(),
+            transfer_progress: Vec::new(),
             created_at_ms: row.get(8)?,
             updated_at_ms: row.get(9)?,
         });
@@ -1505,6 +1514,11 @@ pub async fn read_job(
     } else {
         Vec::new()
     };
+    let transfer_progress = if matches!(kind.as_str(), "image_pull" | "image_push") {
+        read_transfer_progress(&state.db, &job_id).await?
+    } else {
+        Vec::new()
+    };
     Ok(Json(JobResponse {
         id: job_id,
         kind,
@@ -1521,6 +1535,7 @@ pub async fn read_job(
         error: row.get(5)?,
         error_code: row.get(6)?,
         progress,
+        transfer_progress,
         created_at_ms: row.get(8)?,
         updated_at_ms: row.get(9)?,
     }))

@@ -85,6 +85,11 @@ pub async fn sweep_old_jobs(db: &Database) -> Result<usize, turso::Error> {
             params![job_id.clone()],
         )
         .await?;
+        conn.execute(
+            "DELETE FROM artifact_transfer_progress WHERE job_id = ?1",
+            params![job_id.clone()],
+        )
+        .await?;
         conn.execute("DELETE FROM jobs WHERE id = ?1", params![job_id.clone()])
             .await?;
     }
@@ -182,12 +187,29 @@ mod tests {
             (),
         )
         .await?;
+        conn.execute(
+            "INSERT INTO artifact_transfer_progress (
+                id, job_id, sequence, operation, stage, created_at_ms
+             ) VALUES ('tp1', 'j-0', 0, 'pull_image', 'started', 1)",
+            (),
+        )
+        .await?;
 
         let removed = sweep_old_jobs(&db).await?;
         assert_eq!(removed, 1);
 
         let mut rows = conn
             .query("SELECT COUNT(*) FROM build_job_progress", ())
+            .await?;
+        let remaining: i64 = rows
+            .next()
+            .await?
+            .map(|row| row.get(0))
+            .transpose()?
+            .unwrap_or(-1);
+        assert_eq!(remaining, 0);
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM artifact_transfer_progress", ())
             .await?;
         let remaining: i64 = rows
             .next()

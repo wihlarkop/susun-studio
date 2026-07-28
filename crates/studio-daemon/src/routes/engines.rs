@@ -39,6 +39,7 @@ pub(crate) const PLATFORM_DEFAULT_ENGINE_ID: &str = "engine-docker-local";
 pub(crate) struct ResolvedEngine {
     pub engine_id: String,
     pub runtime_profile_id: Option<String>,
+    pub runtime_class: Option<String>,
 }
 
 /// Resolves the engine actually selected right now — once — and confirms
@@ -57,13 +58,14 @@ pub(crate) async fn resolve_and_validate_engine(
     state: &AppState,
     requested_engine_id: &str,
 ) -> Result<ResolvedEngine, ApiError> {
-    let (engine_id, runtime_profile_id) = resolved_engine_id(&state.db).await?;
+    let (engine_id, runtime_profile_id, runtime_class) = resolved_engine_id(&state.db).await?;
     if requested_engine_id != engine_id {
         return Err(ApiError::EngineNotFound);
     }
     Ok(ResolvedEngine {
         engine_id,
         runtime_profile_id,
+        runtime_class,
     })
 }
 
@@ -73,12 +75,14 @@ pub(crate) async fn resolve_and_validate_engine(
 /// exact profile id (if any) that identity came from. This is the single
 /// source of truth for "which engine a request is about" — never derive it
 /// from the legacy `engines` table, which does not drive engine selection.
-async fn resolved_engine_id(db: &turso::Database) -> Result<(String, Option<String>), ApiError> {
-    let (runtime_profile_id, _) = runtime::attribution_for(db, None).await?;
+async fn resolved_engine_id(
+    db: &turso::Database,
+) -> Result<(String, Option<String>, Option<String>), ApiError> {
+    let (runtime_profile_id, runtime_class) = runtime::attribution_for(db, None).await?;
     let engine_id = runtime_profile_id
         .clone()
         .unwrap_or_else(|| PLATFORM_DEFAULT_ENGINE_ID.to_owned());
-    Ok((engine_id, runtime_profile_id))
+    Ok((engine_id, runtime_profile_id, runtime_class))
 }
 
 #[derive(Debug, Serialize)]
@@ -375,7 +379,7 @@ pub(crate) async fn revalidate_engine_still_selected(
     db: &turso::Database,
     plan_engine_id: &str,
 ) -> Result<bool, ApiError> {
-    let (current, _) = resolved_engine_id(db).await?;
+    let (current, _, _) = resolved_engine_id(db).await?;
     Ok(current == plan_engine_id)
 }
 

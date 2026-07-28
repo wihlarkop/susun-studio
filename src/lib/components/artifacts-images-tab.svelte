@@ -1,12 +1,13 @@
 <script lang="ts">
   import * as Table from "$lib/components/ui/table/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
-  import { RefreshCw } from "@lucide/svelte";
+  import { Download, RefreshCw } from "@lucide/svelte";
   import StatusBadge from "./status-badge.svelte";
   import ArtifactsStateBanner from "./artifacts-state-banner.svelte";
   import ImageTagDialog from "./image-tag-dialog.svelte";
   import ImageRemoveDialog from "./image-remove-dialog.svelte";
   import ScopePruneControl from "./scope-prune-control.svelte";
+  import ImagePullDialog from "./image-pull-dialog.svelte";
   import {
     readEngineImages,
     readEngineImage,
@@ -39,6 +40,7 @@
   let selectedImage = $state<ImageArtifactSummary | null>(null);
   let tagOpen = $state(false);
   let removeOpen = $state(false);
+  let pullOpen = $state(false);
 
   function openTag(image: ImageArtifactSummary) {
     selectedImage = image;
@@ -82,6 +84,7 @@
     // no longer describes the selected engine.
     tagOpen = false;
     removeOpen = false;
+    pullOpen = false;
     selectedImage = null;
 
     const controller = new AbortController();
@@ -165,6 +168,10 @@
         {/if}
       </div>
       <div class="flex items-center gap-2">
+        <Button size="sm" disabled={fetchState.loading} onclick={() => (pullOpen = true)}>
+          <Download />
+          Pull image
+        </Button>
         <ScopePruneControl
           {engineId}
           scope="images"
@@ -301,6 +308,13 @@
 {:else}
   <ArtifactsStateBanner state={viewState} itemNoun="images" onRetry={refresh} />
 {/if}
+
+<ImagePullDialog
+  {engineId}
+  {connected}
+  bind:open={pullOpen}
+  oncompleted={refresh}
+/>
 
 {#if selectedImage}
   <ImageTagDialog {engineId} image={selectedImage} bind:open={tagOpen} oncompleted={refresh} />

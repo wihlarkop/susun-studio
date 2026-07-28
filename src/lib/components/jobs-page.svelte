@@ -4,11 +4,18 @@
   import StatusBadge from "./status-badge.svelte";
   import {
     listJobs,
+    readJob,
     type JobActionResult,
     type StudioJob,
     type StudioProject,
   } from "$lib/daemon/client";
   import { isImageBuildResult } from "$lib/jobs/build-job";
+  import {
+    isArtifactTransferResult,
+    isJobExecutionResult,
+    isTransferJobActive,
+    visibleTransferProgress,
+  } from "$lib/jobs/transfer-job";
   import { relativeTime } from "$lib/utils";
 
   let { projects }: { projects: StudioProject[] } = $props();
@@ -20,6 +27,8 @@
   let expandedId = $state<string | null>(null);
   let reportView = $state<"pretty" | "json">("pretty");
   let errorMessage = $state<string | null>(null);
+  let detailCache = $state<Record<string, StudioJob>>({});
+  let detailGeneration = 0;
 
   function toEpochMs(time: { secs_since_epoch: number; nanos_since_epoch: number } | null) {
     return time ? time.secs_since_epoch * 1000 + time.nanos_since_epoch / 1e6 : null;
@@ -40,8 +49,15 @@
 
   async function refresh() {
     try {
-      jobs = await listJobs();
+      const nextJobs = await listJobs();
+      jobs = nextJobs;
       errorMessage = null;
+      const expanded = expandedId
+        ? nextJobs.find((candidate) => candidate.id === expandedId)
+        : null;
+      if (expanded && isTransferJobActive(expanded)) {
+        void loadTransferDetail(expanded.id, detailGeneration);
+      }
     } catch (error) {
       errorMessage = error instanceof Error ? error.message : String(error);
     }
@@ -54,7 +70,30 @@
   });
 
   function projectName(projectId: string): string {
+    if (!projectId) return "Runtime";
     return projects.find((project) => project.id === projectId)?.name ?? projectId;
+  }
+
+  async function loadTransferDetail(jobId: string, requestGeneration: number) {
+    try {
+      const detail = await readJob(jobId);
+      if (requestGeneration !== detailGeneration || expandedId !== jobId) return;
+      detailCache = { ...detailCache, [jobId]: detail };
+    } catch {
+      // The list-level status remains usable. A later poll or re-expand retries detail.
+    }
+  }
+
+  function toggleJob(job: StudioJob) {
+    detailGeneration += 1;
+    if (expandedId === job.id) {
+      expandedId = null;
+      return;
+    }
+    expandedId = job.id;
+    if (job.kind === "image_pull" || job.kind === "image_push") {
+      void loadTransferDetail(job.id, detailGeneration);
+    }
   }
 
   const visible = $derived(
@@ -99,6 +138,8 @@
       <option value="build">build</option>
       <option value="clean">clean</option>
       <option value="image_build">image_build</option>
+      <option value="image_pull">image_pull</option>
+      <option value="image_push">image_push</option>
     </select>
     <select
       bind:value={projectFilter}
@@ -133,7 +174,7 @@
           {#each visible as job (job.id)}
             <Table.Row
               class="cursor-pointer"
-              onclick={() => (expandedId = expandedId === job.id ? null : job.id)}
+              onclick={() => toggleJob(job)}
             >
               <Table.Cell>{projectName(job.project_id)}</Table.Cell>
               <Table.Cell class="font-medium">{job.kind}</Table.Cell>
@@ -145,19 +186,48 @@
             {#if expandedId === job.id}
               <Table.Row>
                 <Table.Cell colspan={4} class="bg-muted/40 whitespace-normal">
+                  {@const detail = detailCache[job.id] ?? job}
                   <div class="flex flex-col gap-3 py-1">
-                    {#if job.error}
+                    {#if detail.error}
                       <p class="text-destructive text-xs">
-                        {job.error}
-                        {#if job.error_code}<span class="font-mono">[{job.error_code}]</span>{/if}
+                        {detail.error}
+                        {#if detail.error_code}<span class="font-mono">[{detail.error_code}]</span>{/if}
                       </p>
                     {/if}
 
-                    {#if !job.error && !job.result}
+                    {#if !detail.error && !detail.result}
                       <p class="text-muted-foreground text-xs">No report yet.</p>
                     {/if}
 
-                    {#if job.result}
+                    {#if detail.transfer_progress?.length}
+                      {@const progressWindow = visibleTransferProgress(detail.transfer_progress, 12)}
+                      <div class="grid gap-1 rounded-md border p-2 text-xs">
+                        {#if progressWindow.hiddenCount > 0}
+                          <p class="text-muted-foreground">
+                            {progressWindow.hiddenCount} earlier updates hidden.
+                          </p>
+                        {/if}
+                        {#each progressWindow.visible as entry (entry.sequence)}
+                          <div class="flex items-start justify-between gap-3">
+                            <span class="min-w-0">
+                              <span class="font-medium">{entry.stage}</span>
+                              {#if entry.message}
+                                <span class="text-muted-foreground">: {entry.message}</span>
+                              {/if}
+                            </span>
+                            {#if entry.current_units !== null}
+                              <span class="shrink-0 tabular-nums text-muted-foreground">
+                                {entry.current_units}{entry.total_units !== null
+                                  ? ` / ${entry.total_units}`
+                                  : ""}
+                              </span>
+                            {/if}
+                          </div>
+                        {/each}
+                      </div>
+                    {/if}
+
+                    {#if detail.result}
                       <div class="border-input inline-flex w-fit rounded-md border p-0.5 text-xs">
                         <button
                           type="button"
@@ -186,8 +256,26 @@
                       </div>
 
                       {#if reportView === "pretty"}
-                        {#if isImageBuildResult(job.result)}
-                          {@const buildResult = job.result}
+                        {#if isArtifactTransferResult(detail.result)}
+                          {@const transferResult = detail.result}
+                          <div class="grid gap-2 rounded-md border px-3 py-2 text-xs">
+                            <div>
+                              <div class="text-muted-foreground">Image</div>
+                              <div class="font-mono font-semibold break-all">
+                                {transferResult.image_reference}
+                              </div>
+                            </div>
+                            <div class="flex flex-wrap gap-x-5 gap-y-1 text-muted-foreground">
+                              <span>Registry: {transferResult.registry}</span>
+                              <span>
+                                {transferResult.authenticated
+                                  ? "Studio-managed auth"
+                                  : "Anonymous"}
+                              </span>
+                            </div>
+                          </div>
+                        {:else if isImageBuildResult(detail.result)}
+                          {@const buildResult = detail.result}
                           <div class="rounded-md border px-2 py-1 text-xs">
                             <div
                               class="text-muted-foreground text-[0.65rem] tracking-wide uppercase"
@@ -206,8 +294,8 @@
                           <p class="text-muted-foreground text-xs">
                             Progress history is on the Builds tab in Artifacts.
                           </p>
-                        {:else}
-                          {@const executionResult = job.result}
+                        {:else if isJobExecutionResult(detail.result)}
+                          {@const executionResult = detail.result}
                           <div class="grid grid-cols-5 gap-2 text-xs">
                             <div class="rounded-md border px-2 py-1">
                               <div
@@ -269,7 +357,7 @@
                                 >
                                   <StatusBadge status={action.status} />
                                   <span class="min-w-0 flex-1 break-words">
-                                    {actionLabel(job, action.action_id)}
+                                    {actionLabel(detail, action.action_id)}
                                   </span>
                                   <span class="text-muted-foreground shrink-0 tabular-nums">
                                     {actionDuration(action)}
@@ -289,7 +377,7 @@
                           {/if}
                         {/if}
                       {:else}
-                        <pre class="overflow-x-auto text-xs">{JSON.stringify(job.result, null, 2)}</pre>
+                        <pre class="overflow-x-auto text-xs">{JSON.stringify(detail.result, null, 2)}</pre>
                       {/if}
                     {/if}
                   </div>
