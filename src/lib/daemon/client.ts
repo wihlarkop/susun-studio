@@ -1295,6 +1295,68 @@ export async function readEngineRegistryCapability(
   return readJson(`/v1/engines/${encodeURIComponent(engineId)}/registry`, options);
 }
 
+export type RegistryCredentialStatus = "ready" | "reauthentication_required" | "unavailable";
+
+export type RegistryCredential = {
+  id: string;
+  registry: string;
+  username_label: string | null;
+  status: RegistryCredentialStatus;
+  created_at_ms: number;
+  updated_at_ms: number;
+  last_success_at_ms: number | null;
+};
+
+type RegistryCredentialListResponse = {
+  credentials: RegistryCredential[];
+};
+
+export async function listRegistryCredentials(
+  options: DaemonRequestOptions = {},
+): Promise<RegistryCredential[]> {
+  const response = await readJson<RegistryCredentialListResponse>(
+    "/v1/registry/credentials",
+    options,
+  );
+  return response.credentials;
+}
+
+export async function createRegistryCredential(
+  registry: string,
+  username: string | null,
+  secret: string,
+  options: DaemonRequestOptions = {},
+): Promise<RegistryCredential> {
+  return readJson("/v1/registry/credentials", {
+    ...options,
+    method: "POST",
+    body: { registry, username, secret },
+  });
+}
+
+export async function rotateRegistryCredential(
+  id: string,
+  username: string | null,
+  secret: string,
+  options: DaemonRequestOptions = {},
+): Promise<RegistryCredential> {
+  return readJson(`/v1/registry/credentials/${encodeURIComponent(id)}`, {
+    ...options,
+    method: "PUT",
+    body: { username, secret },
+  });
+}
+
+export async function deleteRegistryCredential(
+  id: string,
+  options: DaemonRequestOptions = {},
+): Promise<void> {
+  return readJson(`/v1/registry/credentials/${encodeURIComponent(id)}`, {
+    ...options,
+    method: "DELETE",
+  });
+}
+
 export async function runAction(
   projectId: string,
   action: "up" | "down" | "build" | "clean",
@@ -1680,6 +1742,7 @@ async function readJson<T>(path: string, options: DaemonRequestOptions = {}): Pr
     throw new DaemonRequestError(response.status, message);
   }
 
+  if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
 }
 
