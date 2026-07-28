@@ -99,6 +99,10 @@ Run the Tauri app during development:
 bun run tauri dev
 ```
 
+The development command rebuilds the debug daemon sidecar automatically before
+starting Vite. Running `bun run build:sidecar` separately is not required for
+development.
+
 ## Public Docs
 
 Public beta docs live in [`docs/public/`](docs/public/):
@@ -120,7 +124,10 @@ Packaging has two important moving parts:
    bun run build:sidecar
    ```
 
-   Run this before `bun run tauri dev` or `bun run tauri build` (it's also wired into `beforeBuildCommand`, so a full `tauri build` does it automatically — but `cargo check`/`clippy`/`build` on `src-tauri` directly will fail until you've run it at least once).
+   `bun run tauri dev` builds its debug sidecar automatically, and a full
+   `bun run tauri build` builds the release sidecar automatically. Run this
+   command directly only when checking or building `src-tauri` with Cargo
+   without going through the Tauri CLI.
 
 2. **Updater signing keypair.** `src-tauri/tauri.conf.json`'s `plugins.updater.pubkey` is filled with the generated public key. The private key file and password must remain outside the repository and are used as GitHub Actions secrets. To rotate the keypair, generate a new one:
 
