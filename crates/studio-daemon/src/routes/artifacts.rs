@@ -350,7 +350,7 @@ pub async fn read_engine_image(
 
 /// Fingerprints an image's engine-reported identity (references, digests,
 /// size) at preview time so a commit can detect any change since preview.
-fn image_fingerprint(image: &artifact_inventory::ImageSummaryRow) -> String {
+pub(crate) fn image_fingerprint(image: &artifact_inventory::ImageSummaryRow) -> String {
     let mut canonical = format!(
         "id={};size={};shared_size={};",
         image.id,

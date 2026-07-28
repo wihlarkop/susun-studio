@@ -221,6 +221,14 @@ pub fn app(state: AppState) -> Router {
             "/v1/engines/{id}/images/pull",
             post(artifact_transfers::start_image_pull),
         )
+        .route(
+            "/v1/engines/{id}/images/{image_id}/push/preview",
+            post(artifact_transfers::preview_image_push),
+        )
+        .route(
+            "/v1/engines/images/push/commit/{plan_id}",
+            post(artifact_transfers::commit_image_push),
+        )
         .route("/v1/jobs", get(jobs::list_jobs))
         .route("/v1/projects/{id}/jobs", get(jobs::list_project_jobs))
         .route(
