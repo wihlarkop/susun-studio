@@ -115,4 +115,4 @@ jobs:
         run: cargo check -p susun-studio-daemon
 
       - name: Test credential modules
-        run: cargo test -p susun-studio-daemon registry::
+        run: "cargo test -p susun-studio-daemon registry::"
