@@ -6,6 +6,7 @@
   import type { RuntimeProfile, StudioProject } from "$lib/daemon/client";
   import ArtifactsContainersTab from "./artifacts-containers-tab.svelte";
   import ArtifactsImagesTab from "./artifacts-images-tab.svelte";
+  import ArtifactsBuildsTab from "./artifacts-builds-tab.svelte";
   import ArtifactsBuildCacheTab from "./artifacts-build-cache-tab.svelte";
   import ArtifactsRegistryTab from "./artifacts-registry-tab.svelte";
 
@@ -37,14 +38,15 @@
     {/if}
   </div>
   <p class="max-w-2xl text-sm text-muted-foreground">
-    Read-only inventory for the engine behind the runtime above. Switch runtimes from the Runtime
-    page to inspect a different engine.
+    Inventory and image/build actions for the engine behind the runtime above. Switch runtimes
+    from the Runtime page to inspect a different engine.
   </p>
 
   <Tabs.Root value="containers" class="w-full">
     <Tabs.List>
       <Tabs.Trigger value="containers">Containers</Tabs.Trigger>
       <Tabs.Trigger value="images">Images</Tabs.Trigger>
+      <Tabs.Trigger value="builds">Builds</Tabs.Trigger>
       <Tabs.Trigger value="build-cache">Build cache</Tabs.Trigger>
       <Tabs.Trigger value="registry">Registry</Tabs.Trigger>
     </Tabs.List>
@@ -53,6 +55,9 @@
     </Tabs.Content>
     <Tabs.Content value="images" class="pt-4">
       <ArtifactsImagesTab {engineId} {connected} />
+    </Tabs.Content>
+    <Tabs.Content value="builds" class="pt-4">
+      <ArtifactsBuildsTab {engineId} {connected} {projects} />
     </Tabs.Content>
     <Tabs.Content value="build-cache" class="pt-4">
       <ArtifactsBuildCacheTab {engineId} {connected} />

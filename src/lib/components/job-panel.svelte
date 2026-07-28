@@ -26,6 +26,7 @@
     type StudioJob,
     type StudioProject,
   } from "$lib/daemon/client";
+  import { isImageBuildResult } from "$lib/jobs/build-job";
   import { relativeTime } from "$lib/utils";
 
   type StepStatus = "pending" | "running" | "succeeded" | "failed" | "skipped" | "cancelled";
@@ -134,8 +135,13 @@
   }
 
   function buildSteps(nextJob: StudioJob): Step[] {
+    // This panel only ever drives up/down/build/clean jobs (never
+    // image_build, which has its own tab) — narrow away the alternate
+    // result shape so `.actions` is accessible below.
+    const result =
+      nextJob.result && !isImageBuildResult(nextJob.result) ? nextJob.result : null;
     return nextJob.actions.map((action) => {
-      const actionResult = nextJob.result?.actions?.[action.id];
+      const actionResult = result?.actions?.[action.id];
       return {
         ...action,
         status: actionResult

@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use turso::Database;
 
 use crate::{
-    jobs::{registry::JobRegistry, tickets::StreamTickets},
+    jobs::{build_registry::BuildJobRegistry, registry::JobRegistry, tickets::StreamTickets},
     restore::RestoreCoordinator,
     watch::registry::WatchRegistry,
 };
@@ -14,6 +14,7 @@ pub struct AppState {
     pub db_path: PathBuf,
     pub auth_token: Arc<str>,
     pub jobs: Arc<JobRegistry>,
+    pub build_jobs: Arc<BuildJobRegistry>,
     pub stream_tickets: Arc<StreamTickets>,
     pub watch: Arc<WatchRegistry>,
     pub restore: Arc<RestoreCoordinator>,

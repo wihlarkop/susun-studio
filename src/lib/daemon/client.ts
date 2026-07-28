@@ -362,7 +362,7 @@ type RuntimeLogsResponse = {
   lines: RuntimeLogLine[];
 };
 
-export type JobStatus = "running" | "succeeded" | "failed" | "cancelled";
+export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 
 export type JobExecutionSummary = {
   total_actions: number;
@@ -394,20 +394,59 @@ export type JobActionResult = {
     | "cancelled";
 };
 
+/** Result shape for `kind`: "up" | "down" | "build" | "clean" jobs. */
+export type JobExecutionResult = {
+  summary: JobExecutionSummary;
+  partial?: boolean;
+  plan_id?: string;
+  actions?: Record<string, JobActionResult>;
+};
+
+/** Result shape for `kind`: "image_build" jobs. */
+export type ImageBuildResult = {
+  image_reference: string;
+  image_digest: string | null;
+};
+
+/**
+ * One ordered, bounded progress entry for an `image_build` job — mirrors
+ * `susun::BuildEvent`, flattened. `vertex_id`/`log_stream`/`text`/`status`/
+ * `current`/`total` are each populated only for the `kind` values that carry
+ * them (e.g. `text` only for `"vertex_log"`).
+ */
+export type BuildProgressEntry = {
+  sequence: number;
+  kind:
+    | "started"
+    | "vertex_started"
+    | "vertex_progress"
+    | "vertex_log"
+    | "vertex_finished"
+    | "finished";
+  vertex_id: string | null;
+  log_stream: "stdout" | "stderr" | null;
+  text: string | null;
+  status: "succeeded" | "failed" | "cancelled" | null;
+  current: number | null;
+  total: number | null;
+  created_at_ms: number;
+};
+
 export type StudioJob = {
   id: string;
-  kind: "up" | "down" | "build" | "clean";
+  kind: "up" | "down" | "build" | "clean" | "image_build";
   status: JobStatus;
   project_id: string;
+  /** The build-declared service this job targets — only ever set for
+   * `kind: "image_build"`. */
+  service_name: string | null;
   actions: JobAction[];
-  result: {
-    summary: JobExecutionSummary;
-    partial?: boolean;
-    plan_id?: string;
-    actions?: Record<string, JobActionResult>;
-  } | null;
+  result: JobExecutionResult | ImageBuildResult | null;
   error: string | null;
   error_code: string | null;
+  /** Only ever populated for `kind: "image_build"`, and only by `readJob`
+   * (the single-job detail read) — omitted by the list endpoints. */
+  progress?: BuildProgressEntry[];
   created_at_ms: number;
   updated_at_ms: number;
 };
@@ -1265,6 +1304,47 @@ export async function runAction(
     ...options,
     method: "POST",
   });
+}
+
+/**
+ * One build-declared service of a known Studio project, server-resolved
+ * from its persisted Compose files. `supported` is false when the build
+ * declares secrets or SSH forwarding, which Studio does not resolve yet —
+ * such services are still listed (for visibility) but must not be offered
+ * as a startable build option.
+ */
+export type BuildTarget = {
+  service_name: string;
+  has_image: boolean;
+  supported: boolean;
+};
+
+export type BuildTargetsResponse = {
+  project_id: string;
+  services: BuildTarget[];
+};
+
+/** The only source of "safe build options" — a build can only be started for
+ * a `service_name` this endpoint actually returned. */
+export async function readProjectBuildTargets(
+  projectId: string,
+  options: DaemonRequestOptions = {},
+): Promise<BuildTargetsResponse> {
+  return readJson(`/v1/projects/${encodeURIComponent(projectId)}/build-targets`, options);
+}
+
+/** Starts a durable, capability-gated image build for one build-declared
+ * service of a known project. `serviceName` must be one returned by
+ * `readProjectBuildTargets` with `supported: true` — never free text. */
+export async function startImageBuild(
+  projectId: string,
+  serviceName: string,
+  options: DaemonRequestOptions = {},
+): Promise<StudioJob> {
+  return readJson(
+    `/v1/projects/${encodeURIComponent(projectId)}/services/${encodeURIComponent(serviceName)}/build`,
+    { ...options, method: "POST" },
+  );
 }
 
 export async function cancelJob(

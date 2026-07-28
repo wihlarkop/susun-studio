@@ -17,8 +17,8 @@ use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use turso::{Database, params};
 
 use crate::{
-    auth::authorize, error::ApiError, logging, project_source::load_project_source, runtime,
-    state::AppState, susun_integration,
+    auth::authorize, error::ApiError, jobs::error_taxonomy::classify_build_error, logging,
+    project_source::load_project_source, runtime, state::AppState, susun_integration,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -28,19 +28,58 @@ pub struct JobActionResponse {
     pub resource: String,
 }
 
+/// One ordered, bounded progress entry for an `image_build` job. Every field
+/// here already passed through `susun_build`'s own redaction (for `text`) or
+/// is a plain identifier/count — never a raw path, credential, or
+/// unrestricted provider payload.
+#[derive(Debug, Serialize)]
+pub struct BuildProgressEntryResponse {
+    pub sequence: i64,
+    pub kind: String,
+    pub vertex_id: Option<String>,
+    pub log_stream: Option<String>,
+    pub text: Option<String>,
+    pub status: Option<String>,
+    pub current: Option<i64>,
+    pub total: Option<i64>,
+    pub created_at_ms: i64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct JobResponse {
     pub id: String,
     pub kind: String,
     pub status: String,
     pub project_id: String,
+    /// The build-declared service this job targets — only ever set for
+    /// `kind = "image_build"`, parsed from the job's own `request_json`.
+    /// Needed so a queued/running/failed build (which has no `result` yet)
+    /// still shows which service it was for.
+    pub service_name: Option<String>,
     /// Named step manifest — populated when a job is started, empty on list/read.
     pub actions: Vec<JobActionResponse>,
     pub result: Option<serde_json::Value>,
     pub error: Option<String>,
     pub error_code: Option<String>,
+    /// Ordered build-progress history — only ever populated for `kind =
+    /// "image_build"`, and only on the single-job detail read (`read_job`),
+    /// never on the list endpoints, so a large job list can't balloon into
+    /// hundreds of progress rows per entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub progress: Vec<BuildProgressEntryResponse>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+/// Best-effort extraction of `request_json.service_name` — present only for
+/// `image_build` jobs; every other kind's `request_json` is just `{"kind":
+/// ...}`, so this is `None` for them.
+fn service_name_from_request_json(request_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(request_json)
+        .ok()?
+        .get("service_name")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 #[derive(Debug, Serialize)]
@@ -54,6 +93,22 @@ const JOB_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 enum JobOutcome {
     Finished(Result<susun::ExecutionReport, String>),
+    Cancelled,
+    TimedOut,
+}
+
+/// Mirrors `JobOutcome` but for image-build jobs, which race a
+/// `BuildEngine::build` future (`Result<BuildResultRow, susun::BuildError>`)
+/// rather than an up/down `ExecutionReport` — kept as its own type instead
+/// of adding a variant to `JobOutcome` so neither job kind's `match` needs
+/// an `unreachable!()` arm for the other's outcome shape.
+enum BuildJobOutcome {
+    Finished(
+        Result<
+            Result<susun_integration::BuildResultRow, susun::BuildError>,
+            tokio::task::JoinError,
+        >,
+    ),
     Cancelled,
     TimedOut,
 }
@@ -102,6 +157,832 @@ pub async fn action_clean(
     };
     start_down_job(state, project_id, "clean", options).await
 }
+
+#[derive(Debug, Serialize)]
+pub struct BuildTargetRow {
+    pub service_name: String,
+    /// Whether the service also declares `image:` — the build will be
+    /// tagged as that reference; otherwise Studio synthesizes one.
+    pub has_image: bool,
+    /// False when the build declares secrets or SSH forwarding, which
+    /// Studio does not resolve in this phase — starting a build for such a
+    /// service is rejected server-side, not silently attempted without them.
+    pub supported: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BuildTargetsResponse {
+    pub project_id: String,
+    pub services: Vec<BuildTargetRow>,
+}
+
+/// Lists the build-declared services of a known Studio project, resolved
+/// entirely server-side from its persisted Compose files — never accepts a
+/// service list or path from the caller. This is the only source of "safe
+/// build options" the Builds tab offers; a build can only be started for a
+/// `service_name` this endpoint actually returned.
+pub async fn read_project_build_targets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<BuildTargetsResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    let source = load_project_source(&state, &project_id).await?;
+    let sdk_project = susun_integration::analyze_sdk_project(
+        &source.files,
+        source.env_file.as_ref(),
+        source.project_name.as_deref(),
+        &source.profiles,
+    )
+    .map_err(|error| ApiError::PlanningFailed(error.to_string()))?;
+
+    let services = sdk_project
+        .project()
+        .map(susun_integration::buildable_services)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| BuildTargetRow {
+            service_name: row.service_name,
+            has_image: row.has_image,
+            supported: !row.requires_unsupported_build_inputs,
+        })
+        .collect();
+
+    Ok(Json(BuildTargetsResponse {
+        project_id,
+        services,
+    }))
+}
+
+/// Reads back a job's ordered, bounded progress history.
+async fn read_build_progress(
+    db: &Database,
+    job_id: &str,
+) -> Result<Vec<BuildProgressEntryResponse>, ApiError> {
+    let conn = db.connect()?;
+    let mut rows = conn
+        .query(
+            "SELECT sequence, kind, vertex_id, log_stream, text, status, current_units, total_units, created_at_ms
+             FROM build_job_progress WHERE job_id = ?1 ORDER BY sequence ASC",
+            params![job_id.to_owned()],
+        )
+        .await?;
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next().await? {
+        entries.push(BuildProgressEntryResponse {
+            sequence: row.get(0)?,
+            kind: row.get(1)?,
+            vertex_id: row.get(2)?,
+            log_stream: row.get(3)?,
+            text: row.get(4)?,
+            status: row.get(5)?,
+            current: row.get(6)?,
+            total: row.get(7)?,
+            created_at_ms: row.get(8)?,
+        });
+    }
+    Ok(entries)
+}
+
+/// Keep at most this many progress rows per build job. Generous enough to
+/// hold a build's full (redacted, already-batched) output for typical
+/// projects without letting a single verbose build grow the database
+/// unboundedly.
+const MAX_BUILD_PROGRESS_ROWS_PER_JOB: i64 = 500;
+/// Defensive length cap on a single log line, on top of `susun_build`'s own
+/// redaction — never persist an unbounded provider payload.
+const MAX_BUILD_PROGRESS_TEXT_CHARS: usize = 2000;
+
+/// `redact_values` are literal build-argument values known ahead of time
+/// (e.g. `BuildDefinition::args`) — scrubbed unconditionally, since a value
+/// like this can carry a secret without ever containing one of
+/// `susun_secret`'s keyword markers.
+fn bound_text(text: &str, redact_values: &[String]) -> String {
+    let scrubbed = redact_known_values(text, redact_values);
+    let redacted = redact_paths(&scrubbed);
+    if redacted.chars().count() <= MAX_BUILD_PROGRESS_TEXT_CHARS {
+        redacted
+    } else {
+        let truncated: String = redacted
+            .chars()
+            .take(MAX_BUILD_PROGRESS_TEXT_CHARS)
+            .collect();
+        format!("{truncated}… [truncated]")
+    }
+}
+
+/// Literal substring scrub for known build-argument values. Deliberately
+/// simple (exact substring match, no tokenization) since these are known
+/// concrete strings, not a pattern to detect.
+fn redact_known_values(text: &str, redact_values: &[String]) -> String {
+    let mut result = text.to_owned();
+    let mut ordered: Vec<&str> = redact_values
+        .iter()
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .collect();
+    ordered.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
+    ordered.dedup();
+    for value in ordered {
+        result = result.replace(value, "<redacted-arg>");
+    }
+    result
+}
+
+fn collect_build_redact_values(
+    args: &indexmap::IndexMap<String, Option<String>>,
+    resolve_inherited: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut values: Vec<String> = args
+        .iter()
+        .filter_map(|(key, value)| {
+            value
+                .clone()
+                .or_else(|| resolve_inherited(key))
+                .filter(|resolved| !resolved.is_empty())
+        })
+        .collect();
+    values.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
+    values.dedup();
+    values
+}
+
+/// Defensive scrub for raw filesystem paths in provider output. Build
+/// errors can interpolate the host path directly (e.g. a launch failure
+/// echoing the `docker` binary path, or a Dockerfile `COPY`/`ADD` error
+/// echoing the resolved context directory) — `susun_secret`'s own
+/// redaction only recognizes credential-marker keywords, not paths, so this
+/// is a Studio-side backstop on top of it, not a replacement for it. Quoted
+/// spans (`"C:\Program Files\..."`) are treated as one token even though
+/// they contain spaces, so a quoted path isn't left half-redacted by a
+/// naive whitespace split.
+fn redact_paths(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '"' || ch == '\'' {
+            flush_redacted_token(&mut out, &mut token);
+            let quote = ch;
+            let mut inner = String::new();
+            let mut closed = false;
+            for next in chars.by_ref() {
+                if next == quote {
+                    closed = true;
+                    break;
+                }
+                inner.push(next);
+            }
+            out.push(quote);
+            if looks_like_host_path(&inner) {
+                out.push_str("<redacted-path>");
+            } else {
+                out.push_str(&inner);
+            }
+            if closed {
+                out.push(quote);
+            }
+        } else if ch.is_whitespace() {
+            flush_redacted_token(&mut out, &mut token);
+            out.push(ch);
+        } else {
+            token.push(ch);
+        }
+    }
+    flush_redacted_token(&mut out, &mut token);
+    out
+}
+
+fn flush_redacted_token(out: &mut String, token: &mut String) {
+    if !token.is_empty() {
+        if looks_like_host_path(token) {
+            out.push_str("<redacted-path>");
+        } else {
+            out.push_str(token);
+        }
+        token.clear();
+    }
+}
+
+fn looks_like_host_path(token: &str) -> bool {
+    let trimmed =
+        token.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '(' | ')' | ',' | ';' | ':'));
+    if trimmed.len() < 3 {
+        return false;
+    }
+    if trimmed.starts_with("\\\\") {
+        return true;
+    }
+    if trimmed.starts_with('/') && trimmed.matches('/').count() >= 2 {
+        return true;
+    }
+    let bytes = trimmed.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
+/// One flattened, storable shape for a `susun::BuildEvent` — needed because
+/// `BuildEvent` itself has no `Serialize` impl, unlike `RuntimeEvent`.
+struct FlatBuildEvent {
+    kind: &'static str,
+    vertex_id: Option<String>,
+    log_stream: Option<&'static str>,
+    text: Option<String>,
+    status: Option<&'static str>,
+    current: Option<i64>,
+    total: Option<i64>,
+}
+
+fn flatten_build_event(event: susun::BuildEvent, redact_values: &[String]) -> FlatBuildEvent {
+    match event {
+        susun::BuildEvent::Started { .. } => FlatBuildEvent {
+            kind: "started",
+            vertex_id: None,
+            log_stream: None,
+            text: None,
+            status: None,
+            current: None,
+            total: None,
+        },
+        susun::BuildEvent::VertexStarted { vertex, name } => FlatBuildEvent {
+            kind: "vertex_started",
+            vertex_id: Some(vertex.0),
+            log_stream: None,
+            text: Some(bound_text(&name, redact_values)),
+            status: None,
+            current: None,
+            total: None,
+        },
+        susun::BuildEvent::VertexProgress { vertex, progress } => FlatBuildEvent {
+            kind: "vertex_progress",
+            vertex_id: Some(vertex.0),
+            log_stream: None,
+            text: None,
+            status: None,
+            current: i64::try_from(progress.current).ok(),
+            total: progress.total.and_then(|total| i64::try_from(total).ok()),
+        },
+        susun::BuildEvent::VertexLog {
+            vertex,
+            stream,
+            text,
+        } => FlatBuildEvent {
+            kind: "vertex_log",
+            vertex_id: Some(vertex.0),
+            log_stream: Some(match stream {
+                susun::BuildLogStream::Stdout => "stdout",
+                susun::BuildLogStream::Stderr => "stderr",
+            }),
+            text: Some(bound_text(&text, redact_values)),
+            status: None,
+            current: None,
+            total: None,
+        },
+        susun::BuildEvent::VertexFinished { vertex, status } => FlatBuildEvent {
+            kind: "vertex_finished",
+            vertex_id: Some(vertex.0),
+            log_stream: None,
+            text: None,
+            status: Some(match status {
+                susun::BuildVertexStatus::Succeeded => "succeeded",
+                susun::BuildVertexStatus::Failed => "failed",
+                susun::BuildVertexStatus::Cancelled => "cancelled",
+            }),
+            current: None,
+            total: None,
+        },
+        susun::BuildEvent::Finished => FlatBuildEvent {
+            kind: "finished",
+            vertex_id: None,
+            log_stream: None,
+            text: None,
+            status: None,
+            current: None,
+            total: None,
+        },
+    }
+}
+
+async fn persist_build_progress(
+    db: &Database,
+    job_id: &str,
+    sequence: i64,
+    event: susun::BuildEvent,
+    redact_values: &[String],
+) {
+    let Ok(conn) = db.connect() else {
+        return;
+    };
+    let now = now_ms().unwrap_or_default();
+    let entry = flatten_build_event(event, redact_values);
+    let id = format!("bp_{}", uuid::Uuid::new_v4().simple());
+    let _ = conn
+        .execute(
+            "INSERT INTO build_job_progress (
+                id, job_id, sequence, kind, vertex_id, log_stream, text, status,
+                current_units, total_units, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                id,
+                job_id.to_owned(),
+                sequence,
+                entry.kind.to_owned(),
+                entry.vertex_id,
+                entry.log_stream.map(str::to_owned),
+                entry.text,
+                entry.status.map(str::to_owned),
+                entry.current,
+                entry.total,
+                now,
+            ],
+        )
+        .await;
+    // Bound: keep only the newest MAX_BUILD_PROGRESS_ROWS_PER_JOB rows for
+    // this job.
+    let _ = conn
+        .execute(
+            "DELETE FROM build_job_progress WHERE job_id = ?1 AND id NOT IN (
+                SELECT id FROM build_job_progress WHERE job_id = ?1
+                ORDER BY sequence DESC LIMIT ?2
+             )",
+            params![job_id.to_owned(), MAX_BUILD_PROGRESS_ROWS_PER_JOB],
+        )
+        .await;
+}
+
+fn make_build_event_sink(
+    db: Arc<Database>,
+    job_id: String,
+    redact_values: Arc<Vec<String>>,
+) -> susun::BuildEventSink {
+    let sequence = Arc::new(AtomicI64::new(0));
+    susun::BuildEventSink::new(move |event: susun::BuildEvent| {
+        let db = db.clone();
+        let job_id = job_id.clone();
+        let sequence = sequence.clone();
+        let redact_values = redact_values.clone();
+        Box::pin(async move {
+            let seq = sequence.fetch_add(1, Ordering::SeqCst);
+            persist_build_progress(&db, &job_id, seq, event, &redact_values).await;
+        })
+    })
+}
+
+/// Inserts the job row using the exact `(runtime_profile_id, runtime_class)`
+/// resolved by the caller — never re-resolves attribution itself. Re-querying
+/// here would open a TOCTOU gap: the caller's own capability gate (which
+/// rejects any non-default profile — see `start_image_build`) could pass
+/// against one resolution while a concurrent runtime rebind changed the
+/// attribution actually persisted with the job.
+#[allow(clippy::too_many_arguments)]
+async fn insert_build_job(
+    state: &AppState,
+    job_id: &str,
+    project_id: &str,
+    service_name: &str,
+    image_tag: &str,
+    runtime_profile_id: Option<&str>,
+    runtime_class: Option<&str>,
+    now: i64,
+) -> Result<(), ApiError> {
+    let request_json = serde_json::to_string(&serde_json::json!({
+        "kind": "image_build",
+        "service_name": service_name,
+        "image_tag": image_tag,
+    }))
+    .unwrap_or_default();
+    let conn = state.db.connect()?;
+    conn.execute(
+        "INSERT INTO jobs (id, kind, status, project_id, engine_id, request_json, manifest_json,
+            runtime_profile_id, runtime_class, created_at_ms, updated_at_ms)
+         VALUES (?1, 'image_build', 'queued', ?2, 'engine-docker-local', ?3, NULL, ?4, ?5, ?6, ?6)",
+        params![
+            job_id.to_owned(),
+            project_id.to_owned(),
+            request_json,
+            runtime_profile_id,
+            runtime_class,
+            now
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+fn queued_build_job_response(
+    job_id: String,
+    project_id: String,
+    service_name: String,
+    now: i64,
+) -> JobResponse {
+    JobResponse {
+        id: job_id,
+        kind: "image_build".to_owned(),
+        status: "queued".to_owned(),
+        project_id,
+        service_name: Some(service_name),
+        actions: Vec::new(),
+        result: None,
+        error: None,
+        error_code: None,
+        progress: Vec::new(),
+        created_at_ms: now,
+        updated_at_ms: now,
+    }
+}
+
+async fn update_build_job_status(db: &Database, job_id: &str, status: &str) {
+    let Ok(conn) = db.connect() else {
+        return;
+    };
+    let now = now_ms().unwrap_or_default();
+    let _ = conn
+        .execute(
+            "UPDATE jobs SET status = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![status.to_owned(), now, job_id.to_owned()],
+        )
+        .await;
+}
+
+/// Marks an image-build job interrupted (hard-cancelled or timed out) — the
+/// same "we stopped waiting; the daemon's own row now reflects that
+/// honestly" semantics `mark_interrupted` already applies to up/down jobs.
+/// The underlying `docker buildx build` subprocess (if any was actually
+/// launched) is not killed by this — see `BuildJobRegistry`'s own docs.
+async fn mark_build_interrupted(
+    db: &Database,
+    job_id: &str,
+    status: &str,
+    error_code: &str,
+    message: Option<&str>,
+) {
+    let now = now_ms().unwrap_or_default();
+    let Ok(conn) = db.connect() else {
+        return;
+    };
+    let _ = conn
+        .execute(
+            "UPDATE jobs SET status = ?1, error = ?2, error_code = ?3, updated_at_ms = ?4 WHERE id = ?5",
+            params![status, message, error_code, now, job_id.to_owned()],
+        )
+        .await;
+    logging::warn(
+        "image_build_interrupted",
+        &[
+            ("job_id", job_id.to_owned()),
+            ("status", status.to_owned()),
+            ("error_code", error_code.to_owned()),
+        ],
+    );
+}
+
+async fn finish_build_job(
+    db: &Database,
+    job_id: &str,
+    result: Result<susun_integration::BuildResultRow, susun::BuildError>,
+) {
+    let now = now_ms().unwrap_or_default();
+    let Ok(conn) = db.connect() else {
+        return;
+    };
+    match result {
+        Ok(build_result) => {
+            let result_json = serde_json::to_string(&serde_json::json!({
+                "image_reference": build_result.image_reference,
+                "image_digest": build_result.image_digest,
+            }))
+            .unwrap_or_default();
+            let _ = conn
+                .execute(
+                    "UPDATE jobs
+                     SET status = 'succeeded', result_json = ?1,
+                         error = NULL, error_code = NULL, updated_at_ms = ?2
+                     WHERE id = ?3",
+                    params![result_json, now, job_id.to_owned()],
+                )
+                .await;
+            logging::info(
+                "image_build_finished",
+                &[
+                    ("job_id", job_id.to_owned()),
+                    ("status", "succeeded".to_owned()),
+                    ("image_reference", build_result.image_reference),
+                ],
+            );
+        }
+        Err(error) => {
+            let (error_code, message) = classify_build_error(&error);
+            let status = if error_code == "cancelled" {
+                "cancelled"
+            } else {
+                "failed"
+            };
+            let _ = conn
+                .execute(
+                    "UPDATE jobs SET status = ?1, error = ?2, error_code = ?3, updated_at_ms = ?4 WHERE id = ?5",
+                    params![status, message, error_code, now, job_id.to_owned()],
+                )
+                .await;
+            logging::error(
+                "image_build_finished",
+                &[
+                    ("job_id", job_id.to_owned()),
+                    ("status", status.to_owned()),
+                    ("error_code", error_code.to_owned()),
+                ],
+            );
+        }
+    }
+}
+
+/// Starts a durable, capability-gated image build for one build-declared
+/// service of a known Studio project. `service_name` is validated against
+/// the project's own server-resolved build targets — never trusted as a
+/// free-form value used to construct a path.
+pub async fn start_image_build(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project_id, service_name)): Path<(String, String)>,
+) -> Result<Json<JobResponse>, ApiError> {
+    authorize(&state, &headers)?;
+
+    let source = load_project_source(&state, &project_id).await?;
+    let sdk_project = susun_integration::analyze_sdk_project(
+        &source.files,
+        source.env_file.as_ref(),
+        source.project_name.as_deref(),
+        &source.profiles,
+    )
+    .map_err(|error| ApiError::PlanningFailed(error.to_string()))?;
+    let Some(project) = sdk_project.project() else {
+        return Err(ApiError::PlanningFailed(
+            "project could not be analyzed".to_owned(),
+        ));
+    };
+
+    let service_key = susun::ServiceName::new(service_name.clone());
+    let Some(service) = project.services.get(&service_key) else {
+        return Err(ApiError::ServiceNotFound);
+    };
+    let Some(definition) = service.build.clone() else {
+        return Err(ApiError::ActionUnavailable(
+            "This service has no build declaration.".to_owned(),
+        ));
+    };
+    if !definition.secrets.is_empty() || !definition.ssh.is_empty() {
+        return Err(ApiError::ActionUnavailable(
+            "This build declares secrets or SSH forwarding, which Studio does not support yet."
+                .to_owned(),
+        ));
+    }
+
+    // `BuildxProcessOptions` has no endpoint/socket override — the build
+    // subprocess always runs against whatever `docker` CLI context is
+    // ambient in the daemon's own process, never a specific engine endpoint.
+    // Building against a project bound to (or globally selected as) a
+    // non-default runtime profile would silently run through the wrong
+    // provider while Studio still attributes the job to the selected one,
+    // so reject before even attempting to connect. Resolved once here and
+    // threaded through to `insert_build_job` unchanged (never re-resolved)
+    // to avoid a TOCTOU gap against a concurrent rebind.
+    let (runtime_profile_id, runtime_class) =
+        runtime::attribution_for(&state.db, Some(&project_id)).await?;
+    if runtime_profile_id.is_some() {
+        return Err(ApiError::ActionUnavailable(
+            "Image builds currently only run through the default engine. This project is \
+             bound to an external runtime profile; unbind it (or clear the global runtime \
+             selection) before building."
+                .to_owned(),
+        ));
+    }
+
+    // Capability check: confirm some engine is actually reachable before
+    // minting a durable job. Revalidated implicitly by the build process
+    // itself failing honestly if it cannot reach a provider by the time the
+    // spawned task runs.
+    let engine = susun_integration::connect_engine(&state.db, Some(&project_id))
+        .await
+        .map_err(ApiError::EngineUnavailable)?;
+    let health = susun_integration::engine_health(&engine).await;
+    if !health.reachable {
+        return Err(ApiError::EngineUnavailable(
+            health
+                .error
+                .unwrap_or_else(|| "engine unreachable".to_owned()),
+        ));
+    }
+
+    let project_name = project.name.as_str().to_owned();
+    let image_tag = susun_integration::default_build_image_tag(
+        &project_name,
+        &service_name,
+        service.image.as_ref(),
+    );
+
+    let now = now_ms()?;
+    let job_id = format!("job-{now}-image-build");
+    insert_build_job(
+        &state,
+        &job_id,
+        &project_id,
+        &service_name,
+        &image_tag,
+        runtime_profile_id.as_deref(),
+        runtime_class.as_deref(),
+        now,
+    )
+    .await?;
+    logging::info(
+        "image_build_started",
+        &[
+            ("job_id", job_id.clone()),
+            ("project_id", project_id.clone()),
+            ("service_name", service_name.clone()),
+        ],
+    );
+
+    let (cancellation, cancel_notify) = state.build_jobs.register(job_id.clone());
+    let db = state.db.clone();
+    let registry = state.build_jobs.clone();
+    let spawn_job_id = job_id.clone();
+    let project_root = source.root.clone();
+
+    tokio::spawn(async move {
+        run_image_build(
+            db.clone(),
+            spawn_job_id.clone(),
+            project_root,
+            definition,
+            image_tag,
+            cancellation,
+            cancel_notify,
+        )
+        .await;
+        registry.unregister(&spawn_job_id);
+    });
+
+    Ok(Json(queued_build_job_response(
+        job_id,
+        project_id,
+        service_name,
+        now,
+    )))
+}
+
+/// Runs one image build end to end: prepares (resolves + validates + hashes)
+/// the build inputs, then executes it, racing both phases against a
+/// hard-cancel notifier and the shared job timeout — the same pattern
+/// `start_up_job`/`start_down_job` already use, adapted to `BuildEngine`'s
+/// own cancellation/event types. Never reports success until
+/// `BuildEngine::build` itself returns a result.
+#[allow(clippy::too_many_arguments)]
+async fn run_image_build(
+    db: Arc<Database>,
+    job_id: String,
+    project_root: std::path::PathBuf,
+    definition: susun::BuildDefinition,
+    image_tag: String,
+    cancellation: susun::BuildCancellationToken,
+    cancel_notify: Arc<tokio::sync::Notify>,
+) {
+    let redact_values = Arc::new(collect_build_redact_values(&definition.args, |key| {
+        std::env::var(key).ok()
+    }));
+    let prepare_definition = definition.clone();
+    let prepared = tokio::select! {
+        biased;
+        () = cancel_notify.notified() => {
+            mark_build_interrupted(&db, &job_id, "cancelled", "cancelled", None).await;
+            return;
+        }
+        () = tokio::time::sleep(JOB_TIMEOUT) => {
+            mark_build_interrupted(&db, &job_id, "failed", "timeout", None).await;
+            return;
+        }
+        result = tokio::task::spawn_blocking(move || {
+            susun_integration::prepare_build(&project_root, &prepare_definition)
+        }) => {
+            match result {
+                Ok(Ok(prepared)) => prepared,
+                Ok(Err(error)) => {
+                    mark_build_interrupted(&db, &job_id, "failed", error.code(), Some(error.message())).await;
+                    return;
+                }
+                Err(_join_error) => {
+                    mark_build_interrupted(&db, &job_id, "failed", "internal", None).await;
+                    return;
+                }
+            }
+        }
+    };
+
+    update_build_job_status(&db, &job_id, "running").await;
+
+    let events = make_build_event_sink(db.clone(), job_id.clone(), redact_values);
+    // `BuildxProcessBuildEngine` blocks on `docker buildx build` via a
+    // synchronous `Command::output()` call, with no child-process handle to
+    // kill — cancellation/timeout below can only stop *this task's own
+    // await*, never the subprocess itself (see `BuildJobRegistry::cancel`'s
+    // own docs). Run on the blocking thread pool (not an async worker) via
+    // `spawn_blocking` + `block_on`, since that call ties up its thread for
+    // the whole build; the blocking pool is sized for exactly this, unlike
+    // the small async worker pool a naive `tokio::spawn` would tie up.
+    // Spawned independently of the race below (rather than awaited inline)
+    // so that when Studio loses the race, the abandoned build still runs to
+    // completion and its real result — once known — corrects the job's
+    // terminal record, instead of a "cancelled"/"failed" status silently
+    // diverging from what actually happened (up to and including the image
+    // being built and loaded after Studio already reported cancellation).
+    let mut build_handle = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(susun_integration::run_build(
+            &prepared,
+            &definition,
+            &image_tag,
+            events,
+            cancellation,
+        ))
+    });
+
+    let outcome = tokio::select! {
+        biased;
+        () = cancel_notify.notified() => BuildJobOutcome::Cancelled,
+        () = tokio::time::sleep(JOB_TIMEOUT) => BuildJobOutcome::TimedOut,
+        joined = &mut build_handle => BuildJobOutcome::Finished(joined),
+    };
+
+    match outcome {
+        BuildJobOutcome::Finished(Ok(result)) => finish_build_job(&db, &job_id, result).await,
+        BuildJobOutcome::Finished(Err(_join_error)) => {
+            mark_build_interrupted(&db, &job_id, "failed", "internal", None).await;
+        }
+        BuildJobOutcome::Cancelled => {
+            mark_build_interrupted(
+                &db,
+                &job_id,
+                "cancelled",
+                "cancelled",
+                Some(BUILD_INTERRUPT_UNCERTAIN_MESSAGE),
+            )
+            .await;
+            spawn_late_build_correction(db, job_id, build_handle);
+        }
+        BuildJobOutcome::TimedOut => {
+            mark_build_interrupted(
+                &db,
+                &job_id,
+                "failed",
+                "timeout",
+                Some(BUILD_INTERRUPT_UNCERTAIN_MESSAGE),
+            )
+            .await;
+            spawn_late_build_correction(db, job_id, build_handle);
+        }
+    }
+}
+
+/// Lets an abandoned build subprocess (Studio stopped waiting on it via
+/// cancel or timeout, but cannot kill it — see `run_image_build`) finish in
+/// the background, then corrects the job's terminal record to the real
+/// outcome once it's known. Never leaves a "cancelled"/"failed(timeout)"
+/// record standing as the final word when the build actually succeeded (or
+/// failed differently) after Studio stopped watching it.
+fn spawn_late_build_correction(
+    db: Arc<Database>,
+    job_id: String,
+    build_handle: tokio::task::JoinHandle<
+        Result<susun_integration::BuildResultRow, susun::BuildError>,
+    >,
+) {
+    tokio::spawn(finish_late_build_correction(db, job_id, build_handle));
+}
+
+/// Applies the provider's eventual result directly. The Susun build adapter
+/// treats a completed process exit as authoritative, so Studio must not infer
+/// success from image inventory: a matching tag may have existed before this
+/// job started.
+async fn finish_late_build_correction(
+    db: Arc<Database>,
+    job_id: String,
+    build_handle: tokio::task::JoinHandle<
+        Result<susun_integration::BuildResultRow, susun::BuildError>,
+    >,
+) {
+    match build_handle.await {
+        Ok(result) => finish_build_job(&db, &job_id, result).await,
+        Err(_) => mark_build_interrupted(&db, &job_id, "failed", "internal", None).await,
+    }
+}
+
+/// Shown on a build job's `cancelled`/`failed(timeout)` record when Studio
+/// stopped waiting but could not confirm the underlying `docker buildx
+/// build` subprocess actually stopped — this record may still be corrected
+/// automatically once the true outcome is known (see the follow-up
+/// `finish_build_job` call queued alongside it).
+const BUILD_INTERRUPT_UNCERTAIN_MESSAGE: &str = "Studio stopped waiting for this build, but the underlying build process cannot be killed \
+     and may still be running (and could still complete or load an image). This job's status \
+     will update automatically once the real outcome is known.";
 
 pub(crate) async fn start_up_job(
     state: AppState,
@@ -327,6 +1208,7 @@ fn running_job_response(
         kind: kind.to_owned(),
         status: "running".to_owned(),
         project_id,
+        service_name: None,
         actions: manifest
             .into_iter()
             .map(|action| JobActionResponse {
@@ -338,6 +1220,7 @@ fn running_job_response(
         result: None,
         error: None,
         error_code: None,
+        progress: Vec::new(),
         created_at_ms: now,
         updated_at_ms: now,
     }
@@ -492,7 +1375,11 @@ pub async fn cancel_job(
     Path(job_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize(&state, &headers)?;
-    let cancelled = state.jobs.cancel(&job_id);
+    // Each job is registered in exactly one of these two registries
+    // (`RuntimeEvent`-based up/down/build(declared) jobs vs. `BuildEvent`-based
+    // image_build jobs) — try both rather than branching on `kind`, so this
+    // stays correct even if that mapping changes.
+    let cancelled = state.jobs.cancel(&job_id) || state.build_jobs.cancel(&job_id);
     logging::warn(
         "job_cancel_requested",
         &[("job_id", job_id), ("cancelled", cancelled.to_string())],
@@ -509,7 +1396,7 @@ pub async fn list_jobs(
     let conn = state.db.connect()?;
     let mut rows = conn
         .query(
-            "SELECT id, kind, status, project_id, result_json, error, error_code, manifest_json, created_at_ms, updated_at_ms
+            "SELECT id, kind, status, project_id, result_json, error, error_code, manifest_json, created_at_ms, updated_at_ms, request_json
              FROM jobs ORDER BY created_at_ms DESC",
             (),
         )
@@ -519,11 +1406,13 @@ pub async fn list_jobs(
     while let Some(row) = rows.next().await? {
         let result_json: Option<String> = row.get(4)?;
         let manifest_json: Option<String> = row.get(7)?;
+        let request_json: String = row.get(10)?;
         jobs.push(JobResponse {
             id: row.get(0)?,
             kind: row.get(1)?,
             status: row.get(2)?,
             project_id: row.get(3)?,
+            service_name: service_name_from_request_json(&request_json),
             actions: manifest_json
                 .as_deref()
                 .and_then(|json| serde_json::from_str(json).ok())
@@ -533,6 +1422,7 @@ pub async fn list_jobs(
                 .and_then(|json| serde_json::from_str(json).ok()),
             error: row.get(5)?,
             error_code: row.get(6)?,
+            progress: Vec::new(),
             created_at_ms: row.get(8)?,
             updated_at_ms: row.get(9)?,
         });
@@ -551,7 +1441,7 @@ pub async fn list_project_jobs(
     let conn = state.db.connect()?;
     let mut rows = conn
         .query(
-            "SELECT id, kind, status, project_id, result_json, error, error_code, manifest_json, created_at_ms, updated_at_ms
+            "SELECT id, kind, status, project_id, result_json, error, error_code, manifest_json, created_at_ms, updated_at_ms, request_json
              FROM jobs WHERE project_id = ?1 ORDER BY created_at_ms DESC LIMIT 50",
             params![project_id],
         )
@@ -561,11 +1451,13 @@ pub async fn list_project_jobs(
     while let Some(row) = rows.next().await? {
         let result_json: Option<String> = row.get(4)?;
         let manifest_json: Option<String> = row.get(7)?;
+        let request_json: String = row.get(10)?;
         jobs.push(JobResponse {
             id: row.get(0)?,
             kind: row.get(1)?,
             status: row.get(2)?,
             project_id: row.get(3)?,
+            service_name: service_name_from_request_json(&request_json),
             actions: manifest_json
                 .as_deref()
                 .and_then(|json| serde_json::from_str(json).ok())
@@ -575,6 +1467,7 @@ pub async fn list_project_jobs(
                 .and_then(|json| serde_json::from_str(json).ok()),
             error: row.get(5)?,
             error_code: row.get(6)?,
+            progress: Vec::new(),
             created_at_ms: row.get(8)?,
             updated_at_ms: row.get(9)?,
         });
@@ -593,7 +1486,7 @@ pub async fn read_job(
     let conn = state.db.connect()?;
     let mut rows = conn
         .query(
-            "SELECT id, kind, status, project_id, result_json, error, error_code, manifest_json, created_at_ms, updated_at_ms
+            "SELECT id, kind, status, project_id, result_json, error, error_code, manifest_json, created_at_ms, updated_at_ms, request_json
              FROM jobs WHERE id = ?1 LIMIT 1",
             params![job_id],
         )
@@ -604,11 +1497,20 @@ pub async fn read_job(
 
     let result_json: Option<String> = row.get(4)?;
     let manifest_json: Option<String> = row.get(7)?;
+    let kind: String = row.get(1)?;
+    let job_id: String = row.get(0)?;
+    let request_json: String = row.get(10)?;
+    let progress = if kind == "image_build" {
+        read_build_progress(&state.db, &job_id).await?
+    } else {
+        Vec::new()
+    };
     Ok(Json(JobResponse {
-        id: row.get(0)?,
-        kind: row.get(1)?,
+        id: job_id,
+        kind,
         status: row.get(2)?,
         project_id: row.get(3)?,
+        service_name: service_name_from_request_json(&request_json),
         actions: manifest_json
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok())
@@ -618,6 +1520,7 @@ pub async fn read_job(
             .and_then(|json| serde_json::from_str(json).ok()),
         error: row.get(5)?,
         error_code: row.get(6)?,
+        progress,
         created_at_ms: row.get(8)?,
         updated_at_ms: row.get(9)?,
     }))
@@ -688,4 +1591,340 @@ fn now_ms() -> Result<i64, ApiError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ApiError::Clock)?;
     i64::try_from(duration.as_millis()).map_err(|_| ApiError::Clock)
+}
+
+#[cfg(test)]
+mod build_progress_tests {
+    use super::*;
+
+    #[test]
+    fn bound_text_passes_short_text_through_unchanged() {
+        assert_eq!(bound_text("hello", &[]), "hello");
+    }
+
+    #[test]
+    fn bound_text_redacts_windows_host_paths() {
+        let text = r"open C:\Users\wihlarkop\Project\susun-studio\Dockerfile: no such file";
+        assert_eq!(bound_text(text, &[]), "open <redacted-path> no such file");
+    }
+
+    #[test]
+    fn bound_text_redacts_unc_and_unix_host_paths() {
+        assert_eq!(
+            bound_text(r"failed to stat \\wsl.localhost\Ubuntu\home\edo\app", &[]),
+            "failed to stat <redacted-path>"
+        );
+        assert_eq!(
+            bound_text("lstat /home/edo/project/context: permission denied", &[]),
+            "lstat <redacted-path> permission denied"
+        );
+    }
+
+    #[test]
+    fn bound_text_redacts_a_quoted_windows_path_containing_spaces() {
+        let text =
+            r#"open "C:\Program Files\Docker\Docker\resources\bin\docker.exe": access denied"#;
+        assert_eq!(
+            bound_text(text, &[]),
+            r#"open "<redacted-path>": access denied"#
+        );
+    }
+
+    #[test]
+    fn bound_text_redacts_known_build_argument_values_without_a_marker_keyword() {
+        let text = "step 4/9: ARG API_KEY=sk-live-abc123 --build-arg";
+        let redact_values = vec!["sk-live-abc123".to_owned()];
+        assert_eq!(
+            bound_text(text, &redact_values),
+            "step 4/9: ARG API_KEY=<redacted-arg> --build-arg"
+        );
+    }
+
+    #[test]
+    fn bound_text_redacts_short_and_overlapping_known_values() {
+        let text = "MODE=x TOKEN=prefix-secret";
+        let redact_values = vec![
+            "x".to_owned(),
+            "prefix".to_owned(),
+            "prefix-secret".to_owned(),
+        ];
+        assert_eq!(
+            bound_text(text, &redact_values),
+            "MODE=<redacted-arg> TOKEN=<redacted-arg>"
+        );
+    }
+
+    #[test]
+    fn build_redact_values_include_explicit_and_inherited_arguments() {
+        let args = indexmap::indexmap! {
+            "EXPLICIT".to_owned() => Some("explicit-value".to_owned()),
+            "INHERITED".to_owned() => None,
+            "MISSING".to_owned() => None,
+        };
+        let values = collect_build_redact_values(&args, |key| match key {
+            "INHERITED" => Some("inherited-value".to_owned()),
+            _ => None,
+        });
+        assert_eq!(
+            values,
+            vec!["inherited-value".to_owned(), "explicit-value".to_owned()]
+        );
+    }
+
+    #[test]
+    fn bound_text_leaves_non_path_tokens_alone() {
+        assert_eq!(
+            bound_text("step 3/10: RUN npm install", &[]),
+            "step 3/10: RUN npm install"
+        );
+    }
+
+    /// Never persist an unbounded provider payload, even on top of
+    /// `susun_build`'s own redaction — a single very long line must be
+    /// truncated with a visible marker, not silently cut off unremarked.
+    #[test]
+    fn bound_text_truncates_long_text_with_a_visible_marker() {
+        let long = "a".repeat(MAX_BUILD_PROGRESS_TEXT_CHARS + 100);
+        let bounded = bound_text(&long, &[]);
+        assert!(bounded.chars().count() < long.chars().count());
+        assert!(bounded.ends_with("… [truncated]"));
+    }
+
+    #[test]
+    fn flatten_build_event_covers_started_and_finished() {
+        let started = flatten_build_event(
+            susun::BuildEvent::Started {
+                build_id: susun::BuildId("b1".to_owned()),
+            },
+            &[],
+        );
+        assert_eq!(started.kind, "started");
+        assert!(started.vertex_id.is_none());
+
+        let finished = flatten_build_event(susun::BuildEvent::Finished, &[]);
+        assert_eq!(finished.kind, "finished");
+    }
+
+    #[test]
+    fn flatten_build_event_preserves_vertex_log_stream_and_bounds_its_text() {
+        let long = "x".repeat(MAX_BUILD_PROGRESS_TEXT_CHARS + 50);
+        let flat = flatten_build_event(
+            susun::BuildEvent::VertexLog {
+                vertex: susun::BuildVertexId("v1".to_owned()),
+                stream: susun::BuildLogStream::Stderr,
+                text: long,
+            },
+            &[],
+        );
+        assert_eq!(flat.kind, "vertex_log");
+        assert_eq!(flat.vertex_id.as_deref(), Some("v1"));
+        assert_eq!(flat.log_stream, Some("stderr"));
+        let text = flat.text.unwrap_or_default();
+        assert!(text.chars().count() <= MAX_BUILD_PROGRESS_TEXT_CHARS + "… [truncated]".len());
+    }
+
+    #[test]
+    fn flatten_build_event_preserves_progress_counts() {
+        let flat = flatten_build_event(
+            susun::BuildEvent::VertexProgress {
+                vertex: susun::BuildVertexId("v1".to_owned()),
+                progress: susun::BuildProgress {
+                    current: 10,
+                    total: Some(100),
+                },
+            },
+            &[],
+        );
+        assert_eq!(flat.kind, "vertex_progress");
+        assert_eq!(flat.current, Some(10));
+        assert_eq!(flat.total, Some(100));
+    }
+
+    #[test]
+    fn flatten_build_event_preserves_vertex_finished_status() {
+        let flat = flatten_build_event(
+            susun::BuildEvent::VertexFinished {
+                vertex: susun::BuildVertexId("v1".to_owned()),
+                status: susun::BuildVertexStatus::Failed,
+            },
+            &[],
+        );
+        assert_eq!(flat.kind, "vertex_finished");
+        assert_eq!(flat.status, Some("failed"));
+    }
+}
+
+#[cfg(test)]
+mod build_route_tests {
+    use super::*;
+    use crate::test_support::{authorized_headers, fresh_db, test_state};
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    /// A fabricated project id must be rejected before any Compose analysis
+    /// is attempted — `load_project_source` looks the project up first.
+    #[tokio::test]
+    async fn read_project_build_targets_rejects_an_unknown_project() -> TestResult {
+        let state = test_state(fresh_db("jobs-build-targets-unknown-project").await?);
+
+        let result = read_project_build_targets(
+            State(state),
+            authorized_headers(),
+            Path("does-not-exist".to_owned()),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::ProjectNotFound)));
+        Ok(())
+    }
+
+    /// Mirrors the read-side regression: starting a build for an unknown
+    /// project must be rejected before any engine connection is attempted.
+    #[tokio::test]
+    async fn start_image_build_rejects_an_unknown_project() -> TestResult {
+        let state = test_state(fresh_db("jobs-start-build-unknown-project").await?);
+
+        let result = start_image_build(
+            State(state),
+            authorized_headers(),
+            Path(("does-not-exist".to_owned(), "web".to_owned())),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::ProjectNotFound)));
+        Ok(())
+    }
+
+    /// A project row that exists but has never been imported (no stored
+    /// Compose files) must fail with a clear planning error, not panic or
+    /// silently proceed as if it had no build targets.
+    #[tokio::test]
+    async fn read_project_build_targets_rejects_a_project_with_no_source_metadata() -> TestResult {
+        let state = test_state(fresh_db("jobs-build-targets-no-source").await?);
+        let conn = state.db.connect()?;
+        conn.execute(
+            "INSERT INTO projects (id, name, path, created_at_ms) VALUES ('p1', 'Proj', 'C:/proj', 1)",
+            (),
+        )
+        .await?;
+
+        let result =
+            read_project_build_targets(State(state), authorized_headers(), Path("p1".to_owned()))
+                .await;
+
+        assert!(matches!(result, Err(ApiError::PlanningFailed(_))));
+        Ok(())
+    }
+
+    /// `cancel_job` must also route through the build-job registry — a job
+    /// registered only in `state.build_jobs` (as every `image_build` job is)
+    /// would otherwise never be found by a cancel request that only checked
+    /// `state.jobs`.
+    #[tokio::test]
+    async fn cancel_job_finds_a_job_registered_only_in_the_build_registry() -> TestResult {
+        let state = test_state(fresh_db("jobs-cancel-build-registry").await?);
+        let (cancellation, _cancel_notify) = state.build_jobs.register("job-1".to_owned());
+        assert!(!cancellation.is_cancelled());
+
+        let response =
+            cancel_job(State(state), authorized_headers(), Path("job-1".to_owned())).await?;
+
+        assert_eq!(response.0["cancelled"], true);
+        assert!(cancellation.is_cancelled());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn late_build_correction_applies_the_provider_result_directly() -> TestResult {
+        let state = test_state(fresh_db("jobs-late-build-provider-result").await?);
+        let conn = state.db.connect()?;
+        conn.execute(
+            "INSERT INTO jobs (
+                id, kind, status, project_id, engine_id, request_json,
+                error, error_code, created_at_ms, updated_at_ms
+            ) VALUES (
+                'job-late', 'image_build', 'cancelled', 'p1',
+                'engine-docker-local', '{}', 'outcome uncertain',
+                'cancelled', 1, 1
+            )",
+            (),
+        )
+        .await?;
+
+        let build_handle = tokio::spawn(async {
+            Ok(susun_integration::BuildResultRow {
+                image_reference: "example/app:latest".to_owned(),
+                image_digest: Some("sha256:provider-result".to_owned()),
+            })
+        });
+        finish_late_build_correction(state.db.clone(), "job-late".to_owned(), build_handle).await;
+
+        let mut rows = conn
+            .query(
+                "SELECT status, result_json, error, error_code
+                 FROM jobs WHERE id = 'job-late'",
+                (),
+            )
+            .await?;
+        let row = rows.next().await?.ok_or("late build job row missing")?;
+        let status: String = row.get(0)?;
+        let result_json: Option<String> = row.get(1)?;
+        let error: Option<String> = row.get(2)?;
+        let error_code: Option<String> = row.get(3)?;
+        assert_eq!(status, "succeeded");
+        assert!(
+            result_json
+                .as_deref()
+                .is_some_and(|json| json.contains("sha256:provider-result"))
+        );
+        assert!(error.is_none());
+        assert!(error_code.is_none());
+        Ok(())
+    }
+
+    /// `BuildxProcessOptions` has no engine-endpoint override, so a build
+    /// always runs through the daemon's ambient `docker` CLI context. A
+    /// project bound to a non-default runtime profile must be rejected
+    /// before Studio ever attempts to connect or attribute a job to it —
+    /// otherwise a Podman/remote profile could be validated and recorded
+    /// while the build silently executes elsewhere.
+    #[tokio::test]
+    async fn start_image_build_rejects_a_project_bound_to_a_non_default_runtime_profile()
+    -> TestResult {
+        let state = test_state(fresh_db("jobs-start-build-non-default-runtime").await?);
+        let dir = std::env::temp_dir().join(format!(
+            "studio-jobs-non-default-runtime-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let compose_path = dir.join("docker-compose.yml");
+        std::fs::write(
+            &compose_path,
+            "services:\n  web:\n    build:\n      context: .\n    image: myapp-web:latest\n",
+        )?;
+
+        let conn = state.db.connect()?;
+        conn.execute(
+            "INSERT INTO projects (
+                id, name, path, created_at_ms, compose_files, runtime_profile_id
+            ) VALUES ('p1', 'Proj', ?1, 1, ?2, 'external-profile-1')",
+            params![
+                dir.to_string_lossy().into_owned(),
+                serde_json::to_string(&[compose_path.to_string_lossy().into_owned()])?,
+            ],
+        )
+        .await?;
+
+        let result = start_image_build(
+            State(state),
+            authorized_headers(),
+            Path(("p1".to_owned(), "web".to_owned())),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::ActionUnavailable(_))));
+
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
 }

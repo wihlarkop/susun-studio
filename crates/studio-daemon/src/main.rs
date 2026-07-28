@@ -83,6 +83,7 @@ async fn run() -> Result<(), DaemonError> {
         db_path: db_path.clone(),
         auth_token: Arc::from(config::auth_token()?),
         jobs: Arc::new(jobs::registry::JobRegistry::new()),
+        build_jobs: Arc::new(jobs::build_registry::BuildJobRegistry::new()),
         stream_tickets: Arc::new(jobs::tickets::StreamTickets::new()),
         watch: Arc::new(watch::registry::WatchRegistry::new()),
         restore: restore.clone(),
