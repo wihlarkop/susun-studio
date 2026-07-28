@@ -11,7 +11,10 @@ use turso::Database;
 use crate::{
     action_plans::ActionPlanStore,
     db,
-    jobs::{build_registry::BuildJobRegistry, registry::JobRegistry, tickets::StreamTickets},
+    jobs::{
+        build_registry::BuildJobRegistry, registry::JobRegistry, tickets::StreamTickets,
+        transfer_registry::ArtifactTransferJobRegistry,
+    },
     registry::credential_store::MemoryRegistryCredentialStore,
     restore::RestoreCoordinator,
     runtime::trusted_plans::TrustedPlanStore,
@@ -37,6 +40,7 @@ pub(crate) fn test_state(db: Database) -> AppState {
         auth_token: Arc::from(TEST_AUTH_TOKEN),
         jobs: Arc::new(JobRegistry::new()),
         build_jobs: Arc::new(BuildJobRegistry::new()),
+        transfer_jobs: Arc::new(ArtifactTransferJobRegistry::new()),
         stream_tickets: Arc::new(StreamTickets::new()),
         watch: Arc::new(WatchRegistry::new()),
         restore: Arc::new(RestoreCoordinator::new()),
