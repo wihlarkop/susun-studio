@@ -86,6 +86,12 @@ pub enum ApiError {
     #[error("registry identity is invalid")]
     InvalidRegistryIdentity,
 
+    #[error("image reference is invalid")]
+    InvalidImageReference,
+
+    #[error("the selected credential belongs to a different registry")]
+    RegistryCredentialMismatch,
+
     #[error("registry credential request is invalid")]
     InvalidRegistryCredential,
 
@@ -172,6 +178,7 @@ impl IntoResponse for ApiError {
             | Self::MissingPath
             | Self::MissingComposeFiles
             | Self::InvalidRegistryIdentity
+            | Self::InvalidImageReference
             | Self::InvalidRegistryCredential
             | Self::TrustedPlanContentRejected => StatusCode::BAD_REQUEST,
             Self::ProjectNotFound
@@ -189,6 +196,7 @@ impl IntoResponse for ApiError {
             Self::InvalidImport(_)
             | Self::PlanningFailed(_)
             | Self::ActionUnavailable(_)
+            | Self::RegistryCredentialMismatch
             | Self::CredentialTooLarge
             | Self::RestoreArchiveInvalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RestoreInProgress | Self::CredentialStoreUnavailable => {

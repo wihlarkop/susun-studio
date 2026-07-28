@@ -1,3 +1,4 @@
+mod artifact_transfers;
 mod artifacts;
 mod backup;
 mod diagnostics;
@@ -215,6 +216,10 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/v1/projects/{id}/services/{service}/build",
             post(jobs::start_image_build),
+        )
+        .route(
+            "/v1/engines/{id}/images/pull",
+            post(artifact_transfers::start_image_pull),
         )
         .route("/v1/jobs", get(jobs::list_jobs))
         .route("/v1/projects/{id}/jobs", get(jobs::list_project_jobs))
