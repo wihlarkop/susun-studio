@@ -21,6 +21,13 @@ impl RegistryIdentity {
         Ok(Self(canonical))
     }
 
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "consumed by the Phase 15e3 durable image-transfer routes"
+        )
+    )]
     pub fn from_image_ref(value: &str) -> Result<Self, RegistryIdentityError> {
         validate_plain_input(value)?;
         if value.contains('\\') || value.contains(['?', '#']) || value.starts_with('/') {
@@ -155,7 +162,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn canonicalizes_registry_hosts_and_docker_hub_aliases() {
+    fn canonicalizes_registry_hosts_and_docker_hub_aliases() -> Result<(), RegistryIdentityError> {
         let cases = [
             ("REGISTRY.EXAMPLE", "registry.example"),
             ("registry.example:5000", "registry.example:5000"),
@@ -168,13 +175,14 @@ mod tests {
         ];
 
         for (input, expected) in cases {
-            let identity = RegistryIdentity::parse(input).expect("identity should be accepted");
+            let identity = RegistryIdentity::parse(input)?;
             assert_eq!(identity.as_str(), expected, "input: {input}");
         }
+        Ok(())
     }
 
     #[test]
-    fn derives_registry_identity_from_image_references() {
+    fn derives_registry_identity_from_image_references() -> Result<(), RegistryIdentityError> {
         let cases = [
             ("alpine:3.20", "docker.io"),
             ("library/alpine:3.20", "docker.io"),
@@ -185,10 +193,10 @@ mod tests {
         ];
 
         for (image, expected) in cases {
-            let identity = RegistryIdentity::from_image_ref(image)
-                .expect("image reference should be accepted");
+            let identity = RegistryIdentity::from_image_ref(image)?;
             assert_eq!(identity.as_str(), expected, "image: {image}");
         }
+        Ok(())
     }
 
     #[test]

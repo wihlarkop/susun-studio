@@ -7,6 +7,7 @@ mod jobs;
 mod observe;
 mod plans;
 mod projects;
+mod registry_credentials;
 mod runtime;
 mod runtime_transitions;
 mod service_actions;
@@ -278,6 +279,22 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/v1/settings",
             get(settings::get_settings).put(settings::update_settings),
+        )
+        .route(
+            "/v1/registry/credentials",
+            get(registry_credentials::list_registry_credentials)
+                .post(registry_credentials::create_registry_credential)
+                .layer(DefaultBodyLimit::max(
+                    registry_credentials::MAX_REQUEST_BYTES,
+                )),
+        )
+        .route(
+            "/v1/registry/credentials/{id}",
+            put(registry_credentials::rotate_registry_credential)
+                .delete(registry_credentials::delete_registry_credential)
+                .layer(DefaultBodyLimit::max(
+                    registry_credentials::MAX_REQUEST_BYTES,
+                )),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

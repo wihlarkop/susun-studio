@@ -174,35 +174,37 @@ impl RegistryCredentialStore for MemoryRegistryCredentialStore {
 }
 
 #[cfg(test)]
+impl MemoryRegistryCredentialStore {
+    pub fn is_empty(&self) -> bool {
+        self.entries
+            .lock()
+            .map(|entries| entries.is_empty())
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn memory_store_satisfies_put_get_overwrite_and_delete_contract() {
+    fn memory_store_satisfies_put_get_overwrite_and_delete_contract()
+    -> Result<(), CredentialStoreError> {
         let store = MemoryRegistryCredentialStore::default();
         let id = RegistryCredentialId::new();
 
-        assert!(!store.contains(&id).expect("contains should succeed"));
-        store
-            .put(&id, SecretValue::new("first-secret"))
-            .expect("put should succeed");
-        assert!(store.contains(&id).expect("contains should succeed"));
-        assert_eq!(
-            store.get(&id).expect("get should succeed").expose(),
-            "first-secret"
-        );
+        assert!(!store.contains(&id)?);
+        store.put(&id, SecretValue::new("first-secret"))?;
+        assert!(store.contains(&id)?);
+        assert_eq!(store.get(&id)?.expose(), "first-secret");
 
-        store
-            .put(&id, SecretValue::new("replacement-secret"))
-            .expect("overwrite should succeed");
-        assert_eq!(
-            store.get(&id).expect("get should succeed").expose(),
-            "replacement-secret"
-        );
+        store.put(&id, SecretValue::new("replacement-secret"))?;
+        assert_eq!(store.get(&id)?.expose(), "replacement-secret");
 
-        store.delete(&id).expect("delete should succeed");
-        assert!(!store.contains(&id).expect("contains should succeed"));
+        store.delete(&id)?;
+        assert!(!store.contains(&id)?);
         assert!(matches!(store.get(&id), Err(CredentialStoreError::Missing)));
+        Ok(())
     }
 
     #[test]

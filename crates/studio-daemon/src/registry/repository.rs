@@ -96,6 +96,13 @@ pub async fn find_by_registry(
         .transpose()
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "consumed by the Phase 15e4 authenticated image-push worker"
+    )
+)]
 pub async fn touch_success(
     db: &Database,
     id: &RegistryCredentialId,
@@ -107,6 +114,23 @@ pub async fn touch_success(
          SET last_success_at_ms = ?1, updated_at_ms = ?1
          WHERE id = ?2",
         params![now_ms, id.as_str().to_owned()],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn update_username(
+    db: &Database,
+    id: &RegistryCredentialId,
+    username_label: Option<String>,
+    now_ms: i64,
+) -> Result<(), RegistryRepositoryError> {
+    let conn = db.connect()?;
+    conn.execute(
+        "UPDATE registry_credentials
+         SET username_label = ?1, updated_at_ms = ?2
+         WHERE id = ?3",
+        params![username_label, now_ms, id.as_str().to_owned()],
     )
     .await?;
     Ok(())
