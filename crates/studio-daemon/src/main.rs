@@ -90,6 +90,7 @@ async fn run() -> Result<(), DaemonError> {
         restore: restore.clone(),
         trusted_plans: Arc::new(runtime::trusted_plans::TrustedPlanStore::default()),
         action_plans: Arc::new(action_plans::ActionPlanStore::default()),
+        registry_credentials: Arc::new(registry::credential_store::OsRegistryCredentialStore),
     };
 
     let listener = TcpListener::bind(bind_addr)

@@ -12,6 +12,7 @@ use crate::{
     action_plans::ActionPlanStore,
     db,
     jobs::{build_registry::BuildJobRegistry, registry::JobRegistry, tickets::StreamTickets},
+    registry::credential_store::MemoryRegistryCredentialStore,
     restore::RestoreCoordinator,
     runtime::trusted_plans::TrustedPlanStore,
     state::AppState,
@@ -41,6 +42,7 @@ pub(crate) fn test_state(db: Database) -> AppState {
         restore: Arc::new(RestoreCoordinator::new()),
         trusted_plans: Arc::new(TrustedPlanStore::default()),
         action_plans: Arc::new(ActionPlanStore::default()),
+        registry_credentials: Arc::new(MemoryRegistryCredentialStore::default()),
     }
 }
 
