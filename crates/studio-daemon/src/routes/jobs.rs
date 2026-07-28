@@ -276,14 +276,35 @@ fn bound_text(text: &str, redact_values: &[String]) -> String {
 /// concrete strings, not a pattern to detect.
 fn redact_known_values(text: &str, redact_values: &[String]) -> String {
     let mut result = text.to_owned();
-    for value in redact_values {
-        // Skip trivially short values — redacting e.g. "1" or "on" would
-        // mangle unrelated output far more than it protects anything.
-        if value.chars().count() >= 3 {
-            result = result.replace(value.as_str(), "<redacted-arg>");
-        }
+    let mut ordered: Vec<&str> = redact_values
+        .iter()
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .collect();
+    ordered.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
+    ordered.dedup();
+    for value in ordered {
+        result = result.replace(value, "<redacted-arg>");
     }
     result
+}
+
+fn collect_build_redact_values(
+    args: &indexmap::IndexMap<String, Option<String>>,
+    resolve_inherited: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut values: Vec<String> = args
+        .iter()
+        .filter_map(|(key, value)| {
+            value
+                .clone()
+                .or_else(|| resolve_inherited(key))
+                .filter(|resolved| !resolved.is_empty())
+        })
+        .collect();
+    values.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
+    values.dedup();
+    values
 }
 
 /// Defensive scrub for raw filesystem paths in provider output. Build
@@ -635,7 +656,10 @@ async fn finish_build_job(
             .unwrap_or_default();
             let _ = conn
                 .execute(
-                    "UPDATE jobs SET status = 'succeeded', result_json = ?1, updated_at_ms = ?2 WHERE id = ?3",
+                    "UPDATE jobs
+                     SET status = 'succeeded', result_json = ?1,
+                         error = NULL, error_code = NULL, updated_at_ms = ?2
+                     WHERE id = ?3",
                     params![result_json, now, job_id.to_owned()],
                 )
                 .await;
@@ -783,14 +807,12 @@ pub async fn start_image_build(
     let db = state.db.clone();
     let registry = state.build_jobs.clone();
     let spawn_job_id = job_id.clone();
-    let spawn_project_id = project_id.clone();
     let project_root = source.root.clone();
 
     tokio::spawn(async move {
         run_image_build(
             db.clone(),
             spawn_job_id.clone(),
-            spawn_project_id,
             project_root,
             definition,
             image_tag,
@@ -819,20 +841,15 @@ pub async fn start_image_build(
 async fn run_image_build(
     db: Arc<Database>,
     job_id: String,
-    project_id: String,
     project_root: std::path::PathBuf,
     definition: susun::BuildDefinition,
     image_tag: String,
     cancellation: susun::BuildCancellationToken,
     cancel_notify: Arc<tokio::sync::Notify>,
 ) {
-    let redact_values: Arc<Vec<String>> = Arc::new(
-        definition
-            .args
-            .values()
-            .filter_map(|value| value.clone())
-            .collect(),
-    );
+    let redact_values = Arc::new(collect_build_redact_values(&definition.args, |key| {
+        std::env::var(key).ok()
+    }));
     let prepare_definition = definition.clone();
     let prepared = tokio::select! {
         biased;
@@ -864,7 +881,6 @@ async fn run_image_build(
     update_build_job_status(&db, &job_id, "running").await;
 
     let events = make_build_event_sink(db.clone(), job_id.clone(), redact_values);
-    let reconcile_image_tag = image_tag.clone();
     // `BuildxProcessBuildEngine` blocks on `docker buildx build` via a
     // synchronous `Command::output()` call, with no child-process handle to
     // kill — cancellation/timeout below can only stop *this task's own
@@ -910,7 +926,7 @@ async fn run_image_build(
                 Some(BUILD_INTERRUPT_UNCERTAIN_MESSAGE),
             )
             .await;
-            spawn_late_build_correction(db, job_id, project_id, reconcile_image_tag, build_handle);
+            spawn_late_build_correction(db, job_id, build_handle);
         }
         BuildJobOutcome::TimedOut => {
             mark_build_interrupted(
@@ -921,7 +937,7 @@ async fn run_image_build(
                 Some(BUILD_INTERRUPT_UNCERTAIN_MESSAGE),
             )
             .await;
-            spawn_late_build_correction(db, job_id, project_id, reconcile_image_tag, build_handle);
+            spawn_late_build_correction(db, job_id, build_handle);
         }
     }
 }
@@ -935,74 +951,28 @@ async fn run_image_build(
 fn spawn_late_build_correction(
     db: Arc<Database>,
     job_id: String,
-    project_id: String,
-    image_tag: String,
     build_handle: tokio::task::JoinHandle<
         Result<susun_integration::BuildResultRow, susun::BuildError>,
     >,
 ) {
-    tokio::spawn(async move {
-        let Ok(result) = build_handle.await else {
-            return;
-        };
-        match result {
-            Ok(build_result) => finish_build_job(&db, &job_id, Ok(build_result)).await,
-            Err(build_error) => {
-                let (error_code, _) = classify_build_error(&build_error);
-                // The SDK's own cancellation check runs *after* `docker
-                // buildx build` exits and reports `Cancelled` purely from
-                // the token's flipped state — regardless of whether the
-                // subprocess actually completed and loaded the image
-                // first. Trusting that classification would just replace
-                // one confidently-wrong status with another, so reconcile
-                // against the engine's own image inventory instead of the
-                // SDK's classification.
-                if error_code == "cancelled" {
-                    match reconcile_cancelled_build(&db, &project_id, &image_tag).await {
-                        Some(build_result) => {
-                            finish_build_job(&db, &job_id, Ok(build_result)).await;
-                        }
-                        None => {
-                            // Confirmed: no image with this tag exists —
-                            // the honest "cancelled" record already written
-                            // stands.
-                        }
-                    }
-                } else {
-                    finish_build_job(&db, &job_id, Err(build_error)).await;
-                }
-            }
-        }
-    });
+    tokio::spawn(finish_late_build_correction(db, job_id, build_handle));
 }
 
-/// Checks whether an image tagged `image_tag` actually exists on the
-/// project's engine — the only way to tell a build that truly stopped from
-/// one that finished and loaded its image anyway before the SDK observed
-/// the cancellation token (see `spawn_late_build_correction`). Best-effort:
-/// any failure to connect or list images is treated as "can't confirm it
-/// landed", not as evidence either way.
-async fn reconcile_cancelled_build(
-    db: &Database,
-    project_id: &str,
-    image_tag: &str,
-) -> Option<susun_integration::BuildResultRow> {
-    let engine = susun_integration::connect_engine(db, Some(project_id))
-        .await
-        .ok()?;
-    let inventory = crate::artifact_inventory::image_inventory(&engine)
-        .await
-        .ok()?;
-    let matched = inventory.data?.images.into_iter().find(|image| {
-        image
-            .references
-            .iter()
-            .any(|reference| reference == image_tag)
-    })?;
-    Some(susun_integration::BuildResultRow {
-        image_reference: image_tag.to_owned(),
-        image_digest: matched.digests.into_iter().next(),
-    })
+/// Applies the provider's eventual result directly. The Susun build adapter
+/// treats a completed process exit as authoritative, so Studio must not infer
+/// success from image inventory: a matching tag may have existed before this
+/// job started.
+async fn finish_late_build_correction(
+    db: Arc<Database>,
+    job_id: String,
+    build_handle: tokio::task::JoinHandle<
+        Result<susun_integration::BuildResultRow, susun::BuildError>,
+    >,
+) {
+    match build_handle.await {
+        Ok(result) => finish_build_job(&db, &job_id, result).await,
+        Err(_) => mark_build_interrupted(&db, &job_id, "failed", "internal", None).await,
+    }
 }
 
 /// Shown on a build job's `cancelled`/`failed(timeout)` record when Studio
@@ -1671,6 +1641,37 @@ mod build_progress_tests {
     }
 
     #[test]
+    fn bound_text_redacts_short_and_overlapping_known_values() {
+        let text = "MODE=x TOKEN=prefix-secret";
+        let redact_values = vec![
+            "x".to_owned(),
+            "prefix".to_owned(),
+            "prefix-secret".to_owned(),
+        ];
+        assert_eq!(
+            bound_text(text, &redact_values),
+            "MODE=<redacted-arg> TOKEN=<redacted-arg>"
+        );
+    }
+
+    #[test]
+    fn build_redact_values_include_explicit_and_inherited_arguments() {
+        let args = indexmap::indexmap! {
+            "EXPLICIT".to_owned() => Some("explicit-value".to_owned()),
+            "INHERITED".to_owned() => None,
+            "MISSING".to_owned() => None,
+        };
+        let values = collect_build_redact_values(&args, |key| match key {
+            "INHERITED" => Some("inherited-value".to_owned()),
+            _ => None,
+        });
+        assert_eq!(
+            values,
+            vec!["inherited-value".to_owned(), "explicit-value".to_owned()]
+        );
+    }
+
+    #[test]
     fn bound_text_leaves_non_path_tokens_alone() {
         assert_eq!(
             bound_text("step 3/10: RUN npm install", &[]),
@@ -1830,6 +1831,54 @@ mod build_route_tests {
 
         assert_eq!(response.0["cancelled"], true);
         assert!(cancellation.is_cancelled());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn late_build_correction_applies_the_provider_result_directly() -> TestResult {
+        let state = test_state(fresh_db("jobs-late-build-provider-result").await?);
+        let conn = state.db.connect()?;
+        conn.execute(
+            "INSERT INTO jobs (
+                id, kind, status, project_id, engine_id, request_json,
+                error, error_code, created_at_ms, updated_at_ms
+            ) VALUES (
+                'job-late', 'image_build', 'cancelled', 'p1',
+                'engine-docker-local', '{}', 'outcome uncertain',
+                'cancelled', 1, 1
+            )",
+            (),
+        )
+        .await?;
+
+        let build_handle = tokio::spawn(async {
+            Ok(susun_integration::BuildResultRow {
+                image_reference: "example/app:latest".to_owned(),
+                image_digest: Some("sha256:provider-result".to_owned()),
+            })
+        });
+        finish_late_build_correction(state.db.clone(), "job-late".to_owned(), build_handle).await;
+
+        let mut rows = conn
+            .query(
+                "SELECT status, result_json, error, error_code
+                 FROM jobs WHERE id = 'job-late'",
+                (),
+            )
+            .await?;
+        let row = rows.next().await?.ok_or("late build job row missing")?;
+        let status: String = row.get(0)?;
+        let result_json: Option<String> = row.get(1)?;
+        let error: Option<String> = row.get(2)?;
+        let error_code: Option<String> = row.get(3)?;
+        assert_eq!(status, "succeeded");
+        assert!(
+            result_json
+                .as_deref()
+                .is_some_and(|json| json.contains("sha256:provider-result"))
+        );
+        assert!(error.is_none());
+        assert!(error_code.is_none());
         Ok(())
     }
 
