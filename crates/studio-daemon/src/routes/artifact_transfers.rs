@@ -761,6 +761,10 @@ pub async fn preview_image_push(
         artifact_inventory::runtime_context(&state.db, resolved.runtime_profile_id.as_deref())
             .await?
             .into();
+    let capabilities = engine
+        .capabilities()
+        .await
+        .map_err(|error| ApiError::EngineUnavailable(error.redacted_message()))?;
     let registry_capabilities = artifact_inventory::registry_capability(&engine).await?;
     let lookup = artifact_inventory::image_details(&engine, &image_id).await?;
     let source = match lookup {
@@ -777,8 +781,8 @@ pub async fn preview_image_push(
             "Tag this image with the destination reference before pushing it.".to_owned(),
         ));
     }
-    let push_supported = registry_capabilities.supports_push != "unsupported";
-    let auth_supported = registry_capabilities.supports_auth != "unsupported";
+    let push_supported = capabilities.supports_registry_push.is_supported();
+    let auth_supported = capabilities.supports_registry_auth.is_supported();
     let (active_jobs, active_watch_sessions) = crate::routes::engines::engine_active_work(
         &state.db,
         resolved.runtime_profile_id.as_deref(),
@@ -893,7 +897,7 @@ pub async fn commit_image_push(
     };
     let job_id = format!("job_{}", uuid::Uuid::new_v4().simple());
     let now = runtime::now_ms();
-    insert_push_job(
+    if let Err(error) = insert_push_job(
         &state,
         &job_id,
         &source.id,
@@ -903,7 +907,13 @@ pub async fn commit_image_push(
         &resolved,
         now,
     )
-    .await?;
+    .await
+    {
+        state
+            .action_plans
+            .finish(&claimed.plan_id, PlanState::Failed);
+        return Err(error);
+    }
     let cancel_notify = state.transfer_jobs.register(job_id.clone());
     state
         .action_plans

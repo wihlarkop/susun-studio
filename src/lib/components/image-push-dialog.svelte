@@ -58,6 +58,7 @@
   let mutationState = $state<MutationState<ImagePushPreview, StudioJob>>(resetMutation(0));
   let job = $state<StudioJob | null>(null);
   let cancelling = $state(false);
+  let jobError = $state<string | null>(null);
   let generation = 0;
   let controller: AbortController | null = null;
 
@@ -95,6 +96,7 @@
     mutationState = resetMutation(requestGeneration);
     job = null;
     cancelling = false;
+    jobError = null;
     if (isOpen) {
       controller = new AbortController();
       void loadCredentials(controller.signal, requestGeneration);
@@ -207,8 +209,11 @@
   async function cancelPush() {
     if (!job || !isTransferJobActive(job) || cancelling) return;
     cancelling = true;
+    jobError = null;
     try {
       await cancelJob(job.id);
+    } catch (caught) {
+      jobError = toArtifactRequestError(caught).message;
     } finally {
       cancelling = false;
     }
@@ -332,6 +337,7 @@
             </div>
           {/if}
           {#if job.error}<p class="text-xs text-destructive">{job.error}</p>{/if}
+          {#if jobError}<p class="text-xs text-destructive">{jobError}</p>{/if}
         </div>
       {/if}
     </div>
