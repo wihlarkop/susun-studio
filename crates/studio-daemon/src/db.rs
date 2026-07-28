@@ -88,6 +88,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "artifact_transfer_progress",
         sql: include_str!("../migrations/0017_artifact_transfer_progress.sql"),
     },
+    Migration {
+        version: 18,
+        name: "runtime_action_audit_image_push",
+        sql: include_str!("../migrations/0018_runtime_action_audit_image_push.sql"),
+    },
 ];
 
 #[derive(Debug, thiserror::Error)]

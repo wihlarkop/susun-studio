@@ -382,7 +382,11 @@ mod tests {
     #[tokio::test]
     async fn record_accepts_the_new_artifact_domain_action_kinds() -> TestResult {
         let (db, path) = fixture().await?;
-        for kind in [ActionKind::ImageTag, ActionKind::ImageRemove] {
+        for kind in [
+            ActionKind::ImageTag,
+            ActionKind::ImageRemove,
+            ActionKind::ImagePush,
+        ] {
             record(
                 &db,
                 AuditEntry {
@@ -406,7 +410,7 @@ mod tests {
             .await?;
         }
         let rows = list(&db, 50).await?;
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert!(rows.iter().all(|row| row.domain == "artifact"));
         let _ = std::fs::remove_file(path);
         Ok(())

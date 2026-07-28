@@ -419,7 +419,9 @@ export type ImagePullResult = {
 
 export type ImagePushResult = {
   image_reference: string;
+  destination: string;
   registry: string;
+  digest: string | null;
   engine_id: string;
   runtime_profile_id: string | null;
   authenticated: boolean;
@@ -1402,6 +1404,51 @@ export async function startImagePull(
     ...options,
     method: "POST",
     body: request,
+  });
+}
+
+export type ImagePushPreview = {
+  engine_id: string;
+  runtime: ArtifactRuntimeContext;
+  source_image_id: string;
+  source_references: string[];
+  destination: string;
+  registry: string;
+  push_capability: string;
+  auth_capability: string;
+  authenticated: boolean;
+  active_jobs: number;
+  active_watch_sessions: number;
+  commit_enabled: boolean;
+  warning: string | null;
+  plan_id: string | null;
+  expires_in_seconds: number | null;
+};
+
+export async function previewImagePush(
+  engineId: string,
+  imageId: string,
+  destination: string,
+  credentialId: string | null,
+  options: DaemonRequestOptions = {},
+): Promise<ImagePushPreview> {
+  return readJson(
+    `/v1/engines/${encodeURIComponent(engineId)}/images/${encodeURIComponent(imageId)}/push/preview`,
+    {
+      ...options,
+      method: "POST",
+      body: { destination, credential_id: credentialId },
+    },
+  );
+}
+
+export async function commitImagePush(
+  planId: string,
+  options: DaemonRequestOptions = {},
+): Promise<StudioJob> {
+  return readJson(`/v1/engines/images/push/commit/${encodeURIComponent(planId)}`, {
+    ...options,
+    method: "POST",
   });
 }
 

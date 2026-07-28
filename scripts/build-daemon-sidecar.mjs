@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+const isDev = process.argv.includes("--dev");
 
 function resolveTargetTriple() {
   if (process.env.TAURI_ENV_TARGET_TRIPLE) {
@@ -25,14 +26,21 @@ const binaryName = isWindows ? "susun-studio-daemon.exe" : "susun-studio-daemon"
 const sidecarName = isWindows
   ? `susun-studio-daemon-${target}.exe`
   : `susun-studio-daemon-${target}`;
+const cargoArgs = ["build", "-p", "susun-studio-daemon"];
 
-console.log(`building susun-studio-daemon for ${target}`);
-execFileSync("cargo", ["build", "--release", "-p", "susun-studio-daemon", "--target", target], {
+if (!isDev) {
+  cargoArgs.splice(1, 0, "--release", "--target", target);
+}
+
+console.log(`building ${isDev ? "development" : "release"} susun-studio-daemon for ${target}`);
+execFileSync("cargo", cargoArgs, {
   cwd: repoRoot,
   stdio: "inherit",
 });
 
-const sourcePath = join(repoRoot, "target", target, "release", binaryName);
+const sourcePath = isDev
+  ? join(repoRoot, "target", "debug", binaryName)
+  : join(repoRoot, "target", target, "release", binaryName);
 const destDir = join(repoRoot, "src-tauri", "binaries");
 mkdirSync(destDir, { recursive: true });
 const destPath = join(destDir, sidecarName);

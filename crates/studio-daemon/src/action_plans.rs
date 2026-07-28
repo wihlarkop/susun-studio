@@ -43,6 +43,7 @@ pub enum ActionKind {
     MetadataRestore,
     ImageTag,
     ImageRemove,
+    ImagePush,
 }
 
 impl ActionKind {
@@ -57,6 +58,7 @@ impl ActionKind {
             Self::MetadataRestore => "metadata_restore",
             Self::ImageTag => "image_tag",
             Self::ImageRemove => "image_remove",
+            Self::ImagePush => "image_push",
         }
     }
 
@@ -68,7 +70,7 @@ impl ActionKind {
             | Self::DestructiveRemoveBuiltInRuntime => "destructive",
             Self::EnginePrune => "prune",
             Self::MetadataRestore => "restore",
-            Self::ImageTag | Self::ImageRemove => "artifact",
+            Self::ImageTag | Self::ImageRemove | Self::ImagePush => "artifact",
         }
     }
 }
@@ -84,6 +86,7 @@ pub enum ActionPlanPayload {
     MetadataRestore(MetadataRestorePlan),
     ImageTag(ImageTagPlan),
     ImageRemove(ImageRemovePlan),
+    ImagePush(ImagePushPlan),
 }
 
 /// The resolved, server-owned project binding move. Captured at preview so the
@@ -182,6 +185,20 @@ pub struct ImageRemovePlan {
     /// Fingerprint of the target image's inventory row (references, digests,
     /// size) at preview time. Recomputed at commit to reject a stale preview.
     pub source_fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImagePushPlan {
+    pub engine_id: String,
+    pub runtime_profile_id: Option<String>,
+    pub source_image_id: String,
+    pub destination: String,
+    pub registry: String,
+    pub credential_id: Option<String>,
+    pub credential_updated_at_ms: Option<i64>,
+    pub identity_fingerprint: String,
+    pub source_fingerprint: String,
+    pub active_work_fingerprint: String,
 }
 
 #[derive(Debug, Clone)]
@@ -441,7 +458,11 @@ mod tests {
                 ActionKind::DestructiveResetEngineData,
                 ActionKind::DestructiveRemoveBuiltInRuntime,
             ][..],
-            &[ActionKind::ImageTag, ActionKind::ImageRemove][..],
+            &[
+                ActionKind::ImageTag,
+                ActionKind::ImageRemove,
+                ActionKind::ImagePush,
+            ][..],
         ] {
             assert_eq!(
                 store.claim(&ticket.plan_id, "owner-a", wrong).err(),
@@ -473,6 +494,59 @@ mod tests {
             identity_fingerprint: "fp-identity".to_owned(),
             source_fingerprint: "fp-source".to_owned(),
         })
+    }
+
+    fn image_push_payload() -> ActionPlanPayload {
+        ActionPlanPayload::ImagePush(ImagePushPlan {
+            engine_id: "engine-docker-local".to_owned(),
+            runtime_profile_id: None,
+            source_image_id: "sha256:abc".to_owned(),
+            destination: "registry.example/team/app:latest".to_owned(),
+            registry: "registry.example".to_owned(),
+            credential_id: Some("cred_opaque".to_owned()),
+            credential_updated_at_ms: Some(1),
+            identity_fingerprint: "fp-identity".to_owned(),
+            source_fingerprint: "fp-source".to_owned(),
+            active_work_fingerprint: "0:0".to_owned(),
+        })
+    }
+
+    #[test]
+    fn image_push_plan_is_owner_bound_single_use_expiring_and_kind_isolated() {
+        let store = ActionPlanStore::default();
+        let ticket = store.prepare("owner-a", ActionKind::ImagePush, image_push_payload());
+        assert_eq!(
+            store
+                .claim(&ticket.plan_id, "owner-b", &[ActionKind::ImagePush])
+                .err(),
+            Some(ActionPlanError::WrongOwner)
+        );
+        assert_eq!(
+            store
+                .claim(&ticket.plan_id, "owner-a", &[ActionKind::ImageTag])
+                .err(),
+            Some(ActionPlanError::KindMismatch)
+        );
+        assert!(
+            store
+                .claim(&ticket.plan_id, "owner-a", &[ActionKind::ImagePush])
+                .is_ok()
+        );
+        assert_eq!(
+            store
+                .claim(&ticket.plan_id, "owner-a", &[ActionKind::ImagePush])
+                .err(),
+            Some(ActionPlanError::AlreadyConsumed)
+        );
+
+        let expiring = ActionPlanStore::with_ttl(Duration::ZERO);
+        let expired = expiring.prepare("owner-a", ActionKind::ImagePush, image_push_payload());
+        assert_eq!(
+            expiring
+                .claim(&expired.plan_id, "owner-a", &[ActionKind::ImagePush])
+                .err(),
+            Some(ActionPlanError::Expired)
+        );
     }
 
     /// The image tag/remove plans must honor the exact same owner-binding,
@@ -516,5 +590,7 @@ mod tests {
         assert_eq!(ActionKind::ImageTag.domain(), "artifact");
         assert_eq!(ActionKind::ImageRemove.as_str(), "image_remove");
         assert_eq!(ActionKind::ImageRemove.domain(), "artifact");
+        assert_eq!(ActionKind::ImagePush.as_str(), "image_push");
+        assert_eq!(ActionKind::ImagePush.domain(), "artifact");
     }
 }

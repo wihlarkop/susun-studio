@@ -1,13 +1,14 @@
 <script lang="ts">
   import * as Table from "$lib/components/ui/table/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
-  import { Download, RefreshCw } from "@lucide/svelte";
+  import { Download, RefreshCw, Upload } from "@lucide/svelte";
   import StatusBadge from "./status-badge.svelte";
   import ArtifactsStateBanner from "./artifacts-state-banner.svelte";
   import ImageTagDialog from "./image-tag-dialog.svelte";
   import ImageRemoveDialog from "./image-remove-dialog.svelte";
   import ScopePruneControl from "./scope-prune-control.svelte";
   import ImagePullDialog from "./image-pull-dialog.svelte";
+  import ImagePushDialog from "./image-push-dialog.svelte";
   import {
     readEngineImages,
     readEngineImage,
@@ -41,6 +42,7 @@
   let tagOpen = $state(false);
   let removeOpen = $state(false);
   let pullOpen = $state(false);
+  let pushOpen = $state(false);
 
   function openTag(image: ImageArtifactSummary) {
     selectedImage = image;
@@ -50,6 +52,11 @@
   function openRemove(image: ImageArtifactSummary) {
     selectedImage = image;
     removeOpen = true;
+  }
+
+  function openPush(image: ImageArtifactSummary) {
+    selectedImage = image;
+    pushOpen = true;
   }
 
   // Runs only in an async continuation, after the request's first `await` —
@@ -85,6 +92,7 @@
     tagOpen = false;
     removeOpen = false;
     pullOpen = false;
+    pushOpen = false;
     selectedImage = null;
 
     const controller = new AbortController();
@@ -245,6 +253,17 @@
                 >
                   Remove
                 </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onclick={(event) => {
+                    event.stopPropagation();
+                    openPush(image);
+                  }}
+                >
+                  <Upload />
+                  Push
+                </Button>
               </div>
             </Table.Cell>
           </Table.Row>
@@ -319,4 +338,5 @@
 {#if selectedImage}
   <ImageTagDialog {engineId} image={selectedImage} bind:open={tagOpen} oncompleted={refresh} />
   <ImageRemoveDialog {engineId} image={selectedImage} bind:open={removeOpen} oncompleted={refresh} />
+  <ImagePushDialog {engineId} image={selectedImage} bind:open={pushOpen} />
 {/if}

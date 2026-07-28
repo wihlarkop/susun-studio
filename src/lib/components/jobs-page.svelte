@@ -273,6 +273,11 @@
                                   : "Anonymous"}
                               </span>
                             </div>
+                            {#if "digest" in transferResult}
+                              <div class="text-muted-foreground">
+                                Digest: {transferResult.digest ?? "Not reported by registry"}
+                              </div>
+                            {/if}
                           </div>
                         {:else if isImageBuildResult(detail.result)}
                           {@const buildResult = detail.result}
