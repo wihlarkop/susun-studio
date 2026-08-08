@@ -37,7 +37,7 @@
     },
     {
       label: "Artifacts",
-      description: "Containers, images, build cache, and registry on the active engine",
+      description: "Containers, images, build cache, and registry on the configured runtime",
       icon: Boxes,
       view: "artifacts",
     },

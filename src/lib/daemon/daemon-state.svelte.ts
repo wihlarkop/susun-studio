@@ -2,14 +2,16 @@ import {
   getDaemonBaseUrl,
   importProject as importProjectRequest,
   listProjects,
-  listRuntimeProfiles,
   readDaemonHealth,
+  readRuntimeStatus,
   readSettings,
   updateSettings as updateSettingsRequest,
   type DaemonHealth,
   type ImportProjectRequest,
   type ImportProjectResponse,
   type RuntimeProfile,
+  type RuntimePreference,
+  type RuntimeStatus,
   type StudioProject,
   type StudioSettings,
 } from "$lib/daemon/client";
@@ -29,6 +31,7 @@ export function createDaemonState() {
   });
   let projects = $state<StudioProject[]>([]);
   let runtimeProfiles = $state<RuntimeProfile[]>([]);
+  let runtimeStatus = $state<RuntimeStatus | undefined>(undefined);
   let settings = $state<StudioSettings | undefined>(undefined);
   let workspaceDetail = $state(
     "Persisted projects will appear here after the daemon API is wired.",
@@ -43,15 +46,16 @@ export function createDaemonState() {
   async function refresh(signal?: AbortSignal) {
     try {
       const health = await readDaemonHealth(getDaemonBaseUrl(), signal);
-      const [projectList, daemonSettings, profiles] = await Promise.all([
+      const [projectList, daemonSettings, nextRuntimeStatus] = await Promise.all([
         listProjects({ signal }),
         readSettings({ signal }),
-        listRuntimeProfiles({ signal }),
+        readRuntimeStatus({ signal }),
       ]);
 
       projects = projectList;
       settings = daemonSettings;
-      runtimeProfiles = profiles;
+      runtimeStatus = nextRuntimeStatus;
+      runtimeProfiles = nextRuntimeStatus.providers.flatMap((provider) => provider.profiles);
       workspaceDetail = describeWorkspace(projectList);
       healthState = {
         kind: "connected",
@@ -66,6 +70,7 @@ export function createDaemonState() {
 
       projects = [];
       runtimeProfiles = [];
+      runtimeStatus = undefined;
       settings = undefined;
       workspaceDetail = "Start the local daemon to load projects and settings.";
       healthState = {
@@ -122,6 +127,12 @@ export function createDaemonState() {
     },
     get runtimeProfiles() {
       return runtimeProfiles;
+    },
+    get runtimeStatus() {
+      return runtimeStatus;
+    },
+    get runtimePreference(): RuntimePreference | undefined {
+      return runtimeStatus?.policy;
     },
     get settings() {
       return settings;
