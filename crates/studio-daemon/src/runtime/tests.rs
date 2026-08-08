@@ -120,7 +120,7 @@ async fn upgrade_preserves_selection_binding_and_repairs_multiselect() -> TestRe
     )
     .await?;
 
-    db::apply_pending_migrations(&conn).await?;
+    db::apply_migrations_upto(&conn, 11).await?;
 
     // Exactly one selection survives, and it is the most recently updated one.
     assert_eq!(
