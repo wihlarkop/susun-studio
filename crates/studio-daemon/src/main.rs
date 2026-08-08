@@ -14,7 +14,7 @@ mod project_source;
 mod registry;
 mod restore;
 mod routes;
-mod runtime;
+pub mod runtime;
 mod state;
 mod susun_integration;
 #[cfg(test)]

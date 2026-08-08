@@ -326,7 +326,6 @@ impl WindowsDockerDesktopProvider {
                 process: dimension(if running { "running" } else { "stopped" }, None),
                 connection: dimension(if running { "summarized" } else { "not_applicable" }, None),
                 endpoint_summary,
-                provider_default: false,
                 observed_at_ms,
             }],
             // Docker Desktop is a single logical engine keyed by the synthetic
@@ -391,7 +390,6 @@ impl WindowsDockerDesktopProvider {
             process: dimension(process_state, process_detail),
             connection: dimension(connection_state, connection_detail),
             endpoint_summary: None,
-            provider_default: false,
             observed_at_ms: now_ms(),
         }
     }

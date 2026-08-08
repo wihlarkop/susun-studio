@@ -356,7 +356,7 @@ pub(crate) async fn engine_identity_fingerprint(
             profile.availability_state,
             profile.endpoint_summary.unwrap_or_default(),
             profile.observation_revision,
-            profile.is_selected
+            profile.is_preferred
         ),
         (None, None) => "platform_default".to_owned(),
     };
@@ -894,17 +894,22 @@ mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-    async fn insert_selected_runtime_profile(state: &AppState, id: &str) -> TestResult {
+    async fn insert_preferred_runtime_profile(state: &AppState, id: &str) -> TestResult {
         let conn = state.db.connect()?;
         conn.execute(
             "INSERT INTO runtime_profiles (
                 id, provider_id, provider_runtime_key, display_name, product, platform,
                 runtime_class, ownership_state, source,
                 installation_state, process_state, connection_state,
-                is_selected, observed_at_ms, created_at_ms, updated_at_ms
+                observed_at_ms, created_at_ms, updated_at_ms
             ) VALUES (?1, ?2, ?2, ?3, 'podman', 'windows', 'external_local', 'external',
-                'provider_discovery', 'installed', 'running', 'summarized', 1, 1, 1, 1)",
+                'provider_discovery', 'installed', 'running', 'summarized', 1, 1, 1)",
             params![id.to_owned(), format!("key-{id}"), format!("Runtime {id}")],
+        )
+        .await?;
+        conn.execute(
+            "UPDATE runtime_policy SET preferred_profile_id = ?1 WHERE singleton = 1",
+            params![id.to_owned()],
         )
         .await?;
         Ok(())
@@ -941,7 +946,7 @@ mod tests {
     async fn resolve_and_validate_engine_returns_the_exact_profile_id_used_to_connect() -> TestResult
     {
         let state = test_state(fresh_db("engines-validate-profile").await?);
-        insert_selected_runtime_profile(&state, "profile-podman-1").await?;
+        insert_preferred_runtime_profile(&state, "profile-podman-1").await?;
 
         let resolved = resolve_and_validate_engine(&state, "profile-podman-1").await?;
 
@@ -962,7 +967,7 @@ mod tests {
     async fn resolve_and_validate_engine_rejects_platform_default_once_another_engine_is_selected()
     -> TestResult {
         let state = test_state(fresh_db("engines-validate-stale-default").await?);
-        insert_selected_runtime_profile(&state, "profile-podman-1").await?;
+        insert_preferred_runtime_profile(&state, "profile-podman-1").await?;
 
         let result = resolve_and_validate_engine(&state, PLATFORM_DEFAULT_ENGINE_ID).await;
 
@@ -1062,7 +1067,7 @@ mod tests {
         // engine_id is the platform default.
         let plan_engine_id = PLATFORM_DEFAULT_ENGINE_ID;
         // Before commit, the user switches to a different runtime.
-        insert_selected_runtime_profile(&state, "profile-podman-1").await?;
+        insert_preferred_runtime_profile(&state, "profile-podman-1").await?;
 
         let matches = revalidate_engine_still_selected(&state.db, plan_engine_id).await?;
 
@@ -1079,7 +1084,7 @@ mod tests {
     -> TestResult {
         let state = test_state(fresh_db("engines-revalidate-db-error").await?);
         let conn = state.db.connect()?;
-        conn.execute("DROP TABLE runtime_profiles", ()).await?;
+        conn.execute("DROP TABLE runtime_policy", ()).await?;
 
         let result = revalidate_engine_still_selected(&state.db, PLATFORM_DEFAULT_ENGINE_ID).await;
 

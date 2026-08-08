@@ -36,7 +36,7 @@ async fn insert_runtime_profile(
     db: &Database,
     id: &str,
     runtime_class: &str,
-    is_selected: bool,
+    is_preferred: bool,
 ) -> TestResult {
     let conn = db.connect()?;
     conn.execute(
@@ -44,18 +44,24 @@ async fn insert_runtime_profile(
             id, provider_id, provider_runtime_key, display_name, product, platform,
             runtime_class, ownership_state, source,
             installation_state, process_state, connection_state,
-            is_selected, observed_at_ms, created_at_ms, updated_at_ms
+            observed_at_ms, created_at_ms, updated_at_ms
         ) VALUES (?1, ?2, ?2, ?3, 'podman', 'windows', ?4, 'external', 'provider_discovery',
-            'installed', 'running', 'summarized', ?5, 1, 1, 1)",
+            'installed', 'running', 'summarized', 1, 1, 1)",
         params![
             id.to_owned(),
             format!("key-{id}"),
             format!("Runtime {id}"),
             runtime_class.to_owned(),
-            i64::from(is_selected),
         ],
     )
     .await?;
+    if is_preferred {
+        conn.execute(
+            "UPDATE runtime_policy SET preferred_profile_id = ?1 WHERE singleton = 1",
+            params![id.to_owned()],
+        )
+        .await?;
+    }
     Ok(())
 }
 

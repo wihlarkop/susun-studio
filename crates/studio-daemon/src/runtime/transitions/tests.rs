@@ -57,7 +57,6 @@ fn observed(key: &str, name: &str) -> ObservedProfile {
         process: dimension("running", None),
         connection: dimension("summarized", None),
         endpoint_summary: None,
-        provider_default: false,
         observed_at_ms: now_ms(),
     }
 }
@@ -71,12 +70,12 @@ async fn insert_built_in(db: &Database, id: &str) -> TestResult {
             (id, provider_id, provider_runtime_key, display_name, product, platform,
              runtime_class, ownership_state, source, owner_token,
              installation_state, process_state, connection_state,
-             availability_state, is_selected, observation_revision,
+             availability_state, observation_revision,
              observed_at_ms, created_at_ms, updated_at_ms)
          VALUES (?1, 'windows-podman', 'machine/susun-runtime-default', 'Built', 'podman', 'windows',
              'built_in', 'studio_managed', 'studio_setup', 'own_tok',
              'installed', 'running', 'summarized',
-             'available', 0, 0, 1, 1, 1)",
+             'available', 0, 1, 1, 1)",
         params![id.to_owned()],
     )
     .await?;

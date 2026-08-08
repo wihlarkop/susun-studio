@@ -55,7 +55,7 @@ pub async fn runtime_context(
             runtime_profile_id: Some(profile.id),
             runtime_class: Some(profile.runtime_class),
             display_name: Some(profile.display_name),
-            is_selected: Some(profile.is_selected),
+            is_selected: Some(profile.is_preferred),
         },
         None => RuntimeContextRow {
             runtime_profile_id: profile_id.map(str::to_owned),

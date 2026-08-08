@@ -92,7 +92,7 @@ impl RuntimeProvider for WindowsPodmanProvider {
         });
         let selected = profiles
             .iter()
-            .find(|profile| profile.is_selected && profile.provider_id == self.id());
+            .find(|profile| profile.is_preferred && profile.provider_id == self.id());
         let selected_managed = selected.is_some_and(|profile| {
             profile.runtime_class == "built_in" && profile.ownership_state == "studio_managed"
         });
@@ -416,7 +416,7 @@ impl WindowsPodmanProvider {
             }),
             "start" | "stop" | "restart" => {
                 let profile = profiles.iter().find(|profile| {
-                    profile.is_selected
+                    profile.is_preferred
                         && profile.provider_id == self.id()
                         && profile.runtime_class == "built_in"
                         && profile.ownership_state == "studio_managed"
@@ -558,7 +558,6 @@ impl WindowsPodmanProvider {
             process: dimension(process_state, process_detail),
             connection: dimension(connection_state, connection_detail),
             endpoint_summary: None,
-            provider_default: false,
             observed_at_ms: now_ms(),
         }
     }
@@ -630,7 +629,6 @@ impl WindowsPodmanProvider {
                 }),
             ),
             endpoint_summary,
-            provider_default: machine.default.unwrap_or(false),
             observed_at_ms,
         })
     }
@@ -892,7 +890,7 @@ mod resource_tests {
             last_seen_at_ms: Some(1),
             missing_since_ms: None,
             last_error: None,
-            is_selected: true,
+            is_preferred: true,
             observation_revision: 1,
             observed_at_ms: 1,
             management: ManagementCapabilities::derive("built_in", "studio_managed", "available"),
