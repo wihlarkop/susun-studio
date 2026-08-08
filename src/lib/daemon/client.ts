@@ -499,15 +499,7 @@ export type BuildProgressEntry = {
 
 export type StudioJob = {
   id: string;
-  kind:
-    | "up"
-    | "down"
-    | "build"
-    | "clean"
-    | "restart"
-    | "image_build"
-    | "image_pull"
-    | "image_push";
+  kind: "up" | "down" | "build" | "clean" | "restart" | "image_build" | "image_pull" | "image_push";
   status: JobStatus;
   project_id: string;
   runtime_profile_id: string | null;

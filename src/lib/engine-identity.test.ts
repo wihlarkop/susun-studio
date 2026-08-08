@@ -2,9 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { RuntimeBindingSummary } from "$lib/daemon/client";
 import { PLATFORM_DEFAULT_ENGINE_ID, resolveActiveEngineId } from "./engine-identity";
 
-function binding(
-  overrides: Partial<RuntimeBindingSummary> = {},
-): RuntimeBindingSummary {
+function binding(overrides: Partial<RuntimeBindingSummary> = {}): RuntimeBindingSummary {
   return {
     source: "global_preference",
     state: "ready",
