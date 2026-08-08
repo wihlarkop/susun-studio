@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use susun::EngineEndpoint;
 use turso::transaction::Transaction;
 use turso::{Connection, Database, params};
@@ -9,7 +9,7 @@ use super::{ManagementCapabilities, find_provider, now_ms};
 
 const MAX_PROJECT_SUMMARY_BATCH: usize = 100;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeBindingSource {
     ProjectPin,
@@ -57,6 +57,7 @@ pub enum SetPreferredOutcome {
 
 /// A request-local runtime decision. The endpoint is deliberately internal:
 /// routes and persisted reports consume the redacted summary or attribution.
+#[derive(Clone)]
 pub(crate) struct ResolvedRuntime {
     summary: RuntimeBindingSummary,
     endpoint: Option<EngineEndpoint>,
@@ -306,6 +307,26 @@ fn platform_default() -> ResolvedRuntime {
             profile_id: None,
             runtime_class: None,
             display_name: "Platform default runtime".to_owned(),
+        },
+        endpoint: None,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn resolved_runtime_for_test(attribution: RuntimeAttribution) -> ResolvedRuntime {
+    let state = match attribution.binding_source {
+        RuntimeBindingSource::PlatformDefault => RuntimeBindingState::Unconfigured,
+        RuntimeBindingSource::ProjectPin | RuntimeBindingSource::GlobalPreference => {
+            RuntimeBindingState::Ready
+        }
+    };
+    ResolvedRuntime {
+        summary: RuntimeBindingSummary {
+            source: attribution.binding_source,
+            state,
+            profile_id: attribution.runtime_profile_id,
+            runtime_class: attribution.runtime_class,
+            display_name: "Test runtime".to_owned(),
         },
         endpoint: None,
     }

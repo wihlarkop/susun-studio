@@ -12,6 +12,24 @@ pub struct ProjectSource {
     pub root: PathBuf,
 }
 
+/// Confirm a project exists without touching its persisted source metadata or
+/// filesystem. Runtime-backed routes use this before policy resolution so an
+/// unknown id is never treated as an unpinned platform-default project.
+pub async fn ensure_project_exists(state: &AppState, project_id: &str) -> Result<(), ApiError> {
+    let conn = state.db.connect()?;
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM projects WHERE id = ?1 LIMIT 1",
+            params![project_id.to_owned()],
+        )
+        .await?;
+    if rows.next().await?.is_some() {
+        Ok(())
+    } else {
+        Err(ApiError::ProjectNotFound)
+    }
+}
+
 pub async fn load_project_source(
     state: &AppState,
     project_id: &str,

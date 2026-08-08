@@ -305,16 +305,18 @@ async fn reserved_name_conflicts_cannot_be_adopted() -> TestResult {
         params![profile.id.clone()],
     )
     .await?;
-    assert!(matches!(
-        super::engine_endpoint_for(&db, Some("conflict-project"))
-            .await
-            ?,
-        super::EngineEndpointResolution::Unavailable { profile_id }
-            if profile_id == profile.id
-    ));
+    let resolved = super::policy::resolve_project(&db, "conflict-project").await?;
     assert_eq!(
-        super::attribution_for(&db, Some("conflict-project")).await?,
-        (Some(profile.id.clone()), Some("built_in".to_owned()))
+        resolved.summary().state,
+        super::RuntimeBindingState::Unavailable
+    );
+    assert_eq!(
+        resolved.summary().profile_id.as_deref(),
+        Some(profile.id.as_str())
+    );
+    assert_eq!(
+        resolved.attribution().runtime_class.as_deref(),
+        Some("built_in")
     );
 
     // A discovered reserved-name machine cannot manufacture ownership evidence.

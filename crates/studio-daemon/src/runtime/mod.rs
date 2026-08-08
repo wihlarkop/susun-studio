@@ -90,12 +90,6 @@ pub struct RuntimeLogLine {
     pub message: String,
 }
 
-pub(crate) enum EngineEndpointResolution {
-    Explicit(EngineEndpoint),
-    PlatformDefault,
-    Unavailable { profile_id: String },
-}
-
 /// Outcome of forgetting an external profile's Studio metadata.
 pub enum ForgetOutcome {
     Forgotten,
@@ -324,46 +318,6 @@ pub async fn adopt_profile(db: &Database, profile_id: &str) -> Result<AdoptOutco
     }
 
     Ok(AdoptOutcome::OwnershipUnproven)
-}
-
-/// The runtime profile Studio attributes a new job to: the project's own bound
-/// profile when it is still present, otherwise the globally selected profile.
-/// Returns `(profile_id, runtime_class)` so job records keep attribution even
-/// after the profile later disappears.
-pub async fn attribution_for(
-    db: &Database,
-    project_id: Option<&str>,
-) -> Result<(Option<String>, Option<String>), turso::Error> {
-    let resolved = match project_id {
-        Some(project_id) => policy::resolve_project(db, project_id).await?,
-        None => policy::resolve_global(db).await?,
-    };
-    let attribution = resolved.attribution();
-    Ok((attribution.runtime_profile_id, attribution.runtime_class))
-}
-
-/// Engine endpoint for a specific project: the project's own binding wins
-/// (when the bound profile still exists, is present, and is connectable), then
-/// the globally selected profile, then `None` (platform default).
-pub(crate) async fn engine_endpoint_for(
-    db: &Database,
-    project_id: Option<&str>,
-) -> Result<EngineEndpointResolution, turso::Error> {
-    let resolved = match project_id {
-        Some(project_id) => policy::resolve_project(db, project_id).await?,
-        None => policy::resolve_global(db).await?,
-    };
-    if let Some(endpoint) = resolved.endpoint().cloned() {
-        return Ok(EngineEndpointResolution::Explicit(endpoint));
-    }
-    match resolved.summary().source {
-        RuntimeBindingSource::PlatformDefault => Ok(EngineEndpointResolution::PlatformDefault),
-        RuntimeBindingSource::ProjectPin | RuntimeBindingSource::GlobalPreference => {
-            Ok(EngineEndpointResolution::Unavailable {
-                profile_id: resolved.summary().profile_id.clone().unwrap_or_default(),
-            })
-        }
-    }
 }
 
 /// Resolve one explicit profile without consulting project or global policy.

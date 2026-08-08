@@ -31,7 +31,10 @@ use crate::{
     },
     routes::{
         artifacts::{ArtifactRuntimeContext, image_fingerprint},
-        engines::{ResolvedEngine, resolve_and_validate_engine, revalidate_engine_still_selected},
+        engines::{
+            ResolvedEngine, connect_resolved_engine, resolve_and_validate_engine,
+            revalidate_engine_still_selected,
+        },
         jobs::JobResponse,
     },
     runtime,
@@ -41,6 +44,14 @@ use crate::{
 
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_IMAGE_REFERENCE_BYTES: usize = 1_024;
+
+fn runtime_binding_source_value(source: runtime::RuntimeBindingSource) -> &'static str {
+    match source {
+        runtime::RuntimeBindingSource::ProjectPin => "project_pin",
+        runtime::RuntimeBindingSource::GlobalPreference => "global_preference",
+        runtime::RuntimeBindingSource::PlatformDefault => "platform_default",
+    }
+}
 
 #[derive(Deserialize)]
 pub struct ImagePullRequest {
@@ -75,12 +86,7 @@ pub async fn start_image_pull(
         RegistryIdentity::from_image_ref(&image).map_err(|_| ApiError::InvalidImageReference)?;
     let credential = resolve_credential(&state, request.credential_id, &registry).await?;
 
-    let engine = susun_integration::connect_engine_for_profile(
-        &state.db,
-        resolved.runtime_profile_id.as_deref(),
-    )
-    .await
-    .map_err(ApiError::EngineUnavailable)?;
+    let engine = connect_resolved_engine(&resolved).await?.engine;
     let capabilities = engine
         .capabilities()
         .await
@@ -110,7 +116,7 @@ pub async fn start_image_pull(
     )
     .await?;
     let cancel_notify = state.transfer_jobs.register(job_id.clone());
-    let response = queued_pull_response(job_id.clone(), now);
+    let response = queued_pull_response(job_id.clone(), now, &resolved);
 
     let worker_state = state.clone();
     tokio::spawn(async move {
@@ -181,14 +187,15 @@ async fn insert_pull_job(
     conn.execute(
         "INSERT INTO jobs (
             id, kind, status, project_id, engine_id, request_json,
-            runtime_profile_id, runtime_class, created_at_ms, updated_at_ms
-         ) VALUES (?1, 'image_pull', 'queued', '', ?2, ?3, ?4, ?5, ?6, ?6)",
+            runtime_profile_id, runtime_class, runtime_binding_source, created_at_ms, updated_at_ms
+         ) VALUES (?1, 'image_pull', 'queued', '', ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
         params![
             job_id.to_owned(),
             resolved.engine_id.clone(),
             request_json,
             resolved.runtime_profile_id.clone(),
             resolved.runtime_class.clone(),
+            runtime_binding_source_value(resolved.runtime_binding_source),
             now,
         ],
     )
@@ -196,12 +203,15 @@ async fn insert_pull_job(
     Ok(())
 }
 
-fn queued_pull_response(job_id: String, now: i64) -> JobResponse {
+fn queued_pull_response(job_id: String, now: i64, resolved: &ResolvedEngine) -> JobResponse {
     JobResponse {
         id: job_id,
         kind: "image_pull".to_owned(),
         status: "queued".to_owned(),
         project_id: String::new(),
+        runtime_profile_id: resolved.runtime_profile_id.clone(),
+        runtime_class: resolved.runtime_class.clone(),
+        runtime_binding_source: Some(resolved.runtime_binding_source),
         service_name: None,
         actions: Vec::new(),
         result: None,
@@ -323,12 +333,14 @@ async fn execute_pull(
     {
         return Err(PullWorkerError::RuntimeChanged);
     }
-    let engine = susun_integration::connect_engine_for_profile(
-        &state.db,
-        resolved.runtime_profile_id.as_deref(),
-    )
-    .await
-    .map_err(|_| PullWorkerError::EngineUnavailable)?;
+    // The worker revalidates the selected identity above, then connects from
+    // this exact resolution. Re-reading a profile id here would leave a
+    // second policy lookup between the durable job's attribution and its
+    // provider call.
+    let engine = connect_resolved_engine(&resolved)
+        .await
+        .map_err(|_| PullWorkerError::EngineUnavailable)?
+        .engine;
     let progress = make_transfer_progress_sink(state.db.clone(), job_id);
     let mut request =
         susun::PullImageRequest::new(susun::ImageRef::new(image), susun::PullPolicy::Always);
@@ -621,11 +633,12 @@ mod pull_tests {
     async fn job_payload_contains_only_opaque_credential_metadata() -> TestResult {
         let state = test_state(fresh_db("pull-secret-free-job").await?);
         let credential = insert_credential(&state, "registry.example").await?;
-        let resolved = ResolvedEngine {
-            engine_id: "profile-1".to_owned(),
-            runtime_profile_id: Some("profile-1".to_owned()),
-            runtime_class: Some("external_local".to_owned()),
-        };
+        let resolved = crate::routes::engines::resolved_engine_for_test(
+            "profile-1",
+            Some("profile-1"),
+            Some("external_local"),
+            runtime::RuntimeBindingSource::GlobalPreference,
+        );
         insert_pull_job(
             &state,
             "job-1",
@@ -663,11 +676,12 @@ mod pull_tests {
             (),
         )
         .await?;
-        let resolved = ResolvedEngine {
-            engine_id: "engine-docker-local".to_owned(),
-            runtime_profile_id: None,
-            runtime_class: None,
-        };
+        let resolved = crate::routes::engines::resolved_engine_for_test(
+            "engine-docker-local",
+            None,
+            None,
+            runtime::RuntimeBindingSource::PlatformDefault,
+        );
         finish_pull_job(
             &db,
             "job-1",
@@ -751,16 +765,8 @@ pub async fn preview_image_push(
     let registry = RegistryIdentity::from_image_ref(&destination)
         .map_err(|_| ApiError::InvalidImageReference)?;
     let credential = resolve_credential(&state, request.credential_id, &registry).await?;
-    let engine = susun_integration::connect_engine_for_profile(
-        &state.db,
-        resolved.runtime_profile_id.as_deref(),
-    )
-    .await
-    .map_err(ApiError::EngineUnavailable)?;
-    let runtime_ctx =
-        artifact_inventory::runtime_context(&state.db, resolved.runtime_profile_id.as_deref())
-            .await?
-            .into();
+    let runtime_ctx = ArtifactRuntimeContext::from(&resolved);
+    let engine = connect_resolved_engine(&resolved).await?.engine;
     let capabilities = engine
         .capabilities()
         .await
@@ -939,7 +945,7 @@ pub async fn commit_image_push(
         },
     )
     .await;
-    let response = queued_transfer_response(&job_id, "image_push", now);
+    let response = queued_transfer_response(&job_id, "image_push", now, &resolved);
     let worker_state = state.clone();
     tokio::spawn(async move {
         run_image_push(
@@ -1094,14 +1100,15 @@ async fn insert_push_job(
     conn.execute(
         "INSERT INTO jobs (
             id, kind, status, project_id, engine_id, request_json,
-            runtime_profile_id, runtime_class, created_at_ms, updated_at_ms
-         ) VALUES (?1, 'image_push', 'queued', '', ?2, ?3, ?4, ?5, ?6, ?6)",
+            runtime_profile_id, runtime_class, runtime_binding_source, created_at_ms, updated_at_ms
+         ) VALUES (?1, 'image_push', 'queued', '', ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
         params![
             job_id.to_owned(),
             resolved.engine_id.clone(),
             request_json,
             resolved.runtime_profile_id.clone(),
             resolved.runtime_class.clone(),
+            runtime_binding_source_value(resolved.runtime_binding_source),
             now,
         ],
     )
@@ -1109,12 +1116,20 @@ async fn insert_push_job(
     Ok(())
 }
 
-fn queued_transfer_response(job_id: &str, kind: &str, now: i64) -> JobResponse {
+fn queued_transfer_response(
+    job_id: &str,
+    kind: &str,
+    now: i64,
+    resolved: &ResolvedEngine,
+) -> JobResponse {
     JobResponse {
         id: job_id.to_owned(),
         kind: kind.to_owned(),
         status: "queued".to_owned(),
         project_id: String::new(),
+        runtime_profile_id: resolved.runtime_profile_id.clone(),
+        runtime_class: resolved.runtime_class.clone(),
+        runtime_binding_source: Some(resolved.runtime_binding_source),
         service_name: None,
         actions: Vec::new(),
         result: None,
@@ -1236,12 +1251,12 @@ async fn execute_push(
     {
         return Err(PushWorkerError::RuntimeChanged);
     }
-    let engine = susun_integration::connect_engine_for_profile(
-        &state.db,
-        resolved.runtime_profile_id.as_deref(),
-    )
-    .await
-    .map_err(|_| PushWorkerError::EngineUnavailable)?;
+    // See `execute_pull`: the revalidated resolution owns both the provider
+    // connection and the durable job attribution.
+    let engine = connect_resolved_engine(&resolved)
+        .await
+        .map_err(|_| PushWorkerError::EngineUnavailable)?
+        .engine;
     let progress = make_transfer_progress_sink(state.db.clone(), job_id);
     let mut request = susun::ImagePushRequest::new(susun::ImageRef::new(destination));
     let result = match credential {
@@ -1448,11 +1463,12 @@ mod push_tests {
             updated_at_ms: 1,
             last_success_at_ms: None,
         };
-        let resolved = ResolvedEngine {
-            engine_id: "profile-1".to_owned(),
-            runtime_profile_id: Some("profile-1".to_owned()),
-            runtime_class: Some("external_local".to_owned()),
-        };
+        let resolved = crate::routes::engines::resolved_engine_for_test(
+            "profile-1",
+            Some("profile-1"),
+            Some("external_local"),
+            runtime::RuntimeBindingSource::GlobalPreference,
+        );
         insert_push_job(
             &state,
             "job-1",
@@ -1491,11 +1507,12 @@ mod push_tests {
             (),
         )
         .await?;
-        let resolved = ResolvedEngine {
-            engine_id: "engine-docker-local".to_owned(),
-            runtime_profile_id: None,
-            runtime_class: None,
-        };
+        let resolved = crate::routes::engines::resolved_engine_for_test(
+            "engine-docker-local",
+            None,
+            None,
+            runtime::RuntimeBindingSource::PlatformDefault,
+        );
         finish_push_job(
             &db,
             "job-1",

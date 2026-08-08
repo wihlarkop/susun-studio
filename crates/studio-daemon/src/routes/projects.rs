@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -64,6 +65,19 @@ impl ProjectRecord {
     }
 }
 
+/// Policy hydration is a total operation for the requested project ids. If a
+/// future query change breaks that invariant, fail as a daemon fault instead
+/// of panicking or substituting another runtime binding.
+fn require_runtime_binding(
+    bindings: &HashMap<String, runtime::RuntimeBindingSummary>,
+    project_id: &str,
+) -> Result<runtime::RuntimeBindingSummary, ApiError> {
+    bindings
+        .get(project_id)
+        .cloned()
+        .ok_or(ApiError::RuntimePolicyIncomplete)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateProjectRequest {
     pub name: String,
@@ -96,16 +110,14 @@ pub async fn list_projects(
         .iter()
         .map(|project| project.id.clone())
         .collect::<Vec<_>>();
-    let mut bindings = runtime::policy::summarize_projects(&state.db, &project_ids).await?;
+    let bindings = runtime::policy::summarize_projects(&state.db, &project_ids).await?;
     let projects = project_records
         .into_iter()
         .map(|project| {
-            let runtime_binding = bindings
-                .remove(&project.id)
-                .expect("runtime policy returns a binding for every requested project");
-            project.into_response(runtime_binding)
+            let runtime_binding = require_runtime_binding(&bindings, &project.id)?;
+            Ok(project.into_response(runtime_binding))
         })
-        .collect();
+        .collect::<Result<Vec<_>, ApiError>>()?;
 
     Ok(Json(ProjectListResponse { projects }))
 }
@@ -362,11 +374,9 @@ async fn read_project_response(
     };
     drop(rows);
 
-    let bindings = runtime::policy::summarize_projects(db, &[project.id.clone()]).await?;
-    let runtime_binding = bindings
-        .get(&project.id)
-        .cloned()
-        .expect("runtime policy returns a binding for every requested project");
+    let bindings =
+        runtime::policy::summarize_projects(db, std::slice::from_ref(&project.id)).await?;
+    let runtime_binding = require_runtime_binding(&bindings, &project.id)?;
     Ok(Some(project.into_response(runtime_binding)))
 }
 
@@ -516,6 +526,15 @@ mod tests {
             .iter()
             .find(|project| project.id == id)
             .ok_or_else(|| std::io::Error::other(format!("missing project {id}")).into())
+    }
+
+    #[test]
+    fn incomplete_policy_hydration_is_a_typed_daemon_fault() {
+        let bindings = std::collections::HashMap::new();
+
+        let result = require_runtime_binding(&bindings, "project-1");
+
+        assert!(matches!(result, Err(ApiError::RuntimePolicyIncomplete)));
     }
 
     #[tokio::test]

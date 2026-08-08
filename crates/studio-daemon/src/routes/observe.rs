@@ -10,7 +10,11 @@ use susun::ContainerEngine;
 use tokio_stream::Stream;
 
 use crate::{
-    auth::authorize, error::ApiError, project_source::load_project_source, state::AppState,
+    auth::authorize,
+    error::ApiError,
+    project_source::{ensure_project_exists, load_project_source},
+    runtime,
+    state::AppState,
     susun_integration,
 };
 
@@ -34,6 +38,7 @@ pub struct SnapshotResource {
 #[derive(Debug, Serialize)]
 pub struct SnapshotResponse {
     pub observed_at_ms: i64,
+    pub runtime: runtime::RuntimeAttribution,
     pub containers: Vec<SnapshotContainer>,
     pub networks: Vec<SnapshotResource>,
     pub volumes: Vec<SnapshotResource>,
@@ -45,10 +50,13 @@ pub async fn project_snapshot(
     Path(project_id): Path<String>,
 ) -> Result<Json<SnapshotResponse>, ApiError> {
     authorize(&state, &headers)?;
-    let source = load_project_source(&state, &project_id).await?;
-    let engine = susun_integration::connect_engine(&state.db, Some(&project_id))
+    ensure_project_exists(&state, &project_id).await?;
+    let connected = susun_integration::resolve_and_connect_project(&state.db, &project_id)
         .await
         .map_err(ApiError::EngineUnavailable)?;
+    let runtime = connected.attribution;
+    let engine = connected.engine;
+    let source = load_project_source(&state, &project_id).await?;
     let context = susun_integration::runtime_context(
         &source.files,
         source.env_file.as_ref(),
@@ -62,6 +70,7 @@ pub async fn project_snapshot(
 
     Ok(Json(SnapshotResponse {
         observed_at_ms: row.observed_at_ms,
+        runtime,
         containers: row
             .containers
             .into_iter()
@@ -151,10 +160,12 @@ pub async fn stream_logs(
             tail: None,
         });
 
-    let source = load_project_source(&state, &project_id).await?;
-    let engine = susun_integration::connect_engine(&state.db, Some(&project_id))
+    ensure_project_exists(&state, &project_id).await?;
+    let connected = susun_integration::resolve_and_connect_project(&state.db, &project_id)
         .await
         .map_err(ApiError::EngineUnavailable)?;
+    let engine = connected.engine;
+    let source = load_project_source(&state, &project_id).await?;
     let context = susun_integration::runtime_context(
         &source.files,
         source.env_file.as_ref(),
@@ -238,10 +249,12 @@ pub async fn stream_events(
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
     consume_ticket(&state, &query, &format!("events:{project_id}"))?;
 
-    let source = load_project_source(&state, &project_id).await?;
-    let engine = susun_integration::connect_engine(&state.db, Some(&project_id))
+    ensure_project_exists(&state, &project_id).await?;
+    let connected = susun_integration::resolve_and_connect_project(&state.db, &project_id)
         .await
         .map_err(ApiError::EngineUnavailable)?;
+    let engine = connected.engine;
+    let source = load_project_source(&state, &project_id).await?;
     let context = susun_integration::runtime_context(
         &source.files,
         source.env_file.as_ref(),

@@ -243,6 +243,13 @@ export type RuntimePreference = {
   binding: RuntimeBindingSummary;
 };
 
+/** Redacted runtime provenance persisted with work and immediate responses. */
+export type RuntimeAttribution = {
+  runtime_profile_id: string | null;
+  runtime_class: RuntimeClass | null;
+  binding_source: RuntimeBindingSource;
+};
+
 export type RuntimeManagementCapabilities = {
   can_select: boolean;
   can_forget: boolean;
@@ -492,9 +499,20 @@ export type BuildProgressEntry = {
 
 export type StudioJob = {
   id: string;
-  kind: "up" | "down" | "build" | "clean" | "image_build" | "image_pull" | "image_push";
+  kind:
+    | "up"
+    | "down"
+    | "build"
+    | "clean"
+    | "restart"
+    | "image_build"
+    | "image_pull"
+    | "image_push";
   status: JobStatus;
   project_id: string;
+  runtime_profile_id: string | null;
+  runtime_class: string | null;
+  runtime_binding_source: RuntimeBindingSource | null;
   /** The build-declared service this job targets — only ever set for
    * `kind: "image_build"`. */
   service_name: string | null;
@@ -532,6 +550,7 @@ export type SnapshotResource = {
 
 export type ProjectSnapshot = {
   observed_at_ms: number;
+  runtime: RuntimeAttribution;
   containers: SnapshotContainer[];
   networks: SnapshotResource[];
   volumes: SnapshotResource[];
@@ -540,6 +559,7 @@ export type ProjectSnapshot = {
 export type ServiceActionResult = {
   service: string;
   containers: { id: string; state: string }[];
+  runtime: RuntimeAttribution;
 };
 
 export type PortBinding = {
@@ -1123,8 +1143,8 @@ export async function commitEnginePrune(
 export type ArtifactRuntimeContext = {
   runtime_profile_id: string | null;
   runtime_class: string | null;
-  display_name: string | null;
-  is_selected: boolean | null;
+  binding_source: RuntimeBindingSource;
+  display_name: string;
 };
 
 export type ContainerArtifactSummary = {

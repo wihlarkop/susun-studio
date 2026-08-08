@@ -24,48 +24,6 @@ pub enum ArtifactError {
     Database(#[from] turso::Error),
 }
 
-/// Studio-owned selected-runtime attribution attached to every engine-wide
-/// artifact response, so built-in and external runtimes stay distinguishable
-/// and external runtimes are never presented as Studio-owned.
-pub struct RuntimeContextRow {
-    pub runtime_profile_id: Option<String>,
-    pub runtime_class: Option<String>,
-    pub display_name: Option<String>,
-    pub is_selected: Option<bool>,
-}
-
-/// Resolves display-safe runtime attribution for the given profile. `None`
-/// means the platform default engine (no profile selected or bound). A
-/// database fault propagates as `Err` rather than silently collapsing into
-/// "no attribution" — the two must stay distinguishable, since the latter is
-/// a normal state but the former is a daemon fault worth surfacing as one.
-pub async fn runtime_context(
-    db: &Database,
-    profile_id: Option<&str>,
-) -> Result<RuntimeContextRow, ArtifactError> {
-    let profile = match profile_id {
-        Some(id) => crate::runtime::list_all_profiles(db)
-            .await?
-            .into_iter()
-            .find(|profile| profile.id == id),
-        None => None,
-    };
-    Ok(match profile {
-        Some(profile) => RuntimeContextRow {
-            runtime_profile_id: Some(profile.id),
-            runtime_class: Some(profile.runtime_class),
-            display_name: Some(profile.display_name),
-            is_selected: Some(profile.is_preferred),
-        },
-        None => RuntimeContextRow {
-            runtime_profile_id: profile_id.map(str::to_owned),
-            runtime_class: None,
-            display_name: None,
-            is_selected: None,
-        },
-    })
-}
-
 /// One Studio project's derived project identity, used only to associate
 /// engine-wide containers with a known project. Never exposed on the wire.
 struct KnownProjectRow {

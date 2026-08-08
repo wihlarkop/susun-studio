@@ -32,39 +32,6 @@ async fn insert_project(db: &Database, id: &str, name: &str, path: &str) -> Test
     Ok(())
 }
 
-async fn insert_runtime_profile(
-    db: &Database,
-    id: &str,
-    runtime_class: &str,
-    is_preferred: bool,
-) -> TestResult {
-    let conn = db.connect()?;
-    conn.execute(
-        "INSERT INTO runtime_profiles (
-            id, provider_id, provider_runtime_key, display_name, product, platform,
-            runtime_class, ownership_state, source,
-            installation_state, process_state, connection_state,
-            observed_at_ms, created_at_ms, updated_at_ms
-        ) VALUES (?1, ?2, ?2, ?3, 'podman', 'windows', ?4, 'external', 'provider_discovery',
-            'installed', 'running', 'summarized', 1, 1, 1)",
-        params![
-            id.to_owned(),
-            format!("key-{id}"),
-            format!("Runtime {id}"),
-            runtime_class.to_owned(),
-        ],
-    )
-    .await?;
-    if is_preferred {
-        conn.execute(
-            "UPDATE runtime_policy SET preferred_profile_id = ?1 WHERE singleton = 1",
-            params![id.to_owned()],
-        )
-        .await?;
-    }
-    Ok(())
-}
-
 fn sample_container(
     id: &str,
     name: &str,
@@ -155,63 +122,5 @@ fn image_summary_row_excludes_label_values_and_carries_display_safe_fields() -> 
     assert!(row.label_keys.is_empty());
     assert_eq!(row.size_bytes, Some(4096));
     assert_eq!(row.container_count, Some(2));
-    Ok(())
-}
-
-#[tokio::test]
-async fn runtime_context_passes_through_built_in_classification_unchanged() -> TestResult {
-    let db = fresh_db().await?;
-    insert_runtime_profile(&db, "profile-built-in", "built_in", true).await?;
-
-    let context = runtime_context(&db, Some("profile-built-in")).await?;
-
-    assert_eq!(
-        context.runtime_profile_id.as_deref(),
-        Some("profile-built-in")
-    );
-    assert_eq!(context.runtime_class.as_deref(), Some("built_in"));
-    assert_eq!(context.is_selected, Some(true));
-    Ok(())
-}
-
-/// External runtimes must never be presented as Studio-owned: the response
-/// carries whatever classification Studio's own ownership model assigned,
-/// never a fabricated "built_in".
-#[tokio::test]
-async fn runtime_context_never_upgrades_an_external_profile_to_built_in() -> TestResult {
-    let db = fresh_db().await?;
-    insert_runtime_profile(&db, "profile-external", "external_local", false).await?;
-
-    let context = runtime_context(&db, Some("profile-external")).await?;
-
-    assert_eq!(context.runtime_class.as_deref(), Some("external_local"));
-    assert_ne!(context.runtime_class.as_deref(), Some("built_in"));
-    Ok(())
-}
-
-#[tokio::test]
-async fn runtime_context_reports_platform_default_when_no_profile_selected() -> TestResult {
-    let db = fresh_db().await?;
-
-    let context = runtime_context(&db, None).await?;
-
-    assert_eq!(context.runtime_profile_id, None);
-    assert_eq!(context.runtime_class, None);
-    assert_eq!(context.display_name, None);
-    Ok(())
-}
-
-/// A database fault must never look identical to "no such profile" — the
-/// caller needs to tell a daemon fault apart from a normal missing-profile
-/// state.
-#[tokio::test]
-async fn runtime_context_propagates_database_errors_instead_of_hiding_them() -> TestResult {
-    let db = fresh_db().await?;
-    let conn = db.connect()?;
-    conn.execute("DROP TABLE runtime_profiles", ()).await?;
-
-    let result = runtime_context(&db, Some("profile-1")).await;
-
-    assert!(result.is_err());
     Ok(())
 }

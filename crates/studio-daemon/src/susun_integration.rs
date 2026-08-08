@@ -241,20 +241,36 @@ pub struct EngineCapabilitiesRow {
     pub max_container_name_length: Option<usize>,
 }
 
-/// Constructs a Docker-compatible client handle. A configured project/global
-/// profile never silently falls back when unavailable; platform local defaults
-/// are used only when the user has not selected or bound a runtime.
-pub async fn connect_engine(
-    db: &Database,
-    project_id: Option<&str>,
-) -> Result<BollardEngine, String> {
-    let endpoint = match runtime::engine_endpoint_for(db, project_id)
-        .await
-        .map_err(|error| error.to_string())?
-    {
-        runtime::EngineEndpointResolution::Explicit(endpoint) => endpoint,
-        runtime::EngineEndpointResolution::PlatformDefault => EngineEndpoint::Local,
-        runtime::EngineEndpointResolution::Unavailable { profile_id } => {
+/// One connected engine paired with the attribution derived from exactly the
+/// same policy resolution. It is internal-only so endpoint data cannot leak
+/// through daemon DTOs.
+pub struct ConnectedRuntime {
+    pub engine: BollardEngine,
+    pub attribution: runtime::RuntimeAttribution,
+}
+
+/// Connect a runtime decision which the caller has already resolved. A
+/// configured global preference or project pin never falls back; only the
+/// explicit `platform_default` policy state may use the local endpoint.
+pub async fn connect_resolved_runtime(
+    resolved: runtime::policy::ResolvedRuntime,
+) -> Result<ConnectedRuntime, String> {
+    let attribution = resolved.attribution();
+    let endpoint = match resolved.endpoint().cloned() {
+        Some(endpoint) => endpoint,
+        None if matches!(
+            resolved.summary().source,
+            runtime::RuntimeBindingSource::PlatformDefault
+        ) =>
+        {
+            EngineEndpoint::Local
+        }
+        None => {
+            let profile_id = resolved
+                .summary()
+                .profile_id
+                .as_deref()
+                .unwrap_or("configured runtime");
             return Err(format!(
                 "runtime profile `{profile_id}` is unavailable; Studio will not switch engines automatically"
             ));
@@ -263,7 +279,24 @@ pub async fn connect_engine(
     // Fail closed on any endpoint Studio is not allowed to reach (e.g. a
     // remote/TCP endpoint): built-in engine access stays OS-scoped and local.
     runtime::validate_engine_endpoint(&endpoint).map_err(|error| error.to_string())?;
-    BollardEngine::connect_to(endpoint).map_err(|error| error.to_string())
+    let engine = BollardEngine::connect_to(endpoint).map_err(|error| error.to_string())?;
+    Ok(ConnectedRuntime {
+        engine,
+        attribution,
+    })
+}
+
+/// Resolve and connect one project's runtime in a single flow. New callers
+/// should keep the returned attribution with their work rather than resolving
+/// again for a response, audit record, or durable job row.
+pub async fn resolve_and_connect_project(
+    db: &Database,
+    project_id: &str,
+) -> Result<ConnectedRuntime, String> {
+    let resolved = runtime::policy::resolve_project(db, project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    connect_resolved_runtime(resolved).await
 }
 
 /// Connect to one exact runtime profile. Unlike `connect_engine`, this never
