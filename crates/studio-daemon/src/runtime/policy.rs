@@ -131,14 +131,9 @@ pub async fn set_preferred(
     preferred_profile_id: Option<&str>,
 ) -> Result<SetPreferredOutcome, turso::Error> {
     if let Some(profile_id) = preferred_profile_id {
-        let Some(profile) = load_profile(db, profile_id).await? else {
-            return Ok(SetPreferredOutcome::NotFound);
-        };
-        if profile.ownership_state == "ownership_conflict"
-            || !profile.is_ready()
-            || profile.endpoint().is_none()
-        {
-            return Ok(SetPreferredOutcome::Unavailable);
+        let outcome = validate_profile_for_binding(db, profile_id).await?;
+        if outcome != SetPreferredOutcome::Updated {
+            return Ok(outcome);
         }
     }
 
@@ -149,6 +144,26 @@ pub async fn set_preferred(
         params![preferred_profile_id.map(str::to_owned), now_ms()],
     )
     .await?;
+    Ok(SetPreferredOutcome::Updated)
+}
+
+/// Validate a user-selected profile before it becomes either a global
+/// preference or a project pin. Missing, unavailable, and
+/// ownership-conflicted profiles are rejected; callers must never substitute
+/// another runtime on their behalf.
+pub async fn validate_profile_for_binding(
+    db: &Database,
+    profile_id: &str,
+) -> Result<SetPreferredOutcome, turso::Error> {
+    let Some(profile) = load_profile(db, profile_id).await? else {
+        return Ok(SetPreferredOutcome::NotFound);
+    };
+    if profile.ownership_state == "ownership_conflict"
+        || !profile.is_ready()
+        || profile.endpoint().is_none()
+    {
+        return Ok(SetPreferredOutcome::Unavailable);
+    }
     Ok(SetPreferredOutcome::Updated)
 }
 

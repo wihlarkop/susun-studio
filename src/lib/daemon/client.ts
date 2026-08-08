@@ -101,6 +101,7 @@ export type StudioProject = {
   summary: StudioProjectSummary | null;
   diagnostics: DiagnosticsPayload | null;
   runtime_profile_id: string | null;
+  runtime_binding: RuntimeBindingSummary;
 };
 
 export type StudioSettings = {
@@ -1016,7 +1017,7 @@ export async function setProjectEngine(
   projectId: string,
   runtimeProfileId: string | null,
   options: DaemonRequestOptions = {},
-): Promise<{ updated: boolean }> {
+): Promise<StudioProject> {
   return readJson(`/v1/projects/${encodeURIComponent(projectId)}/engine`, {
     ...options,
     method: "PUT",

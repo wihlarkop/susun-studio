@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use susun::ProjectSummary;
 use turso::params;
 
-use crate::{auth::authorize, error::ApiError, logging, state::AppState, susun_integration};
+use crate::{
+    auth::authorize, error::ApiError, logging, runtime, state::AppState, susun_integration,
+};
 
 #[derive(Debug, Serialize)]
 pub struct ProjectListResponse {
@@ -30,6 +32,36 @@ pub struct ProjectResponse {
     pub summary: Option<ProjectSummary>,
     pub diagnostics: Option<serde_json::Value>,
     pub runtime_profile_id: Option<String>,
+    pub runtime_binding: runtime::RuntimeBindingSummary,
+}
+
+struct ProjectRecord {
+    id: String,
+    name: String,
+    path: String,
+    created_at_ms: i64,
+    last_analyzed_at_ms: Option<i64>,
+    has_errors: Option<bool>,
+    summary: Option<ProjectSummary>,
+    diagnostics: Option<serde_json::Value>,
+    runtime_profile_id: Option<String>,
+}
+
+impl ProjectRecord {
+    fn into_response(self, runtime_binding: runtime::RuntimeBindingSummary) -> ProjectResponse {
+        ProjectResponse {
+            id: self.id,
+            name: self.name,
+            path: self.path,
+            created_at_ms: self.created_at_ms,
+            last_analyzed_at_ms: self.last_analyzed_at_ms,
+            has_errors: self.has_errors,
+            summary: self.summary,
+            diagnostics: self.diagnostics,
+            runtime_profile_id: self.runtime_profile_id,
+            runtime_binding,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,30 +85,27 @@ pub async fn list_projects(
             (),
         )
         .await?;
-    let mut projects = Vec::new();
+    let mut project_records = Vec::new();
 
     while let Some(row) = rows.next().await? {
-        let has_errors: Option<i64> = row.get(5)?;
-        let summary_json: Option<String> = row.get(6)?;
-        let diagnostics_json: Option<String> = row.get(7)?;
-        let runtime_profile_id: Option<String> = row.get(8)?;
-
-        projects.push(ProjectResponse {
-            id: row.get(0)?,
-            name: row.get(1)?,
-            path: row.get(2)?,
-            created_at_ms: row.get(3)?,
-            last_analyzed_at_ms: row.get(4)?,
-            has_errors: has_errors.map(|value| value != 0),
-            summary: summary_json
-                .as_deref()
-                .and_then(|json| serde_json::from_str(json).ok()),
-            diagnostics: diagnostics_json
-                .as_deref()
-                .and_then(|json| serde_json::from_str(json).ok()),
-            runtime_profile_id,
-        });
+        project_records.push(project_record_from_row(&row)?);
     }
+
+    drop(rows);
+    let project_ids = project_records
+        .iter()
+        .map(|project| project.id.clone())
+        .collect::<Vec<_>>();
+    let mut bindings = runtime::policy::summarize_projects(&state.db, &project_ids).await?;
+    let projects = project_records
+        .into_iter()
+        .map(|project| {
+            let runtime_binding = bindings
+                .remove(&project.id)
+                .expect("runtime policy returns a binding for every requested project");
+            project.into_response(runtime_binding)
+        })
+        .collect();
 
     Ok(Json(ProjectListResponse { projects }))
 }
@@ -99,38 +128,30 @@ pub async fn create_project(
     }
 
     let created_at_ms = now_ms()?;
-    let project = ProjectResponse {
-        id: format!("project-{created_at_ms}"),
-        name: name.to_owned(),
-        path: path.to_owned(),
-        created_at_ms,
-        last_analyzed_at_ms: None,
-        has_errors: None,
-        summary: None,
-        diagnostics: None,
-        runtime_profile_id: None,
-    };
+    let project_id = format!("project-{created_at_ms}");
+    let project_name = name.to_owned();
+    let project_path = path.to_owned();
 
     let conn = state.db.connect()?;
     conn.execute(
         "INSERT INTO projects (id, name, path, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
         params![
-            project.id.clone(),
-            project.name.clone(),
-            project.path.clone(),
-            project.created_at_ms
+            project_id.clone(),
+            project_name.clone(),
+            project_path.clone(),
+            created_at_ms
         ],
     )
     .await?;
 
     logging::info(
         "project_created",
-        &[
-            ("project_id", project.id.clone()),
-            ("name", project.name.clone()),
-        ],
+        &[("project_id", project_id.clone()), ("name", project_name)],
     );
 
+    let project = read_project_response(&state.db, &project_id)
+        .await?
+        .ok_or(ApiError::ProjectNotFound)?;
     Ok((StatusCode::CREATED, Json(project)))
 }
 
@@ -281,32 +302,14 @@ pub async fn import_project(
         ],
     );
 
-    let mut created_rows = conn
-        .query(
-            "SELECT created_at_ms, runtime_profile_id FROM projects WHERE id = ?1 LIMIT 1",
-            params![source_id.clone()],
-        )
-        .await?;
-    let (created_at_ms, stored_runtime_profile_id): (i64, Option<String>) =
-        match created_rows.next().await? {
-            Some(row) => (row.get(0)?, row.get(1)?),
-            None => (now, request.runtime_profile_id.clone()),
-        };
+    let project = read_project_response(&state.db, &source_id)
+        .await?
+        .ok_or(ApiError::ProjectNotFound)?;
 
     Ok((
         StatusCode::CREATED,
         Json(ImportProjectResponse {
-            project: Some(ProjectResponse {
-                id: source_id,
-                name: display_name,
-                path: project_directory,
-                created_at_ms,
-                last_analyzed_at_ms: Some(now),
-                has_errors: Some(analyzed.has_errors),
-                summary: Some(analyzed.summary.clone()),
-                diagnostics: Some(analyzed.diagnostics.clone()),
-                runtime_profile_id: stored_runtime_profile_id,
-            }),
+            project: Some(project),
             summary: Some(analyzed.summary),
             diagnostics: analyzed.diagnostics,
             has_errors: analyzed.has_errors,
@@ -316,6 +319,55 @@ pub async fn import_project(
 
 fn canonicalize_paths(paths: &[String]) -> Result<Vec<PathBuf>, ApiError> {
     paths.iter().map(|path| canonicalize_path(path)).collect()
+}
+
+fn project_record_from_row(row: &turso::Row) -> Result<ProjectRecord, turso::Error> {
+    let has_errors: Option<i64> = row.get(5)?;
+    let summary_json: Option<String> = row.get(6)?;
+    let diagnostics_json: Option<String> = row.get(7)?;
+
+    Ok(ProjectRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        path: row.get(2)?,
+        created_at_ms: row.get(3)?,
+        last_analyzed_at_ms: row.get(4)?,
+        has_errors: has_errors.map(|value| value != 0),
+        summary: summary_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok()),
+        diagnostics: diagnostics_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok()),
+        runtime_profile_id: row.get(8)?,
+    })
+}
+
+async fn read_project_response(
+    db: &turso::Database,
+    project_id: &str,
+) -> Result<Option<ProjectResponse>, ApiError> {
+    let conn = db.connect()?;
+    let mut rows = conn
+        .query(
+            "SELECT id, name, path, created_at_ms, last_analyzed_at_ms, has_errors,
+                    summary_json, diagnostics_json, runtime_profile_id
+             FROM projects WHERE id = ?1 LIMIT 1",
+            params![project_id.to_owned()],
+        )
+        .await?;
+    let project = match rows.next().await? {
+        Some(row) => project_record_from_row(&row)?,
+        None => return Ok(None),
+    };
+    drop(rows);
+
+    let bindings = runtime::policy::summarize_projects(db, &[project.id.clone()]).await?;
+    let runtime_binding = bindings
+        .get(&project.id)
+        .cloned()
+        .expect("runtime policy returns a binding for every requested project");
+    Ok(Some(project.into_response(runtime_binding)))
 }
 
 fn canonicalize_path(path: &str) -> Result<PathBuf, ApiError> {
@@ -333,32 +385,30 @@ pub async fn set_project_engine(
     headers: HeaderMap,
     Path(project_id): Path<String>,
     Json(request): Json<SetProjectEngineRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<ProjectResponse>, ApiError> {
     authorize(&state, &headers)?;
-    let conn = state.db.connect()?;
+    let runtime_profile_id = request.runtime_profile_id;
 
-    if let Some(profile_id) = &request.runtime_profile_id {
-        // Materialize the existence check before writing on the same
-        // connection — turso silently drops a write issued while an earlier
-        // read cursor is still open.
-        let exists = {
-            let mut rows = conn
-                .query(
-                    "SELECT id FROM runtime_profiles WHERE id = ?1 LIMIT 1",
-                    params![profile_id.clone()],
-                )
-                .await?;
-            rows.next().await?.is_some()
-        };
-        if !exists {
-            return Err(ApiError::RuntimeProfileNotFound);
+    if let Some(profile_id) = runtime_profile_id.as_deref() {
+        match runtime::policy::validate_profile_for_binding(&state.db, profile_id).await? {
+            runtime::policy::SetPreferredOutcome::Updated => {}
+            runtime::policy::SetPreferredOutcome::NotFound => {
+                return Err(ApiError::RuntimeProfileNotFound);
+            }
+            runtime::policy::SetPreferredOutcome::Unavailable => {
+                return Err(ApiError::ActionUnavailable(
+                    "the runtime profile is not available for project binding".to_owned(),
+                ));
+            }
         }
     }
 
+    let conn = state.db.connect()?;
+    // Policy validation above completes before the pin is persisted.
     let affected = conn
         .execute(
             "UPDATE projects SET runtime_profile_id = ?1 WHERE id = ?2",
-            params![request.runtime_profile_id.clone(), project_id.clone()],
+            params![runtime_profile_id.clone(), project_id.clone()],
         )
         .await?;
     if affected == 0 {
@@ -368,16 +418,17 @@ pub async fn set_project_engine(
     logging::info(
         "project_engine_bound",
         &[
-            ("project_id", project_id),
+            ("project_id", project_id.clone()),
             (
                 "runtime_profile_id",
-                request
-                    .runtime_profile_id
-                    .unwrap_or_else(|| "<active>".to_owned()),
+                runtime_profile_id.unwrap_or_else(|| "<active>".to_owned()),
             ),
         ],
     );
-    Ok(Json(serde_json::json!({ "updated": true })))
+    let project = read_project_response(&state.db, &project_id)
+        .await?
+        .ok_or(ApiError::ProjectNotFound)?;
+    Ok(Json(project))
 }
 
 pub async fn delete_project(
@@ -401,4 +452,221 @@ pub async fn delete_project(
     logging::info("project_deleted", &[("project_id", project_id)]);
 
     Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{Json, extract::Path};
+    use turso::params;
+
+    use super::*;
+    use crate::{
+        runtime,
+        test_support::{authorized_headers, fresh_db, test_state},
+    };
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    async fn insert_project(state: &AppState, id: &str, profile_id: Option<&str>) -> TestResult {
+        let conn = state.db.connect()?;
+        conn.execute(
+            "INSERT INTO projects (id, name, path, created_at_ms, runtime_profile_id)
+             VALUES (?1, ?1, ?2, 1, ?3)",
+            params![
+                id.to_owned(),
+                format!("C:/projects/{id}"),
+                profile_id.map(str::to_owned)
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_profile(
+        state: &AppState,
+        id: &str,
+        availability: &str,
+        ownership: &str,
+    ) -> TestResult {
+        let conn = state.db.connect()?;
+        conn.execute(
+            "INSERT INTO runtime_profiles (
+                id, provider_id, provider_runtime_key, display_name, product, platform,
+                runtime_class, ownership_state, source,
+                installation_state, process_state, connection_state,
+                availability_state, missing_since_ms, observation_revision, observed_at_ms, created_at_ms, updated_at_ms
+            ) VALUES (?1, 'windows-docker-desktop', ?2, ?3, 'docker-desktop', 'windows',
+                'external_local', ?4, 'provider_discovery',
+                'installed', 'running', 'summarized', ?5, ?6, 0, 1, 1, 1)",
+            params![
+                id.to_owned(),
+                format!("engine-{id}"),
+                format!("Runtime {id}"),
+                ownership.to_owned(),
+                availability.to_owned(),
+                (availability == "missing").then_some(1_i64),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    fn project<'a>(projects: &'a [ProjectResponse], id: &str) -> TestResult<&'a ProjectResponse> {
+        projects
+            .iter()
+            .find(|project| project.id == id)
+            .ok_or_else(|| std::io::Error::other(format!("missing project {id}")).into())
+    }
+
+    #[tokio::test]
+    async fn project_responses_report_policy_backed_runtime_bindings() -> TestResult {
+        let state = test_state(fresh_db("project-runtime-bindings").await?);
+        insert_profile(&state, "global", "available", "external").await?;
+        insert_profile(&state, "pinned", "available", "external").await?;
+        insert_profile(&state, "unavailable", "missing", "external").await?;
+        assert!(matches!(
+            runtime::policy::set_preferred(&state.db, Some("global")).await?,
+            runtime::policy::SetPreferredOutcome::Updated
+        ));
+        insert_project(&state, "unpinned", None).await?;
+        insert_project(&state, "pinned-ready", Some("pinned")).await?;
+        insert_project(&state, "pinned-missing", Some("gone")).await?;
+        insert_project(&state, "pinned-unavailable", Some("unavailable")).await?;
+
+        let response = list_projects(State(state.clone()), authorized_headers())
+            .await?
+            .0;
+        let unpinned = project(&response.projects, "unpinned")?;
+        assert_eq!(
+            unpinned.runtime_binding.source,
+            runtime::RuntimeBindingSource::GlobalPreference
+        );
+        assert_eq!(
+            unpinned.runtime_binding.state,
+            runtime::RuntimeBindingState::Ready
+        );
+        let ready = project(&response.projects, "pinned-ready")?;
+        assert_eq!(
+            ready.runtime_binding.source,
+            runtime::RuntimeBindingSource::ProjectPin
+        );
+        assert_eq!(
+            ready.runtime_binding.state,
+            runtime::RuntimeBindingState::Ready
+        );
+        let missing = project(&response.projects, "pinned-missing")?;
+        assert_eq!(
+            missing.runtime_binding.state,
+            runtime::RuntimeBindingState::Missing
+        );
+        assert_eq!(missing.runtime_binding.profile_id.as_deref(), Some("gone"));
+        let unavailable = project(&response.projects, "pinned-unavailable")?;
+        assert_eq!(
+            unavailable.runtime_binding.state,
+            runtime::RuntimeBindingState::Unavailable
+        );
+
+        let cleared = set_project_engine(
+            State(state.clone()),
+            authorized_headers(),
+            Path("pinned-ready".to_owned()),
+            Json(SetProjectEngineRequest {
+                runtime_profile_id: None,
+            }),
+        )
+        .await?
+        .0;
+        assert_eq!(cleared.runtime_profile_id, None);
+        assert_eq!(
+            cleared.runtime_binding.source,
+            runtime::RuntimeBindingSource::GlobalPreference
+        );
+
+        let no_preference = test_state(fresh_db("project-platform-default").await?);
+        let created = create_project(
+            State(no_preference),
+            authorized_headers(),
+            Json(CreateProjectRequest {
+                name: "New project".to_owned(),
+                path: "C:/projects/new".to_owned(),
+            }),
+        )
+        .await?
+        .1
+        .0;
+        assert_eq!(
+            created.runtime_binding.source,
+            runtime::RuntimeBindingSource::PlatformDefault
+        );
+        assert_eq!(
+            created.runtime_binding.state,
+            runtime::RuntimeBindingState::Unconfigured
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_pin_rejects_unavailable_and_ownership_conflicted_profiles() -> TestResult {
+        let state = test_state(fresh_db("project-runtime-pin-rejection").await?);
+        insert_project(&state, "project", None).await?;
+        insert_profile(&state, "unavailable", "missing", "external").await?;
+        insert_profile(&state, "conflicted", "available", "ownership_conflict").await?;
+
+        for profile_id in ["unavailable", "conflicted"] {
+            let result = set_project_engine(
+                State(state.clone()),
+                authorized_headers(),
+                Path("project".to_owned()),
+                Json(SetProjectEngineRequest {
+                    runtime_profile_id: Some(profile_id.to_owned()),
+                }),
+            )
+            .await;
+            assert!(matches!(result, Err(ApiError::ActionUnavailable(_))));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn imported_project_includes_the_runtime_binding_summary() -> TestResult {
+        let state = test_state(fresh_db("import-project-runtime-binding").await?);
+        let fixture_directory = std::env::temp_dir().join(format!(
+            "susun-studio-import-runtime-binding-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&fixture_directory)?;
+        let compose_file = fixture_directory.join("compose.yaml");
+        std::fs::write(
+            &compose_file,
+            "services:\n  app:\n    image: nginx:alpine\n",
+        )?;
+
+        let result = import_project(
+            State(state),
+            authorized_headers(),
+            Json(ImportProjectRequest {
+                files: vec![compose_file.to_string_lossy().into_owned()],
+                env_file: None,
+                project_name: None,
+                profiles: Vec::new(),
+                runtime_profile_id: None,
+            }),
+        )
+        .await;
+        std::fs::remove_dir_all(&fixture_directory)?;
+
+        let response = result?.1.0;
+        let project = response
+            .project
+            .ok_or_else(|| std::io::Error::other("expected imported project"))?;
+        assert_eq!(
+            project.runtime_binding.source,
+            runtime::RuntimeBindingSource::PlatformDefault
+        );
+        assert_eq!(
+            project.runtime_binding.state,
+            runtime::RuntimeBindingState::Unconfigured
+        );
+        Ok(())
+    }
 }
