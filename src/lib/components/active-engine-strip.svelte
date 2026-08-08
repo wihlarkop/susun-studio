@@ -29,7 +29,7 @@
   let switching = $state(false);
   let pruneDialogOpen = $state(false);
 
-  const selected = $derived(profiles.find((profile) => profile.is_selected) ?? null);
+  const selected = $derived(profiles.find((profile) => profile.is_preferred) ?? null);
   const selectedReady = $derived(selected?.connection.state === "summarized");
   // The daemon validates this against whichever runtime is actually
   // selected — it must never be a hardcoded id, or the request is rejected

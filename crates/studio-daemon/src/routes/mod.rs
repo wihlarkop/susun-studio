@@ -135,6 +135,10 @@ pub fn app(state: AppState) -> Router {
             get(artifacts::engine_registry_capability),
         )
         .route("/v1/runtime/status", get(runtime::runtime_status))
+        .route(
+            "/v1/runtime/policy",
+            get(runtime::read_runtime_policy).put(runtime::set_runtime_policy),
+        )
         .route("/v1/runtime/logs", get(runtime::runtime_logs))
         .route("/v1/runtime/profiles", get(runtime::list_runtime_profiles))
         .route(

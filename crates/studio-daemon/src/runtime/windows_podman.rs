@@ -9,10 +9,10 @@ use super::{
     command_output, dimension, now_ms,
     provider::{
         EndpointSummary, ObservedProfile, PLACEHOLDER_KEY, RESERVED_BUILT_IN_MACHINE,
-        RuntimeAction, RuntimeClass, RuntimeObservation, RuntimeProvider, RuntimeRecoveryAction,
-        RuntimeRecoveryPlan, RuntimeResourceMetric, RuntimeResourceSnapshot, RuntimeResourceText,
-        RuntimeResourceUpdate, RuntimeResourceUpdateCapabilities, RuntimeResourceUpdateCapability,
-        profile_id,
+        RuntimeAction, RuntimeClass, RuntimeObservation, RuntimeProvider,
+        RuntimeProviderExperience, RuntimeRecoveryAction, RuntimeRecoveryPlan,
+        RuntimeResourceMetric, RuntimeResourceSnapshot, RuntimeResourceText, RuntimeResourceUpdate,
+        RuntimeResourceUpdateCapabilities, RuntimeResourceUpdateCapability, profile_id,
     },
     trusted_exec, trusted_read_output,
 };
@@ -39,6 +39,17 @@ impl RuntimeProvider for WindowsPodmanProvider {
 
     fn supported(&self) -> bool {
         cfg!(target_os = "windows")
+    }
+
+    fn experience(&self) -> RuntimeProviderExperience {
+        RuntimeProviderExperience {
+            can_create_builtin: true,
+            can_discover_external: true,
+            can_manage_builtin_lifecycle: true,
+            can_manage_external_lifecycle: false,
+            can_manage_resources: true,
+            requires_external_desktop_app: false,
+        }
     }
 
     fn detect(&self) -> RuntimeObservation {

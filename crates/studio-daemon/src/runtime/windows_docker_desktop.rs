@@ -8,7 +8,7 @@ use super::{
     command_output, dimension, now_ms,
     provider::{
         EndpointSummary, ObservedProfile, PLACEHOLDER_KEY, RuntimeAction, RuntimeClass,
-        RuntimeObservation, RuntimeProvider, profile_id,
+        RuntimeObservation, RuntimeProvider, RuntimeProviderExperience, profile_id,
     },
 };
 use std::ffi::OsString;
@@ -43,6 +43,17 @@ impl RuntimeProvider for WindowsDockerDesktopProvider {
 
     fn supported(&self) -> bool {
         cfg!(target_os = "windows")
+    }
+
+    fn experience(&self) -> RuntimeProviderExperience {
+        RuntimeProviderExperience {
+            can_create_builtin: false,
+            can_discover_external: true,
+            can_manage_builtin_lifecycle: false,
+            can_manage_external_lifecycle: true,
+            can_manage_resources: false,
+            requires_external_desktop_app: true,
+        }
     }
 
     fn detect(&self) -> RuntimeObservation {

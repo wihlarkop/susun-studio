@@ -30,10 +30,13 @@ use windows_docker_desktop::WindowsDockerDesktopProvider;
 use windows_podman::WindowsPodmanProvider;
 
 pub use endpoint_policy::validate_engine_endpoint;
-use policy::RuntimeBindingSource;
+pub use policy::{
+    RuntimeAttribution, RuntimeBindingSource, RuntimeBindingState, RuntimeBindingSummary,
+    RuntimePreference,
+};
 pub use provider::{
     ManagementCapabilities, RuntimeAction, RuntimeDimension, RuntimeError, RuntimeProfile,
-    RuntimeResourceSnapshot,
+    RuntimeProviderExperience, RuntimeResourceSnapshot,
 };
 
 /// Columns selected to hydrate a [`RuntimeProfile`]; the order matches
@@ -51,6 +54,7 @@ const PROFILE_COLUMNS: &str =
 
 #[derive(Debug, Serialize)]
 pub struct RuntimeStatus {
+    pub policy: RuntimePreference,
     pub providers: Vec<RuntimeProviderStatus>,
 }
 
@@ -61,6 +65,7 @@ pub struct RuntimeProviderStatus {
     pub product: String,
     pub platform: String,
     pub supported: bool,
+    pub experience: RuntimeProviderExperience,
     pub installation: RuntimeDimension,
     pub process: RuntimeDimension,
     pub connection: RuntimeDimension,
@@ -171,6 +176,7 @@ pub async fn status(db: &Database) -> Result<RuntimeStatus, turso::Error> {
             product: provider.product().to_owned(),
             platform: provider.platform().to_owned(),
             supported: provider.supported(),
+            experience: provider.experience(),
             installation: observation.installation,
             process: observation.process,
             connection: observation.connection,
@@ -182,7 +188,10 @@ pub async fn status(db: &Database) -> Result<RuntimeStatus, turso::Error> {
         });
     }
 
-    Ok(RuntimeStatus { providers })
+    Ok(RuntimeStatus {
+        policy: policy::read_preference(db).await?,
+        providers,
+    })
 }
 
 pub async fn resource_snapshot(

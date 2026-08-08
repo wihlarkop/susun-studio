@@ -16,7 +16,7 @@
     projects,
   }: { profiles: RuntimeProfile[]; connected: boolean; projects: StudioProject[] } = $props();
 
-  const selected = $derived(profiles.find((profile) => profile.is_selected) ?? null);
+  const selected = $derived(profiles.find((profile) => profile.is_preferred) ?? null);
   // Never hardcode the legacy id here — this is the same resolution every
   // artifact request uses, so the header always names the engine the data
   // actually came from.

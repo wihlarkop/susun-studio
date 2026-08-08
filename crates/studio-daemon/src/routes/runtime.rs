@@ -4,8 +4,49 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
+use serde::Deserialize;
 
 use crate::{auth::authorize, error::ApiError, logging, runtime, state::AppState};
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimePolicyUpdateRequest {
+    pub preferred_profile_id: Option<String>,
+}
+
+pub async fn read_runtime_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<runtime::RuntimePreference>, ApiError> {
+    authorize(&state, &headers)?;
+    Ok(Json(runtime::policy::read_preference(&state.db).await?))
+}
+
+pub async fn set_runtime_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RuntimePolicyUpdateRequest>,
+) -> Result<Json<runtime::RuntimePreference>, ApiError> {
+    authorize(&state, &headers)?;
+    let preference =
+        set_preferred_runtime(&state.db, request.preferred_profile_id.as_deref()).await?;
+    Ok(Json(preference))
+}
+
+async fn set_preferred_runtime(
+    db: &turso::Database,
+    preferred_profile_id: Option<&str>,
+) -> Result<runtime::RuntimePreference, ApiError> {
+    match runtime::policy::set_preferred(db, preferred_profile_id).await? {
+        runtime::policy::SetPreferredOutcome::Updated => {
+            Ok(runtime::policy::read_preference(db).await?)
+        }
+        runtime::policy::SetPreferredOutcome::NotFound => Err(ApiError::RuntimeProfileNotFound),
+        runtime::policy::SetPreferredOutcome::Unavailable => Err(ApiError::ActionUnavailable(
+            "This runtime is missing or its built-in ownership is not proven.".to_owned(),
+        )),
+    }
+}
 
 pub async fn runtime_status(
     State(state): State<AppState>,
@@ -91,15 +132,7 @@ pub async fn select_runtime_profile(
         "runtime_profile_select_requested",
         &[("profile_id", profile_id.clone())],
     );
-    match runtime::select_profile(&state.db, &profile_id).await? {
-        runtime::SelectOutcome::Selected => {}
-        runtime::SelectOutcome::NotFound => return Err(ApiError::RuntimeProfileNotFound),
-        runtime::SelectOutcome::Unavailable => {
-            return Err(ApiError::ActionUnavailable(
-                "This runtime is missing or its built-in ownership is not proven.".to_owned(),
-            ));
-        }
-    }
+    set_preferred_runtime(&state.db, Some(&profile_id)).await?;
     Ok(Json(serde_json::json!({ "selected": true })))
 }
 
@@ -239,7 +272,30 @@ fn reject_trusted_plan_content(body: &Bytes) -> Result<(), ApiError> {
 
 #[cfg(test)]
 mod tests {
+    use axum::{Json, extract::Path};
+    use turso::params;
+
     use super::*;
+    use crate::test_support::{authorized_headers, fresh_db, test_state};
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    async fn insert_available_profile(state: &AppState, id: &str) -> TestResult {
+        let conn = state.db.connect()?;
+        conn.execute(
+            "INSERT INTO runtime_profiles (
+                id, provider_id, provider_runtime_key, display_name, product, platform,
+                runtime_class, ownership_state, source,
+                installation_state, process_state, connection_state,
+                availability_state, observation_revision, observed_at_ms, created_at_ms, updated_at_ms
+            ) VALUES (?1, 'windows-docker-desktop', ?2, ?3, 'docker-desktop', 'windows',
+                'external_local', 'external', 'provider_discovery',
+                'installed', 'running', 'summarized', 'available', 0, 1, 1, 1)",
+            params![id.to_owned(), format!("engine-{id}"), format!("Runtime {id}")],
+        )
+        .await?;
+        Ok(())
+    }
 
     #[test]
     fn trusted_plan_endpoints_reject_frontend_executable_content() {
@@ -251,5 +307,135 @@ mod tests {
             Err(ApiError::TrustedPlanContentRejected)
         ));
         assert!(reject_trusted_plan_content(&Bytes::new()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn runtime_status_exposes_policy_preference_and_provider_experience() -> TestResult {
+        let state = test_state(fresh_db("runtime-status-contract").await?);
+        insert_available_profile(&state, "profile-status").await?;
+        assert!(matches!(
+            runtime::policy::set_preferred(&state.db, Some("profile-status")).await?,
+            runtime::policy::SetPreferredOutcome::Updated
+        ));
+
+        let response = runtime_status(State(state), authorized_headers()).await?.0;
+        let value = serde_json::to_value(response)?;
+
+        assert_eq!(value["policy"]["binding"]["source"], "global_preference");
+        let providers = value["providers"].as_array().ok_or("providers")?;
+        let podman = providers
+            .iter()
+            .find(|provider| provider["provider_id"] == "windows-podman")
+            .ok_or("podman provider")?;
+        assert_eq!(podman["experience"]["can_create_builtin"], true);
+        assert_eq!(podman["experience"]["can_discover_external"], true);
+        assert_eq!(podman["experience"]["requires_external_desktop_app"], false);
+        let docker = providers
+            .iter()
+            .find(|provider| provider["provider_id"] == "windows-docker-desktop")
+            .ok_or("docker provider")?;
+        assert_eq!(docker["experience"]["can_create_builtin"], false);
+        assert_eq!(docker["experience"]["requires_external_desktop_app"], true);
+        let profile = docker["profiles"]
+            .as_array()
+            .ok_or("docker profiles")?
+            .iter()
+            .find(|profile| profile["id"] == "profile-status")
+            .ok_or("status profile")?;
+        assert_eq!(profile["runtime_class"], "external_local");
+        assert_eq!(profile["is_preferred"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn policy_routes_are_typed_and_legacy_select_does_not_write_profiles() -> TestResult {
+        let state = test_state(fresh_db("runtime-policy-routes").await?);
+        insert_available_profile(&state, "profile-ready").await?;
+
+        let response = set_runtime_policy(
+            State(state.clone()),
+            authorized_headers(),
+            Json(RuntimePolicyUpdateRequest {
+                preferred_profile_id: Some("profile-ready".to_owned()),
+            }),
+        )
+        .await?
+        .0;
+        assert_eq!(
+            response.preferred_profile_id.as_deref(),
+            Some("profile-ready")
+        );
+        assert_eq!(response.binding.state, runtime::RuntimeBindingState::Ready);
+
+        let read = read_runtime_policy(State(state.clone()), authorized_headers())
+            .await?
+            .0;
+        assert_eq!(read.preferred_profile_id, response.preferred_profile_id);
+
+        let cleared = set_runtime_policy(
+            State(state.clone()),
+            authorized_headers(),
+            Json(RuntimePolicyUpdateRequest {
+                preferred_profile_id: None,
+            }),
+        )
+        .await?
+        .0;
+        assert_eq!(cleared.preferred_profile_id, None);
+
+        let conn = state.db.connect()?;
+        let mut rows = conn
+            .query(
+                "SELECT updated_at_ms FROM runtime_profiles WHERE id = 'profile-ready'",
+                (),
+            )
+            .await?;
+        let before: i64 = rows.next().await?.ok_or("profile")?.get(0)?;
+        drop(rows);
+        let legacy = select_runtime_profile(
+            State(state.clone()),
+            authorized_headers(),
+            Path("profile-ready".to_owned()),
+        )
+        .await?
+        .0;
+        assert_eq!(legacy["selected"], true);
+        let mut rows = conn
+            .query(
+                "SELECT updated_at_ms FROM runtime_profiles WHERE id = 'profile-ready'",
+                (),
+            )
+            .await?;
+        let after: i64 = rows.next().await?.ok_or("profile")?.get(0)?;
+        assert_eq!(after, before);
+        drop(rows);
+
+        let unknown = set_runtime_policy(
+            State(state.clone()),
+            authorized_headers(),
+            Json(RuntimePolicyUpdateRequest {
+                preferred_profile_id: Some("missing".to_owned()),
+            }),
+        )
+        .await;
+        assert!(matches!(unknown, Err(ApiError::RuntimeProfileNotFound)));
+
+        conn.execute(
+            "UPDATE runtime_profiles
+             SET availability_state = 'missing', missing_since_ms = 1
+             WHERE id = 'profile-ready'",
+            (),
+        )
+        .await?;
+        let unavailable = set_runtime_policy(
+            State(state),
+            authorized_headers(),
+            Json(RuntimePolicyUpdateRequest {
+                preferred_profile_id: Some("profile-ready".to_owned()),
+            }),
+        )
+        .await;
+        assert!(matches!(unavailable, Err(ApiError::ActionUnavailable(_))));
+        Ok(())
     }
 }

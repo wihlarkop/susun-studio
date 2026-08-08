@@ -20,6 +20,7 @@ pub trait RuntimeProvider: Send + Sync {
     fn product(&self) -> &'static str;
     fn platform(&self) -> &'static str;
     fn supported(&self) -> bool;
+    fn experience(&self) -> RuntimeProviderExperience;
     fn detect(&self) -> RuntimeObservation;
     fn planned_actions(
         &self,
@@ -49,6 +50,19 @@ pub trait RuntimeProvider: Send + Sync {
     ) -> Option<RuntimeRecoveryPlan> {
         None
     }
+}
+
+/// Provider-owned description of Studio's runtime-management boundary. This
+/// is intentionally separate from engine capability probing: it tells the UI
+/// what Studio can manage for this provider without product-name matching.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct RuntimeProviderExperience {
+    pub can_create_builtin: bool,
+    pub can_discover_external: bool,
+    pub can_manage_builtin_lifecycle: bool,
+    pub can_manage_external_lifecycle: bool,
+    pub can_manage_resources: bool,
+    pub requires_external_desktop_app: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

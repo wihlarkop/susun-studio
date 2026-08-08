@@ -27,7 +27,7 @@
   const connected = $derived(healthState.kind === "connected");
   const hasProjects = $derived(projectCount > 0);
   const selectedProfile = $derived(
-    runtimeProfiles.find((profile) => profile.is_selected) ?? null,
+    runtimeProfiles.find((profile) => profile.is_preferred) ?? null,
   );
   const engineReady = $derived(selectedProfile?.connection.state === "summarized");
   const showPanel = $derived(!connected || !hasProjects || !engineReady);

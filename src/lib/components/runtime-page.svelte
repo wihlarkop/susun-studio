@@ -79,7 +79,7 @@
 
   const providers = $derived(status?.providers ?? []);
   const selectedProfiles = $derived(
-    providers.flatMap((provider) => provider.profiles.filter((profile) => profile.is_selected)),
+    providers.flatMap((provider) => provider.profiles.filter((profile) => profile.is_preferred)),
   );
   const readyProviders = $derived(
     providers.filter((provider) => provider.connection.state === "summarized"),
@@ -635,7 +635,7 @@
                       {#if profile.runtime_class === "built_in"}
                         <span class="text-xs text-muted-foreground">Powered by Podman</span>
                       {/if}
-                      {#if profile.is_selected}
+                      {#if profile.is_preferred}
                         <Badge variant="default" class="text-xs">
                           <CheckCircle2 />
                           Active
@@ -679,8 +679,8 @@
                       <Button
                         size="sm"
                         variant="outline"
-                        disabled={!profile.is_selected || profile.connection.state !== "summarized"}
-                        title={profile.is_selected
+                        disabled={!profile.is_preferred || profile.connection.state !== "summarized"}
+                        title={profile.is_preferred
                           ? "Preview unused resources on this runtime."
                           : "Make this runtime active before pruning it."}
                         onclick={() => reviewPrune(profile)}
@@ -700,14 +700,14 @@
                     {/if}
                     <Button
                       size="sm"
-                      variant={profile.is_selected ? "secondary" : "outline"}
-                      disabled={profile.is_selected || !profile.management.can_select}
+                      variant={profile.is_preferred ? "secondary" : "outline"}
+                      disabled={profile.is_preferred || !profile.management.can_select}
                       title={profile.management.can_select
                         ? undefined
                         : "This runtime is missing, so it can't be made active."}
                       onclick={() => handleSelect(profile)}
                     >
-                      {profile.is_selected ? "Active" : "Make active"}
+                      {profile.is_preferred ? "Active" : "Make active"}
                     </Button>
                   </div>
                 </li>
