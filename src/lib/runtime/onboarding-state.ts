@@ -55,5 +55,7 @@ export function canDismissInitialOnboarding(input: {
   reopened: boolean;
   onboarding: OnboardingStateSnapshot;
 }): boolean {
-  return !input.reopened && input.onboarding.state === "pending" && input.onboarding.choice === null;
+  return (
+    !input.reopened && input.onboarding.state === "pending" && input.onboarding.choice === null
+  );
 }

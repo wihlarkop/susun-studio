@@ -49,12 +49,13 @@ export function createDaemonState() {
   async function refresh(signal?: AbortSignal) {
     try {
       const health = await readDaemonHealth(getDaemonBaseUrl(), signal);
-      const [projectList, daemonSettings, nextRuntimeStatus, nextRuntimeOnboarding] = await Promise.all([
-        listProjects({ signal }),
-        readSettings({ signal }),
-        readRuntimeStatus({ signal }),
-        readRuntimeOnboarding({ signal }),
-      ]);
+      const [projectList, daemonSettings, nextRuntimeStatus, nextRuntimeOnboarding] =
+        await Promise.all([
+          listProjects({ signal }),
+          readSettings({ signal }),
+          readRuntimeStatus({ signal }),
+          readRuntimeOnboarding({ signal }),
+        ]);
 
       projects = projectList;
       settings = daemonSettings;

@@ -6,7 +6,12 @@ import {
   selectableExternalProfiles,
 } from "./onboarding-state";
 
-const pending = { state: "pending", choice: null, completed_at_ms: null, updated_at_ms: 1 } as const;
+const pending = {
+  state: "pending",
+  choice: null,
+  completed_at_ms: null,
+  updated_at_ms: 1,
+} as const;
 const completedExisting = {
   state: "completed",
   choice: "existing",
@@ -23,11 +28,15 @@ const builtInReady = {
 
 describe("runtime onboarding state", () => {
   it("waits for a connected daemon without changing pending onboarding", () => {
-    expect(resolveOnboardingView({ connected: false, onboarding: pending })).toEqual({ kind: "wait" });
+    expect(resolveOnboardingView({ connected: false, onboarding: pending })).toEqual({
+      kind: "wait",
+    });
   });
 
   it("shows the chooser only for a pending state with no choice", () => {
-    expect(resolveOnboardingView({ connected: true, onboarding: pending })).toEqual({ kind: "chooser" });
+    expect(resolveOnboardingView({ connected: true, onboarding: pending })).toEqual({
+      kind: "chooser",
+    });
   });
 
   it("completes built-in onboarding only after the managed profile is ready and preferred", () => {
@@ -85,6 +94,8 @@ describe("runtime onboarding state", () => {
   it("allows only the initial pending flow to persist dismissal", () => {
     expect(canDismissInitialOnboarding({ reopened: false, onboarding: pending })).toBe(true);
     expect(canDismissInitialOnboarding({ reopened: true, onboarding: pending })).toBe(false);
-    expect(canDismissInitialOnboarding({ reopened: false, onboarding: completedExisting })).toBe(false);
+    expect(canDismissInitialOnboarding({ reopened: false, onboarding: completedExisting })).toBe(
+      false,
+    );
   });
 });
