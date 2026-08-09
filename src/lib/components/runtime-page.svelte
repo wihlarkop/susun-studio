@@ -51,11 +51,15 @@
     refreshing,
     onRecheck,
     onChooseRuntime,
+    trayRuntimeAction = null,
+    onTrayRuntimeActionHandled,
   }: {
     runtimeStatus: RuntimeStatus | undefined;
     refreshing: boolean;
     onRecheck: () => Promise<void>;
     onChooseRuntime: () => void;
+    trayRuntimeAction?: { action: "start" | "stop"; requestId: number } | null;
+    onTrayRuntimeActionHandled?: () => void;
   } = $props();
 
   let logs = $state<RuntimeLogLine[]>([]);
@@ -200,6 +204,35 @@
     };
     runtimeActionDialogOpen = true;
   }
+
+  function openTrayRuntimeAction(actionId: "start" | "stop") {
+    const selectedProfileId = runtimePreference?.binding.profile_id;
+    const profile = selectedProfileId
+      ? profileEntries.find((entry) => entry.profile.id === selectedProfileId)?.profile
+      : undefined;
+    const provider = profile
+      ? providers.find((candidate) => candidate.provider_id === profile.provider_id)
+      : undefined;
+    const action = provider?.actions.find(
+      (candidate) => candidate.id === actionId && candidate.enabled,
+    );
+    const selectedBuiltIn =
+      profile?.runtime_class === "built_in" &&
+      profile.ownership_state === "studio_managed" &&
+      runtimePreference?.binding.runtime_class === "built_in";
+    if (!selectedBuiltIn || !profile || !provider || !action) {
+      errorMessage = "The requested built-in runtime action is no longer available.";
+      return;
+    }
+    handleAction(provider.provider_id, action);
+  }
+
+  $effect(() => {
+    const request = trayRuntimeAction;
+    if (!request) return;
+    openTrayRuntimeAction(request.action);
+    onTrayRuntimeActionHandled?.();
+  });
 
   function handleResourceUpdate(
     profile: RuntimeProfile,

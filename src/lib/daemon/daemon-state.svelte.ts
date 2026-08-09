@@ -2,6 +2,7 @@ import {
   getDaemonBaseUrl,
   importProject as importProjectRequest,
   listProjects,
+  markProjectOpened as markProjectOpenedRequest,
   readDaemonHealth,
   readRuntimeOnboarding,
   readRuntimeStatus,
@@ -17,6 +18,7 @@ import {
   type StudioProject,
   type StudioSettings,
 } from "$lib/daemon/client";
+import { syncTrayRuntimeSummary } from "$lib/tauri/tray";
 
 export type HealthState =
   | { kind: "checking"; label: "Checking"; detail: string; health?: undefined }
@@ -71,6 +73,7 @@ export function createDaemonState() {
       runtimeStatus = nextRuntimeStatus;
       runtimeOnboarding = nextRuntimeOnboarding;
       runtimeProfiles = nextRuntimeStatus.providers.flatMap((provider) => provider.profiles);
+      void syncTrayRuntimeSummary(nextRuntimeStatus);
       workspaceDetail = describeWorkspace(projectList);
       healthState = {
         kind: "connected",
@@ -86,6 +89,7 @@ export function createDaemonState() {
       projects = [];
       runtimeProfiles = [];
       runtimeStatus = undefined;
+      void syncTrayRuntimeSummary(undefined);
       runtimeOnboarding = undefined;
       settings = undefined;
       workspaceDetail = "Start the local daemon to load projects and settings.";
@@ -138,6 +142,16 @@ export function createDaemonState() {
     }
   }
 
+  async function markProjectOpened(projectId: string): Promise<void> {
+    try {
+      const updated = await markProjectOpenedRequest(projectId);
+      projects = projects.map((project) => (project.id === updated.id ? updated : project));
+    } catch {
+      // Opening remains local and immediate. A transient daemon write failure
+      // leaves the existing recency ordering in place until the next refresh.
+    }
+  }
+
   return {
     get healthState() {
       return healthState;
@@ -167,6 +181,7 @@ export function createDaemonState() {
       return workspaceDetail;
     },
     importProject,
+    markProjectOpened,
     refresh: () => refresh(),
     setLastProjectId,
   };

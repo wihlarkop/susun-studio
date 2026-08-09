@@ -4,12 +4,13 @@
   import * as Tooltip from "$lib/components/ui/tooltip/index.js";
   import { Badge } from "$lib/components/ui/badge/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
-  import { Trash2 } from "@lucide/svelte";
+  import { Search, Trash2, X } from "@lucide/svelte";
   import RemoveProjectDialog from "./remove-project-dialog.svelte";
   import RuntimeIdentity from "./runtime-identity.svelte";
   import { cn, displayPath, formatTimestamp, relativeTime } from "$lib/utils";
   import type { StudioProject } from "$lib/daemon/client";
   import { presentRuntimeBinding } from "$lib/runtime/presentation";
+  import { filterProjects, recentProjects } from "$lib/projects/project-filter";
 
   let {
     projects,
@@ -27,6 +28,12 @@
 
   let removeTarget = $state<StudioProject | null>(null);
   let removeDialogOpen = $state(false);
+  let query = $state("");
+  let view = $state<"recent" | "all">("recent");
+
+  const visibleProjects = $derived(
+    view === "recent" ? recentProjects(projects, query) : filterProjects(projects, query),
+  );
 
   function openRemove(event: MouseEvent, project: StudioProject) {
     event.stopPropagation();
@@ -62,9 +69,49 @@
 </script>
 
 <div class="space-y-2">
-  <div>
-    <h3 class="text-lg font-semibold">Workspace Projects</h3>
-    <p class="text-sm text-muted-foreground">{workspaceSummary}</p>
+  <div class="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+    <div>
+      <h3 class="text-lg font-semibold">Workspace Projects</h3>
+      <p class="text-sm text-muted-foreground">{workspaceSummary}</p>
+    </div>
+    <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
+      <div class="relative min-w-0 sm:w-64">
+        <Search class="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+        <input
+          bind:value={query}
+          class="flex h-8 w-full rounded-md border border-input bg-transparent px-8 py-1 text-sm shadow-xs outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          placeholder="Search projects"
+          aria-label="Search projects"
+        />
+        {#if query}
+          <Button
+            size="icon"
+            variant="ghost"
+            class="absolute top-0.5 right-0.5 size-7"
+            aria-label="Clear project search"
+            onclick={() => (query = "")}
+          >
+            <X class="size-3.5" />
+          </Button>
+        {/if}
+      </div>
+      <div class="grid grid-cols-2 rounded-md border p-0.5" aria-label="Project list view">
+        <Button
+          size="sm"
+          variant={view === "recent" ? "secondary" : "ghost"}
+          class="h-7 px-2"
+          aria-pressed={view === "recent"}
+          onclick={() => (view = "recent")}
+        >Recent</Button>
+        <Button
+          size="sm"
+          variant={view === "all" ? "secondary" : "ghost"}
+          class="h-7 px-2"
+          aria-pressed={view === "all"}
+          onclick={() => (view = "all")}
+        >All</Button>
+      </div>
+    </div>
   </div>
 
   <Card.Root class="p-0">
@@ -80,9 +127,9 @@
         </Table.Row>
       </Table.Header>
       <Table.Body>
-        {#if projects.length > 0}
+        {#if visibleProjects.length > 0}
           <Tooltip.Provider>
-            {#each projects as project (project.id)}
+            {#each visibleProjects as project (project.id)}
               <Table.Row
                 class={cn(
                   "cursor-pointer focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
@@ -141,6 +188,20 @@
               </Table.Row>
             {/each}
           </Tooltip.Provider>
+        {:else if query}
+          <Table.Row>
+            <Table.Cell colspan={6} class="h-24 text-center text-muted-foreground">
+              No projects match this search.
+              <Button variant="link" class="h-auto px-1" onclick={() => (query = "")}>Clear search</Button>
+            </Table.Cell>
+          </Table.Row>
+        {:else if projects.length > 0}
+          <Table.Row>
+            <Table.Cell colspan={6} class="h-24 text-center text-muted-foreground">
+              No recently opened projects yet. Choose <span class="font-medium">All</span> to browse
+              every project.
+            </Table.Cell>
+          </Table.Row>
         {:else}
           <Table.Row>
             <Table.Cell colspan={6} class="h-24 text-center text-muted-foreground">

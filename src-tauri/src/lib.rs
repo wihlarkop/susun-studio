@@ -2,6 +2,7 @@ mod backup;
 mod daemon;
 mod diagnostics;
 mod restore;
+mod tray;
 
 use daemon::DaemonSupervisor;
 use log::{error, info};
@@ -26,16 +27,26 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(DaemonSupervisor::default())
+        .manage(tray::QuitIntent::default())
+        .setup(|app| Ok(tray::setup(app)?))
         .invoke_handler(tauri::generate_handler![
             resolve_daemon_connection,
+            update_tray_runtime_summary,
             export_diagnostics_bundle,
             backup_studio_data,
             preview_restore_studio_data,
             apply_restore_studio_data
         ])
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
-                window.app_handle().state::<DaemonSupervisor>().shutdown();
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.app_handle().state::<tray::QuitIntent>().requested() {
+                    window.app_handle().state::<DaemonSupervisor>().shutdown();
+                    return;
+                }
+                api.prevent_close();
+                if let Err(error) = window.hide() {
+                    error!("event=studio_window_hide_failed error={error}");
+                }
             }
         })
         .run(tauri::generate_context!())
@@ -54,6 +65,14 @@ async fn resolve_daemon_connection(
         error!("event=resolve_daemon_connection_command_failed error={error}");
         error.to_string()
     })
+}
+
+#[tauri::command]
+fn update_tray_runtime_summary(
+    app: tauri::AppHandle,
+    summary: tray::TrayRuntimeSummary,
+) -> Result<(), String> {
+    tray::update_summary(&app, summary).map_err(|error| error.to_string())
 }
 
 #[tauri::command]

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import * as Sidebar from "$lib/components/ui/sidebar/index.js";
   import AppSidebar from "$lib/components/app-sidebar.svelte";
   import TopBar from "$lib/components/top-bar.svelte";
@@ -20,6 +21,11 @@
     type ImportProjectResponse,
   } from "$lib/daemon/client";
   import { resolveOnboardingView } from "$lib/runtime/onboarding-state";
+  import {
+    listenForTrayRequests,
+    type TrayNavigationIntent,
+    type TrayRuntimeAction,
+  } from "$lib/tauri/tray";
 
   const daemonState = createDaemonState();
   let importDialogOpen = $state(false);
@@ -27,6 +33,8 @@
   let selectedProjectId = $state<string | null>(null);
   let runtimeOnboardingOpen = $state(false);
   let runtimeOnboardingReopened = $state(false);
+  let trayRuntimeAction = $state<{ action: TrayRuntimeAction; requestId: number } | null>(null);
+  let nextTrayRequestId = 0;
   const selectedProject = $derived(
     daemonState.projects.find((project) => project.id === selectedProjectId) ??
       daemonState.projects[0] ??
@@ -36,6 +44,7 @@
   function selectProject(id: string) {
     selectedProjectId = id;
     void daemonState.setLastProjectId(id);
+    void daemonState.markProjectOpened(id);
   }
 
   // Restore the last-viewed project once, the first time both settings and
@@ -118,6 +127,43 @@
     runtimeOnboardingOpen = false;
     runtimeOnboardingReopened = false;
   }
+
+  function handleTrayNavigation(intent: TrayNavigationIntent) {
+    switch (intent) {
+      case "open":
+        activeView = "projects";
+        break;
+      case "runtime_settings":
+        activeView = "settings";
+        break;
+      case "runtime_setup":
+        activeView = "runtime";
+        void openRuntimeSetup();
+        break;
+      case "runtime":
+        activeView = "runtime";
+        break;
+    }
+  }
+
+  onMount(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listenForTrayRequests({
+      onNavigation: handleTrayNavigation,
+      onRuntimeAction: (action) => {
+        activeView = "runtime";
+        trayRuntimeAction = { action, requestId: ++nextTrayRequestId };
+      },
+    }).then((nextUnlisten) => {
+      if (disposed) nextUnlisten();
+      else unlisten = nextUnlisten;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  });
 </script>
 
 <svelte:head>
@@ -179,6 +225,8 @@
           refreshing={daemonState.refreshing}
           onRecheck={daemonState.refresh}
           onChooseRuntime={openRuntimeSetup}
+          {trayRuntimeAction}
+          onTrayRuntimeActionHandled={() => (trayRuntimeAction = null)}
         />
       {:else if activeView === "artifacts"}
         <ArtifactsPage
