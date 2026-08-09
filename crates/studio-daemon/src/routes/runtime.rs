@@ -134,6 +134,18 @@ pub async fn list_runtime_profiles(
     Ok(Json(serde_json::json!({ "profiles": profiles })))
 }
 
+pub async fn runtime_profile_compatibility(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(profile_id): Path<String>,
+) -> Result<Json<runtime::RuntimeCompatibilityReport>, ApiError> {
+    authorize(&state, &headers)?;
+    let report = runtime::compatibility::report_for_profile(&state.db, &profile_id)
+        .await?
+        .ok_or(ApiError::RuntimeProfileNotFound)?;
+    Ok(Json(report))
+}
+
 pub async fn runtime_profile_resources(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -563,6 +575,19 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn compatibility_route_keeps_missing_profiles_as_a_normal_not_found() -> TestResult {
+        let state = test_state(fresh_db("runtime-compatibility-not-found").await?);
+        let result = runtime_profile_compatibility(
+            State(state),
+            authorized_headers(),
+            Path("missing".to_owned()),
+        )
+        .await;
+        assert!(matches!(result, Err(ApiError::RuntimeProfileNotFound)));
+        Ok(())
     }
 
     #[tokio::test]

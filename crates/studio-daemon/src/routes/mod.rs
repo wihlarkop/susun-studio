@@ -170,6 +170,10 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/runtime/logs", get(runtime::runtime_logs))
         .route("/v1/runtime/profiles", get(runtime::list_runtime_profiles))
         .route(
+            "/v1/runtime/profiles/{id}/compatibility",
+            get(runtime::runtime_profile_compatibility),
+        )
+        .route(
             "/v1/runtime/profiles/{id}/resources",
             get(runtime::runtime_profile_resources),
         )

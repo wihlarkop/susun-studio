@@ -269,6 +269,27 @@ export type ProjectRuntimeImpactPreview = {
   impact_fingerprint: string;
 };
 
+export type RuntimeCompatibilityLevel = "supported" | "limited" | "unsupported" | "unavailable" | "unknown";
+
+export type RuntimeWorkflowCompatibility = {
+  id: string;
+  level: RuntimeCompatibilityLevel;
+  reason_code: string;
+  detail: string;
+};
+
+export type RuntimeCompatibilityReport = {
+  profile_id: string;
+  provider_id: string;
+  runtime_class: RuntimeClass;
+  ownership_state: RuntimeOwnershipState;
+  availability_state: string;
+  observed_api_version: string | null;
+  version_policy: "probe_based";
+  workflows: RuntimeWorkflowCompatibility[];
+  observed_at_ms: number;
+};
+
 export type RuntimeOnboardingChoice = "built_in" | "existing";
 
 export type RuntimeOnboardingState = {
@@ -770,6 +791,13 @@ export async function readRuntimePolicy(
   options: DaemonRequestOptions = {},
 ): Promise<RuntimePreference> {
   return readJson("/v1/runtime/policy", options);
+}
+
+export async function readRuntimeCompatibility(
+  profileId: string,
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeCompatibilityReport> {
+  return readJson(`/v1/runtime/profiles/${encodeURIComponent(profileId)}/compatibility`, options);
 }
 
 export async function previewPreferredRuntime(

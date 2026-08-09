@@ -24,6 +24,20 @@ pub struct DiagnosticsEngineStatus {
     pub reachable: bool,
 }
 
+/// Persisted runtime metadata only. Dynamic compatibility probes and endpoint
+/// summaries are intentionally excluded from diagnostics.
+#[derive(Debug, Serialize)]
+pub struct DiagnosticsRuntimeProfile {
+    pub provider_id: String,
+    pub runtime_class: String,
+    pub ownership_state: String,
+    pub availability_state: String,
+    pub connection_state: String,
+    pub source: String,
+    pub is_preferred: bool,
+    pub last_error_code: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct DiagnosticsActionAudit {
     pub action_kind: String,
@@ -53,6 +67,7 @@ pub struct DiagnosticsReport {
     pub project_count: i64,
     pub recent_job_errors: Vec<DiagnosticsJobError>,
     pub engines: Vec<DiagnosticsEngineStatus>,
+    pub runtime_profiles: Vec<DiagnosticsRuntimeProfile>,
     pub recent_action_audit: Vec<DiagnosticsActionAudit>,
 }
 
@@ -109,6 +124,35 @@ pub async fn diagnostics(
         });
     }
 
+    let mut runtime_rows = conn
+        .query(
+            "SELECT provider_id, runtime_class, ownership_state, availability_state,
+                    connection_state, source,
+                    CASE WHEN id = (SELECT preferred_profile_id FROM runtime_policy WHERE singleton = 1)
+                        THEN 1 ELSE 0 END,
+                    last_error_code
+             FROM runtime_profiles ORDER BY provider_id ASC, id ASC",
+            (),
+        )
+        .await?;
+    let mut runtime_profiles = Vec::new();
+    while let Some(row) = runtime_rows.next().await? {
+        let is_preferred: i64 = row.get(6)?;
+        runtime_profiles.push(DiagnosticsRuntimeProfile {
+            provider_id: diagnostic_code(&row.get::<String>(0)?),
+            runtime_class: diagnostic_code(&row.get::<String>(1)?),
+            ownership_state: diagnostic_code(&row.get::<String>(2)?),
+            availability_state: diagnostic_code(&row.get::<String>(3)?),
+            connection_state: diagnostic_code(&row.get::<String>(4)?),
+            source: diagnostic_code(&row.get::<String>(5)?),
+            is_preferred: is_preferred != 0,
+            last_error_code: row
+                .get::<Option<String>>(7)?
+                .as_deref()
+                .map(diagnostic_code),
+        });
+    }
+
     let db_file_name = state
         .db_path
         .file_name()
@@ -154,6 +198,7 @@ pub async fn diagnostics(
         project_count,
         recent_job_errors,
         engines,
+        runtime_profiles,
         recent_action_audit,
     };
     logging::info(
@@ -255,7 +300,11 @@ fn contains_sensitive_marker(input: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{REDACTED, redact_and_truncate_error};
+    use axum::extract::State;
+    use turso::params;
+
+    use super::{REDACTED, diagnostics, redact_and_truncate_error};
+    use crate::test_support::{authorized_headers, fresh_db, test_state};
 
     #[test]
     fn diagnostics_error_redaction_masks_sensitive_key_values() {
@@ -268,5 +317,46 @@ mod tests {
         assert!(redacted.contains("PORT=8080"));
         assert!(!redacted.contains("super-secret"));
         assert!(!redacted.contains("postgres://user:pass@host"));
+    }
+
+    #[tokio::test]
+    async fn runtime_diagnostics_include_only_bounded_profile_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let state = test_state(fresh_db("diagnostics-runtime-profile").await?);
+        let conn = state.db.connect()?;
+        conn.execute(
+            "INSERT INTO runtime_profiles (
+                id, provider_id, provider_runtime_key, display_name, product, platform,
+                runtime_class, ownership_state, source,
+                installation_state, process_state, connection_state,
+                availability_state, last_error_code, last_error_detail,
+                observation_revision, observed_at_ms, created_at_ms, updated_at_ms
+            ) VALUES (?1, 'windows-podman', 'machine/test', 'secret display', 'podman', 'windows',
+                'external_local', 'external', 'provider_discovery',
+                'installed', 'running', 'summarized',
+                'available', 'connect_failed', '//./pipe/podman.sock secret', 0, 1, 1, 1)",
+            params!["profile"],
+        )
+        .await?;
+
+        let report = diagnostics(State(state), authorized_headers()).await?.0;
+        let value = serde_json::to_value(report)?;
+        let profiles = value["runtime_profiles"].as_array().ok_or("profiles")?;
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0]["provider_id"], "windows-podman");
+        assert_eq!(profiles[0]["last_error_code"], "connect_failed");
+        let serialized = value.to_string();
+        for forbidden in [
+            "secret display",
+            "podman.sock",
+            "last_error_detail",
+            "endpoint",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "diagnostics exposed {forbidden}"
+            );
+        }
+        Ok(())
     }
 }
