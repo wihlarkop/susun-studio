@@ -66,6 +66,7 @@ pub struct RuntimeMigrationProfile {
     pub ownership_state: Option<String>,
     pub availability_state: String,
     pub reference_state: &'static str,
+    pub selectable: bool,
     pub is_preferred: bool,
     pub explicitly_pinned_project_count: i64,
 }
@@ -315,6 +316,7 @@ pub async fn migration_inventory(db: &Database) -> Result<RuntimeMigrationInvent
                 ownership_state: Some(profile.ownership_state.clone()),
                 availability_state: profile.availability_state.clone(),
                 reference_state: "present",
+                selectable: profile.management.can_select,
                 is_preferred: profile.is_preferred,
                 explicitly_pinned_project_count: pinned_count,
             });
@@ -328,6 +330,7 @@ pub async fn migration_inventory(db: &Database) -> Result<RuntimeMigrationInvent
                 ownership_state: None,
                 availability_state: "missing".to_owned(),
                 reference_state: "missing",
+                selectable: false,
                 is_preferred,
                 explicitly_pinned_project_count: pinned_count,
             });
@@ -348,6 +351,7 @@ pub async fn migration_inventory(db: &Database) -> Result<RuntimeMigrationInvent
             ownership_state: Some(profile.ownership_state),
             availability_state: profile.availability_state,
             reference_state: "present",
+            selectable: profile.management.can_select,
             is_preferred: profile.is_preferred,
             explicitly_pinned_project_count: 0,
         });

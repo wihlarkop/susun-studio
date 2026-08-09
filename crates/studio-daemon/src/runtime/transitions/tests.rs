@@ -580,6 +580,7 @@ async fn migration_inventory_keeps_explicit_pins_and_missing_sources_visible() -
     assert_eq!(missing.reference_state, "missing");
     assert_eq!(missing.runtime_class, None);
     assert_eq!(missing.ownership_state, None);
+    assert!(!missing.selectable);
     assert_eq!(missing.explicitly_pinned_project_count, 2);
     assert!(
         inventory
@@ -599,7 +600,8 @@ async fn migration_inventory_keeps_explicit_pins_and_missing_sources_visible() -
             .profiles
             .iter()
             .any(|profile| profile.profile_id == target
-                && profile.ownership_state.as_deref() == Some("external"))
+                && profile.ownership_state.as_deref() == Some("external")
+                && profile.selectable)
     );
     let serialized = serde_json::to_string(&inventory)?;
     assert!(!serialized.contains("One"));

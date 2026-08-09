@@ -944,6 +944,7 @@ export type RuntimeMigrationInventoryProfile = {
   ownership_state: RuntimeOwnershipState | null;
   availability_state: string;
   reference_state: "present" | "missing";
+  selectable: boolean;
   is_preferred: boolean;
   explicitly_pinned_project_count: number;
 };
