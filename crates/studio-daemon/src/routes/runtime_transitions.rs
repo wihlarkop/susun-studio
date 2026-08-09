@@ -1,7 +1,7 @@
 use axum::{
     Json,
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     http::HeaderMap,
 };
 
@@ -15,7 +15,8 @@ use crate::{
         transitions::{
             self, CommitRejected, DestructiveCommitResult, DestructivePreview,
             DestructivePreviewRequest, MigrationPreview, MigrationRequest, MigrationResult,
-            MigrationRollbackPreview, MigrationRollbackResult, UninstallPolicy,
+            MigrationRollbackPreview, MigrationRollbackResult, RuntimeMigrationHistory,
+            RuntimeMigrationInventory, UninstallPolicy,
         },
     },
     state::AppState,
@@ -38,6 +39,37 @@ fn owner(state: &AppState) -> String {
 
 fn map_rejection(rejection: CommitRejected) -> ApiError {
     ApiError::ActionUnavailable(rejection.message)
+}
+
+fn reject_read_inputs(query: &RawQuery, body: &Bytes) -> Result<(), ApiError> {
+    if query.0.as_deref().is_some_and(|value| !value.is_empty()) || !body.is_empty() {
+        return Err(ApiError::ActionUnavailable(
+            "Migration inventory and history do not accept request inputs.".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub async fn migration_inventory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    query: RawQuery,
+    body: Bytes,
+) -> Result<Json<RuntimeMigrationInventory>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_read_inputs(&query, &body)?;
+    Ok(Json(transitions::migration_inventory(&state.db).await?))
+}
+
+pub async fn migration_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    query: RawQuery,
+    body: Bytes,
+) -> Result<Json<RuntimeMigrationHistory>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_read_inputs(&query, &body)?;
+    Ok(Json(transitions::migration_history(&state.db).await?))
 }
 
 pub async fn preview_migration(
@@ -242,5 +274,18 @@ mod tests {
             Err(ApiError::TrustedPlanContentRejected)
         ));
         assert!(reject_commit_body(&Bytes::new()).is_ok());
+    }
+
+    #[test]
+    fn inventory_and_history_reject_query_or_body_inputs() {
+        assert!(reject_read_inputs(&RawQuery(None), &Bytes::new()).is_ok());
+        assert!(
+            reject_read_inputs(
+                &RawQuery(Some("source=untrusted".to_owned())),
+                &Bytes::new()
+            )
+            .is_err()
+        );
+        assert!(reject_read_inputs(&RawQuery(None), &Bytes::from_static(b"{}")).is_err());
     }
 }

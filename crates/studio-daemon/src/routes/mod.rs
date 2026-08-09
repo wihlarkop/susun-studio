@@ -182,6 +182,14 @@ pub fn app(state: AppState) -> Router {
             post(runtime::prepare_runtime_resource_update),
         )
         .route(
+            "/v1/runtime/migrations/inventory",
+            get(runtime_transitions::migration_inventory),
+        )
+        .route(
+            "/v1/runtime/migrations/history",
+            get(runtime_transitions::migration_history),
+        )
+        .route(
             "/v1/runtime/migrations/preview",
             post(runtime_transitions::preview_migration),
         )

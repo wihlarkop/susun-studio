@@ -98,13 +98,19 @@ pub struct MigrationCommitPlan {
     pub project_ids: Vec<String>,
     /// Fingerprint of the source bindings + target selectability at preview time.
     /// Recomputed at commit; a mismatch means the inventory changed → stale.
-    pub fingerprint: String,
+    pub target_observation_revision: i64,
+    /// Hashed, daemon-derived compatibility state. No endpoint or raw probe
+    /// response is stored in the plan.
+    pub compatibility_fingerprint: String,
+    pub active_work_fingerprint: String,
+    pub binding_inventory_fingerprint: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct MigrationRollbackPlan {
     pub migration_id: String,
-    pub fingerprint: String,
+    pub binding_inventory_fingerprint: String,
+    pub active_work_fingerprint: String,
 }
 
 #[derive(Debug, Clone)]
@@ -384,7 +390,10 @@ mod tests {
             source_profile_id: "src".to_owned(),
             target_profile_id: "dst".to_owned(),
             project_ids: vec!["p1".to_owned()],
-            fingerprint: "fp".to_owned(),
+            target_observation_revision: 1,
+            compatibility_fingerprint: "compat".to_owned(),
+            active_work_fingerprint: "work".to_owned(),
+            binding_inventory_fingerprint: "bindings".to_owned(),
         })
     }
 

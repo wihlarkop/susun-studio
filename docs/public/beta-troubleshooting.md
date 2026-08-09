@@ -23,24 +23,45 @@ Recovery:
 - Restart Studio or rerun `bun run daemon`.
 - If local state appears corrupt, back up and remove `.susun-studio/studio.db`, then re-import projects.
 
-## Engine Unavailable
+## Runtime Unavailable
 
 Symptoms:
 
-- Engine card shows unreachable.
-- Runtime actions fail with an engine unavailable error.
+- Runtime profile shows unavailable or unreachable.
+- A project action is blocked because its explicit pin or the configured preferred runtime is unavailable.
 
 Checks:
 
-- Start Docker Desktop, Docker Engine, or another Docker-compatible local engine.
-- Confirm `docker ps` works from the same user account.
-- Recheck engine health in Studio.
+- Recheck the selected runtime in Studio.
+- For an existing external runtime, confirm its own CLI or desktop application can reach the runtime from the same user account.
+- For Susun Runtime, use the Runtime page to prepare a trusted start or repair action.
+- Check whether the project has an explicit runtime pin. A pin intentionally overrides the global preference.
 
 Recovery:
 
-- Restart the engine.
-- Restart the Studio daemon if the engine socket changed.
-- Export diagnostics if the engine remains unreachable.
+- Restore the pinned or preferred runtime, then recheck it. Studio does not silently fall back to another runtime.
+- If a pinned source is permanently unavailable, use the guarded metadata migration flow to move only the selected explicit bindings to a live compatible target.
+- Export diagnostics if the runtime remains unreachable.
+
+## Runtime Migration Or Rollback Is Blocked
+
+Symptoms:
+
+- The migration preview is blocked.
+- A rollback preview says it is unavailable.
+- A previously previewed migration is rejected as stale.
+
+Checks:
+
+- The target must be present, selectable, reachable, and compatible when the preview and commit run.
+- Only projects with explicit pins to the chosen source can be selected. Projects inheriting the global preference stay unpinned.
+- Stop jobs and watch sessions attributed to the source before migration, or the target before rollback.
+
+Recovery:
+
+- Refresh inventory and prepare a new preview after any runtime/profile change.
+- A missing or stopped source can still be migrated away from when Studio's metadata proves the explicit pins; the target must still be live.
+- Rollback restores only the exact recorded project pins. It has its own preview and explicit confirmation.
 
 ## Project Import Diagnostics
 
