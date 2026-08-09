@@ -16,14 +16,20 @@ import {
   beginRollbackCommit,
   beginRollbackPreview,
   boundedMigrationError,
+  boundedRollbackBlocker,
   canAcceptMigrationResponse,
   canCommitMigration,
   canCommitRollback,
   cancelMigration,
   chooseMigrationWorkflow,
   createMigrationState,
+  failMigrationRequest,
   migrationEligibleSources,
+  migrationEligibleTargets,
+  migrationConfirmationDetails,
   migrationExcludedCategories,
+  invalidateMigrationForRuntimeRefresh,
+  migrationProjectsForSource,
   updateMigrationSelection,
 } from "./migration-state";
 
@@ -97,6 +103,18 @@ const inventory = {
       },
       explicitly_pinned: false,
       selectable: false,
+    },
+    {
+      project_id: "project-c",
+      binding: {
+        source: "project_pin",
+        state: "missing",
+        profile_id: "missing",
+        runtime_class: null,
+        display_name: "Missing runtime profile",
+      },
+      explicitly_pinned: true,
+      selectable: true,
     },
   ],
 } as RuntimeMigrationInventory;
@@ -266,11 +284,97 @@ describe("runtime migration state", () => {
     expect(migrationExcludedCategories).toContain("runtime_ownership");
   });
 
+  it("derives migration controls only from typed inventory and a daemon preview", () => {
+    expect(
+      migrationProjectsForSource(inventory, "podman").map((project) => project.project_id),
+    ).toEqual(["project-a"]);
+    expect(
+      migrationProjectsForSource(inventory, "missing").map((project) => project.project_id),
+    ).toEqual(["project-c"]);
+    expect(
+      migrationEligibleTargets(inventory, "podman").map((profile) => profile.profile_id),
+    ).toEqual(["docker"]);
+
+    expect(migrationConfirmationDetails(preview)).toMatchObject({
+      source: preview.source,
+      target: preview.target,
+      projectCount: 1,
+      rollbackAvailable: true,
+      expiresInSeconds: 60,
+    });
+    expect(migrationConfirmationDetails(preview).excludedCategories).toEqual(
+      migrationExcludedCategories,
+    );
+  });
+
   it("never uses raw daemon content in a user-visible migration error", () => {
     const sensitive = "connect \\.\\pipe\\docker_engine argv=podman token=secret";
     const message = boundedMigrationError({ status: 502, message: sensitive });
     expect(message).toBe("The selected runtime could not be reached.");
     expect(message).not.toContain("docker_engine");
     expect(message).not.toContain("secret");
+  });
+
+  it("maps rollback blockers to fixed public guidance", () => {
+    expect(
+      boundedRollbackBlocker(
+        "Stop running work on the migrated runtime before preparing rollback.",
+      ),
+    ).toBe("Stop running work on the migrated runtime, then prepare rollback again.");
+    const unknown = boundedRollbackBlocker("C:/secret podman.exe --host npipe");
+    expect(unknown).toBe("Rollback is not available for the current migration state.");
+    expect(unknown).not.toContain("secret");
+  });
+
+  it("keeps request failures bounded and ignores an older failure after selection changes", () => {
+    const previewing = beginMigrationPreview(readyMigrationState(), 1_000);
+    const failed = failMigrationRequest(previewing, previewing.generation, {
+      status: 502,
+      message: "podman.exe --host npipe:////./pipe/secret",
+    });
+    expect(failed).toMatchObject({
+      phase: "editing",
+      preview: null,
+      error: "The selected runtime could not be reached.",
+    });
+    const changed = updateMigrationSelection(failed, { profileRevision: 1 });
+    expect(failMigrationRequest(changed, previewing.generation, { status: 500 })).toEqual(changed);
+  });
+
+  it("invalidates preview and rollback plans when shared runtime state refreshes", () => {
+    const previewing = beginMigrationPreview(readyMigrationState(), 1_000);
+    const previewed = acceptMigrationPreview(previewing, previewing.generation, preview, 1_000);
+    const refreshedPreview = invalidateMigrationForRuntimeRefresh(previewed);
+    expect(refreshedPreview).toMatchObject({ phase: "editing", preview: null });
+    expect(canCommitMigration(refreshedPreview, 1_001)).toBe(false);
+
+    const committed = acceptMigrationCommit(
+      beginMigrationCommit(previewed, 1_001),
+      previewed.generation + 1,
+      {
+        migration_id: "migration-a",
+        status: "completed",
+        source_profile_id: "podman",
+        target_profile_id: "docker",
+        project_count: 1,
+        skipped_items: [],
+        failures: [],
+        rollback_available: true,
+      },
+    );
+    const rollbackLoading = beginRollbackPreview(committed);
+    const rollbackReady = acceptRollbackPreview(
+      rollbackLoading,
+      rollbackLoading.generation,
+      rollbackPreview,
+      1_002,
+    );
+    const refreshedRollback = invalidateMigrationForRuntimeRefresh(rollbackReady);
+    expect(refreshedRollback).toMatchObject({
+      phase: "committed",
+      rollbackPreview: null,
+      rollbackConfirmed: false,
+    });
+    expect(canCommitRollback(refreshedRollback, 1_003)).toBe(false);
   });
 });

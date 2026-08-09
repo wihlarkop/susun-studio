@@ -92,6 +92,10 @@ export function createMigrationState(): MigrationState {
   };
 }
 
+export function resetMigrationDialog(state: MigrationState): MigrationState {
+  return { ...createMigrationState(), generation: state.generation + 1 };
+}
+
 export function chooseMigrationWorkflow(
   state: MigrationState,
   workflow: Exclude<MigrationWorkflow, null>,
@@ -103,12 +107,15 @@ export function chooseMigrationWorkflow(
   };
 }
 
-export function beginMigrationInventory(state: MigrationState): MigrationState {
+export function beginMigrationInventory(
+  state: MigrationState,
+  workflow: Exclude<MigrationWorkflow, null> = state.workflow ?? "migrate",
+): MigrationState {
   return {
     ...state,
     phase: "loading_inventory",
     generation: state.generation + 1,
-    workflow: "migrate",
+    workflow,
     inventory: null,
     selection: emptySelection(),
     preview: null,
@@ -331,6 +338,105 @@ export function acceptRollbackCommit(
   };
 }
 
+export function failMigrationRequest(
+  state: MigrationState,
+  generation: number,
+  error: unknown,
+): MigrationState {
+  if (state.generation !== generation) return state;
+  const message = boundedMigrationError(error);
+  switch (state.phase) {
+    case "loading_inventory":
+      return { ...state, phase: "idle", inventory: null, error: message };
+    case "previewing":
+      return {
+        ...state,
+        phase: "editing",
+        preview: null,
+        previewExpiresAtMs: null,
+        error: message,
+      };
+    case "committing":
+      return {
+        ...state,
+        phase: "commit_failed",
+        preview: null,
+        previewExpiresAtMs: null,
+        error: message,
+      };
+    case "rollback_previewing":
+      return {
+        ...state,
+        phase: "committed",
+        rollbackPreview: null,
+        rollbackExpiresAtMs: null,
+        rollbackConfirmed: false,
+        error: message,
+      };
+    case "rollback_committing":
+      return {
+        ...state,
+        phase: "rollback_failed",
+        rollbackPreview: null,
+        rollbackExpiresAtMs: null,
+        rollbackConfirmed: false,
+        error: message,
+      };
+    default:
+      return state;
+  }
+}
+
+export function invalidateMigrationForRuntimeRefresh(state: MigrationState): MigrationState {
+  const base = {
+    ...state,
+    generation: state.generation + 1,
+    selection: {
+      ...state.selection,
+      profileRevision: state.selection.profileRevision + 1,
+    },
+    preview: null,
+    previewExpiresAtMs: null,
+    rollbackPreview: null,
+    rollbackExpiresAtMs: null,
+    rollbackConfirmed: false,
+  };
+  switch (state.phase) {
+    case "loading_inventory":
+      return {
+        ...base,
+        phase: "idle",
+        inventory: null,
+        error: "Runtime state changed. Refresh the migration inventory.",
+      };
+    case "previewing":
+    case "previewed":
+    case "editing":
+    case "commit_failed":
+      return { ...base, phase: "editing", error: null };
+    case "committing":
+      return {
+        ...base,
+        phase: "commit_failed",
+        result: null,
+        error:
+          "Runtime state changed while the migration was being confirmed. Refresh before continuing.",
+      };
+    case "rollback_previewing":
+    case "rollback_previewed":
+      return { ...base, phase: "committed", error: null };
+    case "rollback_committing":
+      return {
+        ...base,
+        phase: "rollback_failed",
+        rollbackResult: null,
+        error: "Runtime state changed while rollback was being confirmed. Prepare a new preview.",
+      };
+    default:
+      return { ...base, error: null };
+  }
+}
+
 export function cancelMigration(state: MigrationState): MigrationState {
   return {
     ...state,
@@ -380,6 +486,33 @@ export function migrationEligibleTargets(
     .sort((left, right) => left.profile_id.localeCompare(right.profile_id));
 }
 
+export function migrationProjectsForSource(
+  inventory: RuntimeMigrationInventory,
+  sourceId: string | null,
+): RuntimeMigrationInventory["projects"] {
+  return inventory.projects.filter(
+    (project) => project.explicitly_pinned && project.binding.profile_id === sourceId,
+  );
+}
+
+export function migrationConfirmationDetails(preview: RuntimeMigrationPreview): {
+  source: RuntimeMigrationPreview["source"];
+  target: RuntimeMigrationPreview["target"];
+  projectCount: number;
+  excludedCategories: readonly string[];
+  rollbackAvailable: boolean;
+  expiresInSeconds: number | null;
+} {
+  return {
+    source: preview.source,
+    target: preview.target,
+    projectCount: preview.projects.length,
+    excludedCategories: migrationExcludedCategories,
+    rollbackAvailable: preview.rollback_available,
+    expiresInSeconds: preview.expires_in_seconds,
+  };
+}
+
 export function canAcceptMigrationResponse(
   state: MigrationState,
   responseGeneration: number,
@@ -400,6 +533,17 @@ export function boundedMigrationError(error: unknown): string {
   if (typeof status === "number" && status >= 500)
     return "Studio could not complete the migration request.";
   return "Studio could not reach the daemon. Try again.";
+}
+
+export function boundedRollbackBlocker(blocker: string | null): string {
+  switch (blocker) {
+    case "Stop running work on the migrated runtime before preparing rollback.":
+      return "Stop running work on the migrated runtime, then prepare rollback again.";
+    case "This migration can no longer be rolled back.":
+      return "Rollback is no longer available because the recorded bindings changed.";
+    default:
+      return "Rollback is not available for the current migration state.";
+  }
 }
 
 function emptySelection(): MigrationSelection {

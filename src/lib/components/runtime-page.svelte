@@ -852,6 +852,7 @@
     profiles={providers.flatMap((provider) => provider.profiles)}
     bind:open={migrationDialogOpen}
     oncompleted={refreshRuntime}
+    onconnect={(profileId) => onContextChange({ kind: "preference", profileId })}
   />
   <RuntimeDataScopeDialog
     profile={dataScopeProfile}
