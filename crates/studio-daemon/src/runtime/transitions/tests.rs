@@ -515,6 +515,112 @@ async fn destructive_commit_rejects_when_ownership_changes() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn migration_inventory_keeps_explicit_pins_and_missing_sources_visible() -> TestResult {
+    let (db, path, source, target) = fixture().await?;
+    let conn = db.connect()?;
+    conn.execute(
+        "INSERT INTO projects (id, name, path, created_at_ms, runtime_profile_id)
+         VALUES ('unpinned', 'Inherited', '/inherited', 1, NULL)",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "DELETE FROM runtime_profiles WHERE id = ?1",
+        params![source.clone()],
+    )
+    .await?;
+
+    let inventory = migration_inventory(&db).await?;
+    let missing = inventory
+        .profiles
+        .iter()
+        .find(|profile| profile.profile_id == source)
+        .ok_or("missing source")?;
+    assert_eq!(missing.reference_state, "missing");
+    assert_eq!(missing.runtime_class, None);
+    assert_eq!(missing.ownership_state, None);
+    assert_eq!(missing.explicitly_pinned_project_count, 2);
+    assert!(
+        inventory
+            .projects
+            .iter()
+            .filter(|project| project.explicitly_pinned)
+            .all(|project| project.selectable)
+    );
+    assert!(
+        inventory
+            .projects
+            .iter()
+            .any(|project| project.project_id == "unpinned" && !project.selectable)
+    );
+    assert!(
+        inventory
+            .profiles
+            .iter()
+            .any(|profile| profile.profile_id == target
+                && profile.ownership_state.as_deref() == Some("external"))
+    );
+    let serialized = serde_json::to_string(&inventory)?;
+    assert!(!serialized.contains("One"));
+    assert!(!serialized.contains("/p1"));
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn migration_history_is_bounded_newest_first_and_redacts_legacy_json() -> TestResult {
+    let (db, path, source, target) = fixture().await?;
+    let conn = db.connect()?;
+    for index in 0..51 {
+        conn.execute(
+            "INSERT INTO runtime_migrations (
+                id, source_profile_id, target_profile_id, status, project_count,
+                project_ids_json, skipped_items_json, failures_json,
+                rollback_available, created_at_ms, completed_at_ms
+             ) VALUES (?1, ?2, ?3, 'completed', 1, '[\"p1\"]', ?4, ?5, 1, ?6, ?6)",
+            params![
+                format!("migration-{index:02}"),
+                source.clone(),
+                target.clone(),
+                if index == 50 {
+                    "not-json"
+                } else {
+                    "[\"volume data\"]"
+                },
+                "[\"raw provider endpoint C:/secret\"]",
+                index as i64,
+            ],
+        )
+        .await?;
+    }
+
+    let history = migration_history(&db).await?;
+    assert_eq!(history.entries.len(), 50);
+    assert_eq!(
+        history.entries.first().map(|entry| entry.created_at_ms),
+        Some(50)
+    );
+    assert_eq!(
+        history
+            .entries
+            .first()
+            .map(|entry| &entry.skipped_categories),
+        Some(&vec!["unknown".to_owned()])
+    );
+    assert_eq!(
+        history.entries.first().map(|entry| &entry.failure_codes),
+        Some(&vec!["unknown".to_owned()])
+    );
+    let serialized = serde_json::to_string(&history)?;
+    assert!(!serialized.contains("C:/secret"));
+    assert!(!serialized.contains("p1"));
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 async fn binding(conn: &turso::Connection, project_id: &str) -> TestResult<String> {
     let mut rows = conn
         .query(

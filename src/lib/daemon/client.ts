@@ -937,6 +937,59 @@ export type RuntimeMigrationProject = {
   currently_bound_to_source: boolean;
 };
 
+export type RuntimeMigrationInventoryProfile = {
+  profile_id: string;
+  provider_id: string | null;
+  display_name: string;
+  runtime_class: RuntimeClass | null;
+  ownership_state: RuntimeOwnershipState | null;
+  availability_state: string;
+  reference_state: "present" | "missing";
+  is_preferred: boolean;
+  explicitly_pinned_project_count: number;
+};
+
+export type RuntimeMigrationInventoryProject = {
+  project_id: string;
+  binding: RuntimeBindingSummary;
+  explicitly_pinned: boolean;
+  selectable: boolean;
+};
+
+export type RuntimeMigrationInventory = {
+  profiles: RuntimeMigrationInventoryProfile[];
+  projects: RuntimeMigrationInventoryProject[];
+  global_binding: RuntimeBindingSummary;
+};
+
+export type RuntimeMigrationHistoryEntry = {
+  migration_id: string;
+  source_profile_id: string;
+  target_profile_id: string;
+  status: "completed" | "failed" | "rolled_back" | "unknown";
+  project_count: number;
+  skipped_categories: string[];
+  failure_codes: string[];
+  rollback_available: boolean;
+  created_at_ms: number;
+  completed_at_ms: number;
+  rolled_back_at_ms: number | null;
+};
+
+export type RuntimeMigrationHistory = { entries: RuntimeMigrationHistoryEntry[] };
+
+export async function readRuntimeMigrationInventory(
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeMigrationInventory> {
+  return readJson("/v1/runtime/migrations/inventory", options);
+}
+
+export async function readRuntimeMigrationHistory(
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeMigrationHistory> {
+  return readJson("/v1/runtime/migrations/history", options);
+}
+
 export type RuntimeArtifactPolicy = {
   category: string;
   disposition: string;

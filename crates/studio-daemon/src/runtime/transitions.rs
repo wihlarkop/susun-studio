@@ -18,9 +18,12 @@
 //! Runtime reset/remove/repair go through the same gate before a trusted,
 //! provider-owned recovery plan is executed.
 
+use std::collections::{BTreeMap, HashMap};
+
 use serde::{Deserialize, Serialize};
 use turso::{Connection, Database, params};
 
+use super::policy::{self, RuntimeBindingSummary};
 use super::provider::{RuntimeRecoveryAction, RuntimeRecoveryPlan};
 use super::{RuntimeProfile, list_all_profiles, now_ms, stable_suffix};
 use crate::action_audit::{self, AffectedCount, AuditEntry};
@@ -37,6 +40,56 @@ pub struct MigrationRequest {
     pub source_profile_id: String,
     pub target_profile_id: String,
     pub project_ids: Vec<String>,
+}
+
+/// Read-only, display-safe migration input. This is intentionally derived
+/// from persisted Studio metadata and never probes or mutates a runtime.
+#[derive(Debug, Serialize)]
+pub struct RuntimeMigrationInventory {
+    pub profiles: Vec<RuntimeMigrationProfile>,
+    pub projects: Vec<RuntimeMigrationProject>,
+    pub global_binding: RuntimeBindingSummary,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeMigrationProfile {
+    pub profile_id: String,
+    pub provider_id: Option<String>,
+    pub display_name: String,
+    pub runtime_class: Option<String>,
+    pub ownership_state: Option<String>,
+    pub availability_state: String,
+    pub reference_state: &'static str,
+    pub is_preferred: bool,
+    pub explicitly_pinned_project_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeMigrationProject {
+    pub project_id: String,
+    pub binding: RuntimeBindingSummary,
+    pub explicitly_pinned: bool,
+    pub selectable: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeMigrationHistory {
+    pub entries: Vec<RuntimeMigrationHistoryEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeMigrationHistoryEntry {
+    pub migration_id: String,
+    pub source_profile_id: String,
+    pub target_profile_id: String,
+    pub status: String,
+    pub project_count: i64,
+    pub skipped_categories: Vec<String>,
+    pub failure_codes: Vec<String>,
+    pub rollback_available: bool,
+    pub created_at_ms: i64,
+    pub completed_at_ms: i64,
+    pub rolled_back_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -212,6 +265,136 @@ impl CommitRejected {
 // --------------------------------------------------------------------------
 // Migration
 // --------------------------------------------------------------------------
+
+/// Returns the current metadata-only migration landscape. Missing profiles are
+/// preserved when an explicit pin or global preference still references them,
+/// allowing recovery without inventing provider details in the frontend.
+pub async fn migration_inventory(db: &Database) -> Result<RuntimeMigrationInventory, turso::Error> {
+    let global_binding = policy::summarize_global(db).await?;
+    let profiles = list_all_profiles(db).await?;
+    let (project_ids, explicit_pins) = migration_project_bindings(db).await?;
+    let summaries = policy::summarize_projects(db, &project_ids).await?;
+
+    let mut pin_counts = BTreeMap::<String, i64>::new();
+    for profile_id in explicit_pins.values().flatten() {
+        *pin_counts.entry(profile_id.clone()).or_default() += 1;
+    }
+    if let Some(profile_id) = &global_binding.profile_id {
+        pin_counts.entry(profile_id.clone()).or_default();
+    }
+
+    let present = profiles
+        .into_iter()
+        .map(|profile| (profile.id.clone(), profile))
+        .collect::<HashMap<_, _>>();
+    let mut inventory_profiles = Vec::with_capacity(present.len() + pin_counts.len());
+    for (profile_id, pinned_count) in pin_counts {
+        if let Some(profile) = present.get(&profile_id) {
+            inventory_profiles.push(RuntimeMigrationProfile {
+                profile_id,
+                provider_id: Some(profile.provider_id.clone()),
+                display_name: profile.display_name.clone(),
+                runtime_class: Some(profile.runtime_class.clone()),
+                ownership_state: Some(profile.ownership_state.clone()),
+                availability_state: profile.availability_state.clone(),
+                reference_state: "present",
+                is_preferred: profile.is_preferred,
+                explicitly_pinned_project_count: pinned_count,
+            });
+        } else {
+            let is_preferred = global_binding.profile_id.as_deref() == Some(profile_id.as_str());
+            inventory_profiles.push(RuntimeMigrationProfile {
+                display_name: "Missing runtime profile".to_owned(),
+                profile_id,
+                provider_id: None,
+                runtime_class: None,
+                ownership_state: None,
+                availability_state: "missing".to_owned(),
+                reference_state: "missing",
+                is_preferred,
+                explicitly_pinned_project_count: pinned_count,
+            });
+        }
+    }
+    for (_, profile) in present {
+        if inventory_profiles
+            .iter()
+            .any(|entry| entry.profile_id == profile.id)
+        {
+            continue;
+        }
+        inventory_profiles.push(RuntimeMigrationProfile {
+            profile_id: profile.id,
+            provider_id: Some(profile.provider_id),
+            display_name: profile.display_name,
+            runtime_class: Some(profile.runtime_class),
+            ownership_state: Some(profile.ownership_state),
+            availability_state: profile.availability_state,
+            reference_state: "present",
+            is_preferred: profile.is_preferred,
+            explicitly_pinned_project_count: 0,
+        });
+    }
+    inventory_profiles.sort_by(|left, right| left.profile_id.cmp(&right.profile_id));
+
+    let projects = project_ids
+        .into_iter()
+        .map(|project_id| {
+            let pin = explicit_pins.get(&project_id).cloned().flatten();
+            RuntimeMigrationProject {
+                binding: summaries
+                    .get(&project_id)
+                    .cloned()
+                    .unwrap_or_else(|| global_binding.clone()),
+                project_id,
+                explicitly_pinned: pin.is_some(),
+                selectable: pin.is_some(),
+            }
+        })
+        .collect();
+
+    Ok(RuntimeMigrationInventory {
+        profiles: inventory_profiles,
+        projects,
+        global_binding,
+    })
+}
+
+/// Returns the bounded, redacted history held by the existing Runtime Data 3
+/// table. Legacy JSON is decoded conservatively into stable codes only.
+pub async fn migration_history(db: &Database) -> Result<RuntimeMigrationHistory, turso::Error> {
+    let conn = db.connect()?;
+    let mut rows = conn
+        .query(
+            "SELECT id, source_profile_id, target_profile_id, status, project_count,
+                    skipped_items_json, failures_json, rollback_available,
+                    created_at_ms, completed_at_ms, rolled_back_at_ms
+             FROM runtime_migrations
+             ORDER BY created_at_ms DESC, id DESC
+             LIMIT 50",
+            (),
+        )
+        .await?;
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let skipped: String = row.get(5)?;
+        let failures: String = row.get(6)?;
+        entries.push(RuntimeMigrationHistoryEntry {
+            migration_id: row.get(0)?,
+            source_profile_id: row.get(1)?,
+            target_profile_id: row.get(2)?,
+            status: bounded_status(&row.get::<String>(3)?),
+            project_count: row.get(4)?,
+            skipped_categories: bounded_legacy_codes(&skipped, skipped_category_code),
+            failure_codes: bounded_legacy_codes(&failures, failure_code),
+            rollback_available: row.get::<i64>(7)? != 0,
+            created_at_ms: row.get(8)?,
+            completed_at_ms: row.get(9)?,
+            rolled_back_at_ms: row.get(10)?,
+        });
+    }
+    Ok(RuntimeMigrationHistory { entries })
+}
 
 pub async fn preview_migration(
     db: &Database,
@@ -1389,6 +1572,73 @@ async fn migration_projects(
         }
     }
     Ok(projects)
+}
+
+async fn migration_project_bindings(
+    db: &Database,
+) -> Result<(Vec<String>, HashMap<String, Option<String>>), turso::Error> {
+    let conn = db.connect()?;
+    let mut rows = conn
+        .query(
+            "SELECT id, runtime_profile_id FROM projects ORDER BY id ASC",
+            (),
+        )
+        .await?;
+    let mut project_ids = Vec::new();
+    let mut bindings = HashMap::new();
+    while let Some(row) = rows.next().await? {
+        let project_id: String = row.get(0)?;
+        let profile_id: Option<String> = row.get(1)?;
+        project_ids.push(project_id.clone());
+        bindings.insert(project_id, profile_id);
+    }
+    Ok((project_ids, bindings))
+}
+
+fn bounded_status(status: &str) -> String {
+    match status {
+        "completed" | "failed" | "rolled_back" => status.to_owned(),
+        _ => "unknown".to_owned(),
+    }
+}
+
+fn bounded_legacy_codes(value: &str, map: impl Fn(&str) -> Option<&'static str>) -> Vec<String> {
+    let Ok(values) = serde_json::from_str::<Vec<String>>(value) else {
+        return vec!["unknown".to_owned()];
+    };
+    let mut codes = values
+        .iter()
+        .map(|value| map(value).unwrap_or("unknown").to_owned())
+        .collect::<Vec<_>>();
+    codes.sort();
+    codes.dedup();
+    codes
+}
+
+fn skipped_category_code(value: &str) -> Option<&'static str> {
+    match value {
+        "images" => Some("images"),
+        "containers" => Some("containers"),
+        "volume data" | "volumes" => Some("volumes"),
+        "networks" => Some("networks"),
+        "registry credentials" => Some("registry_credentials"),
+        "runtime settings" => Some("runtime_settings"),
+        "runtime ownership" => Some("runtime_ownership"),
+        "project files" => Some("project_files"),
+        _ => None,
+    }
+}
+
+fn failure_code(value: &str) -> Option<&'static str> {
+    match value {
+        "binding_race" => Some("binding_race"),
+        "target_missing" => Some("target_missing"),
+        "target_unavailable" => Some("target_unavailable"),
+        "target_incompatible" => Some("target_incompatible"),
+        "active_work" => Some("active_work"),
+        "stale_preview" => Some("stale_preview"),
+        _ => None,
+    }
 }
 
 async fn bound_project_count(db: &Database, profile_id: &str) -> Result<i64, turso::Error> {
