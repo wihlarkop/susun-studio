@@ -1441,7 +1441,8 @@ async fn load_migration(
 }
 
 /// Count of running jobs and watch sessions attributed to a runtime profile.
-/// Watch sessions attribute through their project's runtime binding.
+/// A watch session keeps its persisted start-time attribution rather than
+/// following a later project binding change.
 async fn active_work(db: &Database, profile_id: &str) -> Result<(i64, i64), turso::Error> {
     let conn = db.connect()?;
     let mut job_rows = conn
@@ -1456,9 +1457,8 @@ async fn active_work(db: &Database, profile_id: &str) -> Result<(i64, i64), turs
     };
     let mut watch_rows = conn
         .query(
-            "SELECT COUNT(*) FROM watch_sessions w
-             JOIN projects p ON p.id = w.project_id
-             WHERE w.status = 'running' AND p.runtime_profile_id = ?1",
+            "SELECT COUNT(*) FROM watch_sessions
+             WHERE status = 'running' AND runtime_profile_id = ?1",
             params![profile_id.to_owned()],
         )
         .await?;

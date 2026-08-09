@@ -9,25 +9,25 @@
   import ServicesPanel from "./services-panel.svelte";
   import LogsViewer from "./logs-viewer.svelte";
   import EventsViewer from "./events-viewer.svelte";
-  import { setProjectEngine, type RuntimeProfile, type StudioProject } from "$lib/daemon/client";
+  import { type RuntimeProfile, type StudioProject } from "$lib/daemon/client";
   import RuntimeIdentity from "./runtime-identity.svelte";
   import { presentRuntimeBinding } from "$lib/runtime/presentation";
   import { presentProjectBinding } from "$lib/runtime/project-binding-state";
   import { ChevronDown } from "@lucide/svelte";
+  import type { RuntimeContextTarget } from "$lib/runtime/context-change";
 
   let {
     project,
     profiles,
-    onEngineChanged,
+    onContextChange,
   }: {
     project: StudioProject | null;
     profiles: RuntimeProfile[];
-    onEngineChanged: () => void;
+    onContextChange: (target: RuntimeContextTarget) => void;
   } = $props();
 
   let showLogs = $state(false);
   let logsAutoStartToken = $state(0);
-  let bindingBusy = $state(false);
   let bindingSelect = $state<HTMLSelectElement | null>(null);
 
   const bindingView = $derived(
@@ -51,16 +51,10 @@
     logsAutoStartToken += 1;
   }
 
-  async function changeBinding(event: Event) {
+  function changeBinding(event: Event) {
     if (!project) return;
     const value = (event.currentTarget as HTMLSelectElement).value;
-    bindingBusy = true;
-    try {
-      await setProjectEngine(project.id, value || null);
-      onEngineChanged();
-    } finally {
-      bindingBusy = false;
-    }
+    onContextChange({ kind: "project", projectId: project.id, profileId: value || null });
   }
 </script>
 
@@ -76,7 +70,6 @@
       <select
         bind:this={bindingSelect}
         class="h-8 appearance-none rounded-md border bg-background bg-none pr-8 pl-3 text-sm"
-        disabled={bindingBusy}
         value={project.runtime_profile_id ?? ""}
         onchange={changeBinding}
         aria-label="Project runtime binding"
@@ -102,7 +95,7 @@
       />
       </div>
       {#if bindingView.canClear}
-        <Button size="sm" variant="ghost" disabled={bindingBusy} onclick={() => bindingSelect?.focus()}>
+        <Button size="sm" variant="ghost" onclick={() => bindingSelect?.focus()}>
           Change runtime
         </Button>
       {/if}

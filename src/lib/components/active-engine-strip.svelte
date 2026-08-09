@@ -7,31 +7,30 @@
   import RuntimeIdentity from "./runtime-identity.svelte";
   import {
     readEngineHealth,
-    setPreferredRuntime,
     type EngineHealth,
     type RuntimePreference,
     type RuntimeProfile,
   } from "$lib/daemon/client";
   import { resolveActiveEngineId } from "$lib/engine-identity";
   import { presentRuntimeBinding } from "$lib/runtime/presentation";
+  import type { RuntimeContextTarget } from "$lib/runtime/context-change";
 
   let {
     profiles,
     runtimePreference,
     connected,
     onManageRuntimes,
-    onChanged,
+    onContextChange,
   }: {
     profiles: RuntimeProfile[];
     runtimePreference: RuntimePreference | undefined;
     connected: boolean;
     onManageRuntimes: () => void;
-    onChanged: () => void | Promise<void>;
+    onContextChange: (target: RuntimeContextTarget) => void;
   } = $props();
 
   let health = $state<EngineHealth | null>(null);
   let checking = $state(false);
-  let switching = $state(false);
   let pruneDialogOpen = $state(false);
 
   const binding = $derived(runtimePreference?.binding ?? null);
@@ -65,16 +64,10 @@
     }
   }
 
-  async function switchProfile(event: Event) {
+  function switchProfile(event: Event) {
     const profileId = (event.currentTarget as HTMLSelectElement).value || null;
     if (profileId === runtimePreference?.preferred_profile_id) return;
-    switching = true;
-    try {
-      await setPreferredRuntime(profileId);
-      await onChanged();
-    } finally {
-      switching = false;
-    }
+    onContextChange({ kind: "preference", profileId });
   }
 </script>
 
@@ -101,7 +94,7 @@
         <div class="relative min-w-72 max-w-full flex-1 sm:flex-none">
           <select
             class="h-9 w-full appearance-none rounded-md border bg-background bg-none pr-9 pl-3 text-sm leading-5"
-            disabled={switching || !connected}
+            disabled={!connected}
             value={runtimePreference?.preferred_profile_id ?? ""}
             onchange={switchProfile}
             aria-label="Set preferred runtime"

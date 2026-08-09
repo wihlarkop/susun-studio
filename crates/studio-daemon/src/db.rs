@@ -108,6 +108,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "project_recency",
         sql: include_str!("../migrations/0021_project_recency.sql"),
     },
+    Migration {
+        version: 22,
+        name: "watch_runtime_attribution",
+        sql: include_str!("../migrations/0022_watch_runtime_attribution.sql"),
+    },
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -324,6 +329,16 @@ mod tests {
             .await?;
         let conn = db.connect()?;
         apply_migrations_upto(&conn, 19).await?;
+        Ok((db, conn, path))
+    }
+
+    async fn version_twenty_one_database() -> TestResult<(Database, Connection, PathBuf)> {
+        let path = unique_db_path();
+        let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
+            .build()
+            .await?;
+        let conn = db.connect()?;
+        apply_migrations_upto(&conn, 21).await?;
         Ok((db, conn, path))
     }
 
@@ -675,8 +690,8 @@ mod tests {
     }
 
     #[test]
-    fn project_recency_migration_is_registered() {
-        assert_eq!(latest_migration_version(), 21);
+    fn watch_runtime_attribution_migration_is_registered() {
+        assert_eq!(latest_migration_version(), 22);
     }
 
     #[tokio::test]
@@ -704,6 +719,44 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("existing project"))?;
         assert_eq!(row.get::<String>(0)?, "existing");
         assert_eq!(row.get::<Option<i64>>(1)?, None);
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watch_runtime_attribution_migration_preserves_existing_sessions_and_checks_values()
+    -> TestResult {
+        let (_db, conn, path) = version_twenty_one_database().await?;
+        conn.execute(
+            "INSERT INTO watch_sessions (
+                id, project_id, status, action, services_json, sync_specs_json,
+                watch_paths_json, debounce_ms, track_restart_as_job, created_at_ms, updated_at_ms
+             ) VALUES ('legacy-watch', 'project-1', 'stopped', 'restart', '[]', '[]', '[]', 150, 0, 1, 1)",
+            (),
+        )
+        .await?;
+
+        apply_pending_migrations(&conn).await?;
+
+        let mut rows = conn
+            .query(
+                "SELECT runtime_profile_id, runtime_class, runtime_binding_source
+                 FROM watch_sessions WHERE id = 'legacy-watch'",
+                (),
+            )
+            .await?;
+        let row = rows.next().await?.ok_or("legacy watch")?;
+        assert_eq!(row.get::<Option<String>>(0)?, None);
+        assert_eq!(row.get::<Option<String>>(1)?, None);
+        assert_eq!(row.get::<Option<String>>(2)?, None);
+
+        for sql in [
+            "UPDATE watch_sessions SET runtime_class = 'unsupported' WHERE id = 'legacy-watch'",
+            "UPDATE watch_sessions SET runtime_binding_source = 'fallback' WHERE id = 'legacy-watch'",
+        ] {
+            assert!(conn.execute(sql, ()).await.is_err());
+        }
 
         let _ = std::fs::remove_file(path);
         Ok(())

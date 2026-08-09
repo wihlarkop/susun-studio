@@ -1,5 +1,6 @@
 use std::{
     path::PathBuf,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -72,6 +73,9 @@ pub struct WatchSessionResponse {
     pub last_action_status: Option<String>,
     pub last_action_error: Option<String>,
     pub error: Option<String>,
+    pub runtime_profile_id: Option<String>,
+    pub runtime_class: Option<String>,
+    pub runtime_binding_source: Option<crate::runtime::RuntimeBindingSource>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -90,6 +94,31 @@ fn now_ms() -> Result<i64, ApiError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ApiError::Clock)?;
     i64::try_from(duration.as_millis()).map_err(|_| ApiError::Clock)
+}
+
+struct WatchRuntimeContext {
+    context: Arc<crate::susun_integration::RuntimeContext>,
+    engine: Arc<susun_engine_bollard::BollardEngine>,
+    attribution: crate::runtime::RuntimeAttribution,
+}
+
+fn runtime_binding_source_value(source: crate::runtime::RuntimeBindingSource) -> &'static str {
+    match source {
+        crate::runtime::RuntimeBindingSource::ProjectPin => "project_pin",
+        crate::runtime::RuntimeBindingSource::GlobalPreference => "global_preference",
+        crate::runtime::RuntimeBindingSource::PlatformDefault => "platform_default",
+    }
+}
+
+fn runtime_binding_source_from_db(
+    value: Option<String>,
+) -> Option<crate::runtime::RuntimeBindingSource> {
+    match value.as_deref() {
+        Some("project_pin") => Some(crate::runtime::RuntimeBindingSource::ProjectPin),
+        Some("global_preference") => Some(crate::runtime::RuntimeBindingSource::GlobalPreference),
+        Some("platform_default") => Some(crate::runtime::RuntimeBindingSource::PlatformDefault),
+        _ => None,
+    }
 }
 
 pub async fn start_watch(
@@ -112,6 +141,20 @@ pub async fn start_watch(
             "sync and sync_restart require at least one sync mapping".to_owned(),
         ));
     }
+
+    // Resolve and connect exactly once for the lifetime of this session. The
+    // session-owned context is passed to every later action so a changed
+    // project pin or global preference cannot redirect the running watch.
+    let crate::routes::service_actions::ServiceEngineContext {
+        context,
+        engine,
+        attribution,
+    } = engine_context(&state, &project_id).await?;
+    let runtime = WatchRuntimeContext {
+        context: Arc::new(context),
+        engine: Arc::new(engine),
+        attribution,
+    };
 
     let source = load_project_source(&state, &project_id).await?;
     let dockerignore = susun_integration::resolve_dockerignore(&source.root);
@@ -137,7 +180,16 @@ pub async fn start_watch(
             container_path: spec.container_path.clone(),
         })
         .collect();
-    insert_watch_session(&state, &watch_id, &project_id, &request, &sync_specs, now).await?;
+    insert_watch_session(
+        &state,
+        &watch_id,
+        &project_id,
+        &request,
+        &sync_specs,
+        &runtime.attribution,
+        now,
+    )
+    .await?;
 
     let sender = state.watch.register(watch_id.clone(), cancellation);
 
@@ -151,6 +203,7 @@ pub async fn start_watch(
         request.services,
         sync_specs,
         request.track_restart_as_job,
+        runtime,
     );
 
     read_watch_session_row(&state, &watch_id).await
@@ -162,6 +215,7 @@ async fn insert_watch_session(
     project_id: &str,
     request: &StartWatchRequest,
     sync_specs: &[SyncSpecRow],
+    attribution: &crate::runtime::RuntimeAttribution,
     now: i64,
 ) -> Result<(), ApiError> {
     let services_json = serde_json::to_string(&request.services).unwrap_or_default();
@@ -171,8 +225,9 @@ async fn insert_watch_session(
     conn.execute(
         "INSERT INTO watch_sessions (
              id, project_id, status, action, services_json, sync_specs_json,
-             watch_paths_json, debounce_ms, track_restart_as_job, created_at_ms, updated_at_ms
-         ) VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+             watch_paths_json, debounce_ms, track_restart_as_job,
+             runtime_profile_id, runtime_class, runtime_binding_source, created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
         params![
             watch_id.to_owned(),
             project_id.to_owned(),
@@ -182,6 +237,9 @@ async fn insert_watch_session(
             watch_paths_json,
             request.debounce_ms as i64,
             i64::from(request.track_restart_as_job),
+            attribution.runtime_profile_id.clone(),
+            attribution.runtime_class.clone(),
+            runtime_binding_source_value(attribution.binding_source),
             now
         ],
     )
@@ -200,6 +258,7 @@ fn run_watch_session(
     services: Vec<String>,
     sync_specs: Vec<SyncSpecRow>,
     track_restart_as_job: bool,
+    runtime: WatchRuntimeContext,
 ) {
     let (event_tx, mut event_rx) =
         mpsc::unbounded_channel::<susun::WatchResult<susun::WatchEvent>>();
@@ -245,6 +304,7 @@ fn run_watch_session(
                     let result = dispatch_watch_action(
                         &state,
                         &project_id,
+                        &runtime,
                         &action,
                         &services,
                         &sync_specs,
@@ -378,6 +438,7 @@ async fn update_last_action(db: &Database, watch_id: &str, status: &str, error: 
 async fn dispatch_watch_action(
     state: &AppState,
     project_id: &str,
+    runtime: &WatchRuntimeContext,
     action: &str,
     services: &[String],
     sync_specs: &[SyncSpecRow],
@@ -390,21 +451,23 @@ async fn dispatch_watch_action(
                 build_policy: susun::BuildPolicy::BuildDeclared,
                 ..susun::UpPlanOptions::default()
             };
-            crate::routes::jobs::start_up_job(
+            crate::routes::jobs::start_up_job_with_runtime(
                 state.clone(),
                 project_id.to_owned(),
                 "build",
                 options,
+                Arc::clone(&runtime.engine),
+                runtime.attribution.clone(),
             )
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
         }
-        "restart" => run_restart(state, project_id, services, track_restart_as_job).await,
-        "sync" => sync_watch_event(state, project_id, sync_specs, event).await,
+        "restart" => run_restart(state, project_id, runtime, services, track_restart_as_job).await,
+        "sync" => sync_watch_event(runtime, sync_specs, event).await,
         "sync_restart" => {
-            sync_watch_event(state, project_id, sync_specs, event).await?;
-            run_restart(state, project_id, services, track_restart_as_job).await
+            sync_watch_event(runtime, sync_specs, event).await?;
+            run_restart(state, project_id, runtime, services, track_restart_as_job).await
         }
         _ => Err(format!("unknown watch action `{action}`")),
     }
@@ -413,22 +476,19 @@ async fn dispatch_watch_action(
 async fn run_restart(
     state: &AppState,
     project_id: &str,
+    runtime: &WatchRuntimeContext,
     services: &[String],
     track_as_job: bool,
 ) -> Result<(), String> {
     if track_as_job {
-        return start_restart_job(state, project_id, services.to_vec())
+        return start_restart_job(state, project_id, runtime, services.to_vec())
             .await
             .map(|_job_id| ())
             .map_err(|error| error.to_string());
     }
-    let crate::routes::service_actions::ServiceEngineContext {
-        context, engine, ..
-    } = engine_context(state, project_id)
-        .await
-        .map_err(|error| error.to_string())?;
     let targets: Vec<String> = if services.is_empty() {
-        context
+        runtime
+            .context
             .project
             .services
             .keys()
@@ -438,7 +498,7 @@ async fn run_restart(
         services.to_vec()
     };
     for service in targets {
-        restart_service_containers(&engine, &context, &service)
+        restart_service_containers(&runtime.engine, &runtime.context, &service)
             .await
             .map_err(|error| error.to_string())?;
     }
@@ -446,8 +506,7 @@ async fn run_restart(
 }
 
 async fn sync_watch_event(
-    state: &AppState,
-    project_id: &str,
+    runtime: &WatchRuntimeContext,
     sync_specs: &[SyncSpecRow],
     event: &susun::WatchEvent,
 ) -> Result<(), String> {
@@ -463,13 +522,8 @@ async fn sync_watch_event(
     if matching.is_empty() {
         return Ok(());
     }
-    let crate::routes::service_actions::ServiceEngineContext {
-        context, engine, ..
-    } = engine_context(state, project_id)
-        .await
-        .map_err(|error| error.to_string())?;
     for spec in matching {
-        let (container, _) = require_containers(&engine, &context, &spec.service)
+        let (container, _) = require_containers(&runtime.engine, &runtime.context, &spec.service)
             .await
             .map_err(|error| error.to_string())?
             .into_iter()
@@ -477,7 +531,8 @@ async fn sync_watch_event(
             .ok_or_else(|| format!("service `{}` has no running containers", spec.service))?;
         let archive =
             build_single_file_archive(&event.absolute_path).map_err(|error| error.to_string())?;
-        engine
+        runtime
+            .engine
             .copy_to_container(susun::CopyToContainerRequest {
                 container,
                 path: spec.container_path.clone(),
@@ -496,22 +551,28 @@ async fn sync_watch_event(
 async fn start_restart_job(
     state: &AppState,
     project_id: &str,
+    runtime: &WatchRuntimeContext,
     services: Vec<String>,
 ) -> Result<String, ApiError> {
-    let crate::routes::service_actions::ServiceEngineContext {
-        context,
-        engine,
-        attribution,
-    } = engine_context(state, project_id).await?;
     let now = now_ms()?;
     let job_id = format!("job-{now}-restart");
     let request_json =
         serde_json::to_string(&serde_json::json!({ "kind": "restart", "services": services }))
             .unwrap_or_default();
-    insert_restart_job(state, &job_id, project_id, &request_json, &attribution, now).await?;
+    insert_restart_job(
+        state,
+        &job_id,
+        project_id,
+        &request_json,
+        &runtime.attribution,
+        now,
+    )
+    .await?;
 
     let db = state.db.clone();
     let spawn_job_id = job_id.clone();
+    let engine = Arc::clone(&runtime.engine);
+    let context = Arc::clone(&runtime.context);
     tokio::spawn(async move {
         let result: Result<(), ApiError> = async {
             let targets: Vec<String> = if services.is_empty() {
@@ -605,6 +666,9 @@ fn row_to_response(
     last_action_status: Option<String>,
     last_action_error: Option<String>,
     error: Option<String>,
+    runtime_profile_id: Option<String>,
+    runtime_class: Option<String>,
+    runtime_binding_source: Option<String>,
     created_at_ms: i64,
     updated_at_ms: i64,
 ) -> WatchSessionResponse {
@@ -630,6 +694,9 @@ fn row_to_response(
         last_action_status,
         last_action_error,
         error,
+        runtime_profile_id,
+        runtime_class,
+        runtime_binding_source: runtime_binding_source_from_db(runtime_binding_source),
         created_at_ms,
         updated_at_ms,
     }
@@ -644,7 +711,8 @@ async fn read_watch_session_row(
         .query(
             "SELECT id, project_id, status, action, services_json, sync_specs_json,
                     watch_paths_json, debounce_ms, track_restart_as_job, last_action_status,
-                    last_action_error, error, created_at_ms, updated_at_ms
+                    last_action_error, error, runtime_profile_id, runtime_class,
+                    runtime_binding_source, created_at_ms, updated_at_ms
              FROM watch_sessions WHERE id = ?1 LIMIT 1",
             params![watch_id.to_owned()],
         )
@@ -667,6 +735,9 @@ async fn read_watch_session_row(
         row.get(11)?,
         row.get(12)?,
         row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
+        row.get(16)?,
     )))
 }
 
@@ -689,7 +760,8 @@ pub async fn list_watch_sessions(
         .query(
             "SELECT id, project_id, status, action, services_json, sync_specs_json,
                     watch_paths_json, debounce_ms, track_restart_as_job, last_action_status,
-                    last_action_error, error, created_at_ms, updated_at_ms
+                    last_action_error, error, runtime_profile_id, runtime_class,
+                    runtime_binding_source, created_at_ms, updated_at_ms
              FROM watch_sessions ORDER BY created_at_ms DESC",
             (),
         )
@@ -711,6 +783,9 @@ pub async fn list_watch_sessions(
             row.get(11)?,
             row.get(12)?,
             row.get(13)?,
+            row.get(14)?,
+            row.get(15)?,
+            row.get(16)?,
         ));
     }
     Ok(Json(WatchListResponse { sessions }))
@@ -727,7 +802,8 @@ pub async fn list_project_watch_sessions(
         .query(
             "SELECT id, project_id, status, action, services_json, sync_specs_json,
                     watch_paths_json, debounce_ms, track_restart_as_job, last_action_status,
-                    last_action_error, error, created_at_ms, updated_at_ms
+                    last_action_error, error, runtime_profile_id, runtime_class,
+                    runtime_binding_source, created_at_ms, updated_at_ms
              FROM watch_sessions WHERE project_id = ?1 ORDER BY created_at_ms DESC LIMIT 20",
             params![project_id],
         )
@@ -749,6 +825,9 @@ pub async fn list_project_watch_sessions(
             row.get(11)?,
             row.get(12)?,
             row.get(13)?,
+            row.get(14)?,
+            row.get(15)?,
+            row.get(16)?,
         ));
     }
     Ok(Json(WatchListResponse { sessions }))
@@ -859,6 +938,102 @@ mod tests {
         assert_eq!(profile_id.as_deref(), Some("profile-1"));
         assert_eq!(runtime_class.as_deref(), Some("external_local"));
         assert_eq!(binding_source.as_deref(), Some("project_pin"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watch_session_persists_the_runtime_attribution_at_start() -> TestResult {
+        let state = test_state(fresh_db("watch-session-runtime-attribution").await?);
+        let request = StartWatchRequest {
+            action: "restart".to_owned(),
+            services: Vec::new(),
+            sync: Vec::new(),
+            watch_paths: Vec::new(),
+            debounce_ms: 150,
+            track_restart_as_job: false,
+        };
+        let attribution = crate::runtime::RuntimeAttribution {
+            runtime_profile_id: Some("profile-1".to_owned()),
+            runtime_class: Some("external_local".to_owned()),
+            binding_source: crate::runtime::RuntimeBindingSource::GlobalPreference,
+        };
+
+        insert_watch_session(
+            &state,
+            "watch-attribution",
+            "project-1",
+            &request,
+            &[],
+            &attribution,
+            1,
+        )
+        .await?;
+
+        let conn = state.db.connect()?;
+        let mut rows = conn
+            .query(
+                "SELECT runtime_profile_id, runtime_class, runtime_binding_source
+                 FROM watch_sessions WHERE id = 'watch-attribution'",
+                (),
+            )
+            .await?;
+        let row = rows.next().await?.ok_or("watch session")?;
+        assert_eq!(row.get::<Option<String>>(0)?.as_deref(), Some("profile-1"));
+        assert_eq!(
+            row.get::<Option<String>>(1)?.as_deref(),
+            Some("external_local")
+        );
+        assert_eq!(
+            row.get::<Option<String>>(2)?.as_deref(),
+            Some("global_preference")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn platform_default_watch_session_records_source_without_inventing_profile_identity()
+    -> TestResult {
+        let state = test_state(fresh_db("watch-platform-default-attribution").await?);
+        let request = StartWatchRequest {
+            action: "restart".to_owned(),
+            services: Vec::new(),
+            sync: Vec::new(),
+            watch_paths: Vec::new(),
+            debounce_ms: 150,
+            track_restart_as_job: false,
+        };
+        let attribution = crate::runtime::RuntimeAttribution {
+            runtime_profile_id: None,
+            runtime_class: None,
+            binding_source: crate::runtime::RuntimeBindingSource::PlatformDefault,
+        };
+
+        insert_watch_session(
+            &state,
+            "watch-platform-default",
+            "project-1",
+            &request,
+            &[],
+            &attribution,
+            1,
+        )
+        .await?;
+
+        let conn = state.db.connect()?;
+        let mut rows = conn
+            .query(
+                "SELECT runtime_profile_id, runtime_class, runtime_binding_source
+                 FROM watch_sessions WHERE id = 'watch-platform-default'",
+                (),
+            )
+            .await?;
+        let row = rows.next().await?.ok_or("watch session")?;
+        assert_eq!(row.get::<Option<String>>(0)?, None);
+        assert_eq!(row.get::<Option<String>>(1)?, None);
+        assert_eq!(
+            row.get::<Option<String>>(2)?.as_deref(),
+            Some("platform_default")
+        );
         Ok(())
     }
 }

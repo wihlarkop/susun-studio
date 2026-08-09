@@ -9,6 +9,7 @@
   import RuntimeActionAudit from "$lib/components/runtime-action-audit.svelte";
   import RuntimeResourcePanel from "$lib/components/runtime-resource-panel.svelte";
   import RuntimeIdentity from "$lib/components/runtime-identity.svelte";
+  import RuntimeCompatibilityPanel from "$lib/components/runtime-compatibility-panel.svelte";
   import PruneDialog from "$lib/components/prune-dialog.svelte";
   import {
     forgetRuntimeProfile,
@@ -16,7 +17,6 @@
     readRuntimeProfileResources,
     prepareRuntimeAction,
     prepareRuntimeResourceUpdate,
-    setPreferredRuntime,
     type RuntimeAction,
     type RuntimeDimension,
     type RuntimeEndpointSummary,
@@ -28,6 +28,7 @@
   } from "$lib/daemon/client";
   import { resolveActiveEngineId } from "$lib/engine-identity";
   import { presentRuntimeBinding, presentRuntimeProfile } from "$lib/runtime/presentation";
+  import type { RuntimeContextTarget } from "$lib/runtime/context-change";
   import type { RuntimeActionDialogRequest } from "$lib/components/runtime-action-dialog.svelte";
   import {
     AlertCircle,
@@ -51,6 +52,7 @@
     refreshing,
     onRecheck,
     onChooseRuntime,
+    onContextChange,
     trayRuntimeAction = null,
     onTrayRuntimeActionHandled,
   }: {
@@ -58,6 +60,7 @@
     refreshing: boolean;
     onRecheck: () => Promise<void>;
     onChooseRuntime: () => void;
+    onContextChange: (target: RuntimeContextTarget) => void;
     trayRuntimeAction?: { action: "start" | "stop"; requestId: number } | null;
     onTrayRuntimeActionHandled?: () => void;
   } = $props();
@@ -248,9 +251,8 @@
     runtimeActionDialogOpen = true;
   }
 
-  async function handleSelect(profile: RuntimeProfile) {
-    await setPreferredRuntime(profile.id);
-    await refreshRuntime();
+  function handleSelect(profile: RuntimeProfile) {
+    onContextChange({ kind: "preference", profileId: profile.id });
   }
 
   function isPreferred(profile: RuntimeProfile): boolean {
@@ -546,6 +548,7 @@
             <div class="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-md border p-3">
               <div class="min-w-0 flex-1">
                 <RuntimeIdentity presentation={entryPresentation(entry.profile, entry.provider)} />
+                <RuntimeCompatibilityPanel profile={entry.profile} />
               </div>
               <Button
                 size="sm"
@@ -731,6 +734,7 @@
                         onnetworkchange={(mode) => handleResourceUpdate(profile, mode)}
                       />
                     {/if}
+                    <RuntimeCompatibilityPanel {profile} />
                   </div>
                   <div class="flex flex-wrap items-center gap-2 md:justify-end">
                     {#if profile.runtime_class === "built_in"}

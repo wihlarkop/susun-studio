@@ -1,4 +1,5 @@
 mod command;
+pub(crate) mod compatibility;
 mod endpoint_policy;
 pub mod onboarding;
 mod package_source;
@@ -30,6 +31,7 @@ use turso::{Connection, Database, params};
 use windows_docker_desktop::WindowsDockerDesktopProvider;
 use windows_podman::WindowsPodmanProvider;
 
+pub use compatibility::{RuntimeCompatibilityReport, RuntimeWorkflowCompatibility};
 pub use endpoint_policy::validate_engine_endpoint;
 pub use policy::{
     RuntimeAttribution, RuntimeBindingSource, RuntimeBindingState, RuntimeBindingSummary,
@@ -150,6 +152,12 @@ fn find_provider(provider_id: &str) -> Option<Box<dyn RuntimeProvider>> {
     registered_providers()
         .into_iter()
         .find(|provider| provider.id() == provider_id)
+}
+
+/// Typed provider authority used by daemon-only compatibility derivation.
+/// Product/display strings never participate in this decision.
+pub(crate) fn provider_experience(provider_id: &str) -> Option<RuntimeProviderExperience> {
+    find_provider(provider_id).map(|provider| provider.experience())
 }
 
 pub async fn status(db: &Database) -> Result<RuntimeStatus, turso::Error> {

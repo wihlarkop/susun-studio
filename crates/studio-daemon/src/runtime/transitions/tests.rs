@@ -286,6 +286,38 @@ async fn migration_commit_rejects_when_a_job_starts_after_preview() -> TestResul
 }
 
 #[tokio::test]
+async fn active_watch_work_stays_with_its_persisted_runtime_attribution() -> TestResult {
+    let (db, path, source, target) = fixture().await?;
+    let conn = db.connect()?;
+    conn.execute(
+        "INSERT INTO watch_sessions (
+            id, project_id, status, action, services_json, sync_specs_json, watch_paths_json,
+            debounce_ms, track_restart_as_job, runtime_profile_id, runtime_class,
+            runtime_binding_source, created_at_ms, updated_at_ms
+         ) VALUES (
+            'watch-source', 'p1', 'running', 'restart', '[]', '[]', '[]', 150, 0,
+            ?1, 'external_local', 'project_pin', 1, 1
+         )",
+        params![source.clone()],
+    )
+    .await?;
+
+    // The project may be rebound later, but the running session keeps the
+    // runtime it resolved when it started.
+    conn.execute(
+        "UPDATE projects SET runtime_profile_id = ?1 WHERE id = 'p1'",
+        params![target.clone()],
+    )
+    .await?;
+
+    assert_eq!(active_work(&db, &source).await?, (0, 1));
+    assert_eq!(active_work(&db, &target).await?, (0, 0));
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[tokio::test]
 async fn rollback_prepare_and_commit_restore_bindings() -> TestResult {
     let (db, path, source, target) = fixture().await?;
     let store = ActionPlanStore::default();

@@ -499,19 +499,21 @@ pub(crate) async fn engine_active_work(
     let mut watch_rows = match profile_id {
         Some(profile_id) => {
             conn.query(
-                "SELECT COUNT(*) FROM watch_sessions w
-                 JOIN projects p ON p.id = w.project_id
-                 WHERE w.status = 'running'
-                   AND (p.runtime_profile_id = ?1 OR p.runtime_profile_id IS NULL)",
+                "SELECT COUNT(*) FROM watch_sessions
+                 WHERE status = 'running' AND runtime_profile_id = ?1",
                 params![profile_id.to_owned()],
             )
             .await?
         }
         None => {
+            // Historical sessions from before attribution was introduced have
+            // no profile id. Conservatively retain their platform-default
+            // blocker behavior without claiming they ran on a later profile.
             conn.query(
-                "SELECT COUNT(*) FROM watch_sessions w
-                 JOIN projects p ON p.id = w.project_id
-                 WHERE w.status = 'running' AND p.runtime_profile_id IS NULL",
+                "SELECT COUNT(*) FROM watch_sessions
+                 WHERE status = 'running'
+                   AND runtime_profile_id IS NULL
+                   AND (runtime_binding_source IS NULL OR runtime_binding_source = 'platform_default')",
                 (),
             )
             .await?

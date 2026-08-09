@@ -237,6 +237,15 @@ pub struct EngineCapabilitiesRow {
     pub supports_network_aliases: String,
     pub supports_log_follow: String,
     pub supports_build: String,
+    pub supports_container_inventory: String,
+    pub supports_image_inventory: String,
+    pub supports_engine_information: String,
+    pub supports_image_management: String,
+    pub supports_registry_pull: String,
+    pub supports_registry_push: String,
+    pub supports_registry_auth: String,
+    pub supports_build_cache: String,
+    pub supports_cleanup_preview: String,
     pub supports_mount_types: Vec<String>,
     pub max_container_name_length: Option<usize>,
 }
@@ -353,6 +362,15 @@ pub async fn engine_capabilities(engine: &BollardEngine) -> Result<EngineCapabil
         supports_network_aliases: enum_label(capabilities.supports_network_aliases),
         supports_log_follow: enum_label(capabilities.supports_log_follow),
         supports_build: enum_label(capabilities.supports_build),
+        supports_container_inventory: enum_label(capabilities.supports_container_inventory),
+        supports_image_inventory: enum_label(capabilities.supports_image_inventory),
+        supports_engine_information: enum_label(capabilities.supports_engine_information),
+        supports_image_management: enum_label(capabilities.supports_image_management),
+        supports_registry_pull: enum_label(capabilities.supports_registry_pull),
+        supports_registry_push: enum_label(capabilities.supports_registry_push),
+        supports_registry_auth: enum_label(capabilities.supports_registry_auth),
+        supports_build_cache: enum_label(capabilities.supports_build_cache),
+        supports_cleanup_preview: enum_label(capabilities.supports_cleanup_preview),
         supports_mount_types: capabilities
             .supports_mount_types
             .iter()

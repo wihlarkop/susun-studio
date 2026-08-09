@@ -13,6 +13,7 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
 };
 use serde::{Deserialize, Serialize};
+use susun_engine_bollard::BollardEngine;
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use turso::{Database, params};
 
@@ -1027,8 +1028,28 @@ pub(crate) async fn start_up_job(
     let connected = susun_integration::resolve_and_connect_project(&state.db, &project_id)
         .await
         .map_err(ApiError::EngineUnavailable)?;
-    let attribution = connected.attribution;
-    let engine = Arc::new(connected.engine);
+    start_up_job_with_runtime(
+        state,
+        project_id,
+        kind,
+        options,
+        Arc::new(connected.engine),
+        connected.attribution,
+    )
+    .await
+}
+
+/// Starts an up/build job with a runtime already resolved by the caller.
+/// Watch sessions use this path so subsequent file events cannot re-resolve
+/// the project after a policy or pin change.
+pub(crate) async fn start_up_job_with_runtime(
+    state: AppState,
+    project_id: String,
+    kind: &'static str,
+    options: susun::UpPlanOptions,
+    engine: Arc<BollardEngine>,
+    attribution: runtime::RuntimeAttribution,
+) -> Result<Json<JobResponse>, ApiError> {
     let source = load_project_source(&state, &project_id).await?;
 
     // Plan up front so we can hand the UI a named step manifest, then execute

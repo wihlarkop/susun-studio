@@ -244,6 +244,57 @@ export type RuntimePreference = {
   binding: RuntimeBindingSummary;
 };
 
+export type RuntimePreferenceImpactPreview = {
+  current: RuntimeBindingSummary;
+  target: RuntimeBindingSummary;
+  inheriting_project_count: number;
+  explicitly_pinned_project_count: number;
+  affected_active_jobs: number;
+  affected_active_watch_sessions: number;
+  change_allowed: boolean;
+  reason_code: string | null;
+  is_noop: boolean;
+  impact_fingerprint: string;
+};
+
+export type ProjectRuntimeImpactPreview = {
+  project_id: string;
+  current: RuntimeBindingSummary;
+  target: RuntimeBindingSummary;
+  affected_active_jobs: number;
+  affected_active_watch_sessions: number;
+  change_allowed: boolean;
+  reason_code: string | null;
+  is_noop: boolean;
+  impact_fingerprint: string;
+};
+
+export type RuntimeCompatibilityLevel =
+  | "supported"
+  | "limited"
+  | "unsupported"
+  | "unavailable"
+  | "unknown";
+
+export type RuntimeWorkflowCompatibility = {
+  id: string;
+  level: RuntimeCompatibilityLevel;
+  reason_code: string;
+  detail: string;
+};
+
+export type RuntimeCompatibilityReport = {
+  profile_id: string;
+  provider_id: string;
+  runtime_class: RuntimeClass;
+  ownership_state: RuntimeOwnershipState;
+  availability_state: string;
+  observed_api_version: string | null;
+  version_policy: "probe_based";
+  workflows: RuntimeWorkflowCompatibility[];
+  observed_at_ms: number;
+};
+
 export type RuntimeOnboardingChoice = "built_in" | "existing";
 
 export type RuntimeOnboardingState = {
@@ -747,14 +798,36 @@ export async function readRuntimePolicy(
   return readJson("/v1/runtime/policy", options);
 }
 
+export async function readRuntimeCompatibility(
+  profileId: string,
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeCompatibilityReport> {
+  return readJson(`/v1/runtime/profiles/${encodeURIComponent(profileId)}/compatibility`, options);
+}
+
+export async function previewPreferredRuntime(
+  preferredProfileId: string | null,
+  options: DaemonRequestOptions = {},
+): Promise<RuntimePreferenceImpactPreview> {
+  return readJson("/v1/runtime/policy/preview", {
+    ...options,
+    method: "POST",
+    body: { preferred_profile_id: preferredProfileId },
+  });
+}
+
 export async function setPreferredRuntime(
   preferredProfileId: string | null,
+  expectedImpactFingerprint?: string,
   options: DaemonRequestOptions = {},
 ): Promise<RuntimePreference> {
   return readJson("/v1/runtime/policy", {
     ...options,
     method: "PUT",
-    body: { preferred_profile_id: preferredProfileId },
+    body: {
+      preferred_profile_id: preferredProfileId,
+      expected_impact_fingerprint: expectedImpactFingerprint,
+    },
   });
 }
 
@@ -1077,22 +1150,28 @@ export async function readRuntimeUninstallPolicy(
 export async function setProjectEngine(
   projectId: string,
   runtimeProfileId: string | null,
+  expectedImpactFingerprint?: string,
   options: DaemonRequestOptions = {},
 ): Promise<StudioProject> {
   return readJson(`/v1/projects/${encodeURIComponent(projectId)}/engine`, {
     ...options,
     method: "PUT",
-    body: { runtime_profile_id: runtimeProfileId },
+    body: {
+      runtime_profile_id: runtimeProfileId,
+      expected_impact_fingerprint: expectedImpactFingerprint,
+    },
   });
 }
 
-export async function selectRuntimeProfile(
-  profileId: string,
+export async function previewProjectEngine(
+  projectId: string,
+  runtimeProfileId: string | null,
   options: DaemonRequestOptions = {},
-): Promise<{ selected: boolean }> {
-  return readJson(`/v1/runtime/profiles/${encodeURIComponent(profileId)}/select`, {
+): Promise<ProjectRuntimeImpactPreview> {
+  return readJson(`/v1/projects/${encodeURIComponent(projectId)}/engine/preview`, {
     ...options,
     method: "POST",
+    body: { runtime_profile_id: runtimeProfileId },
   });
 }
 
@@ -1687,6 +1766,9 @@ export type StudioWatchSession = {
   last_action_status: string | null;
   last_action_error: string | null;
   error: string | null;
+  runtime_profile_id: string | null;
+  runtime_class: RuntimeClass | null;
+  runtime_binding_source: RuntimeBindingSource | null;
   created_at_ms: number;
   updated_at_ms: number;
 };

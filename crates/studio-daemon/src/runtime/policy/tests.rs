@@ -1,8 +1,10 @@
 use turso::{Database, params};
 
 use super::{
-    RuntimeBindingSource, RuntimeBindingState, SetPreferredOutcome, read_preference,
-    resolve_global, resolve_project, set_preferred, summarize_global, summarize_projects,
+    ContextChangeCommit, ContextChangeRejection, RuntimeBindingSource, RuntimeBindingState,
+    SetPreferredOutcome, commit_preference_change, commit_project_binding_change,
+    preview_preference_change, preview_project_binding_change, read_preference, resolve_global,
+    resolve_project, set_preferred, summarize_global, summarize_projects,
 };
 use crate::{db, runtime};
 
@@ -336,6 +338,149 @@ async fn setup_claim_writes_ownership_and_preference_together_after_proof() -> T
     assert_eq!(
         read_preference(&db).await?.preferred_profile_id.as_deref(),
         Some(id.as_str())
+    );
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn global_context_preview_separates_pins_and_blocks_only_redirected_work() -> TestResult {
+    let (db, path) = fresh_db().await?;
+    insert_profile(&db, "global", "Global", "available", "external").await?;
+    insert_profile(&db, "next", "Next", "available", "external").await?;
+    insert_profile(&db, "pinned", "Pinned", "available", "external").await?;
+    assert_eq!(
+        set_preferred(&db, Some("global")).await?,
+        SetPreferredOutcome::Updated
+    );
+    pin_project(&db, "inherits", None).await?;
+    pin_project(&db, "pinned-project", Some("pinned")).await?;
+
+    let preview = preview_preference_change(&db, Some("next")).await?;
+    assert_eq!(preview.inheriting_project_count, 1);
+    assert_eq!(preview.explicitly_pinned_project_count, 1);
+    assert!(preview.change_allowed);
+    assert_eq!(preview.affected_active_jobs, 0);
+    assert_eq!(preview.affected_active_watch_sessions, 0);
+
+    let conn = db.connect()?;
+    conn.execute(
+        "INSERT INTO jobs (
+            id, kind, status, project_id, engine_id, request_json,
+            runtime_profile_id, runtime_binding_source, created_at_ms, updated_at_ms
+         ) VALUES ('pinned-job', 'up', 'running', 'pinned-project', 'engine', '{}',
+                   'pinned', 'project_pin', 1, 1)",
+        (),
+    )
+    .await?;
+    assert!(
+        preview_preference_change(&db, Some("next"))
+            .await?
+            .change_allowed
+    );
+
+    conn.execute(
+        "INSERT INTO jobs (
+            id, kind, status, project_id, engine_id, request_json,
+            runtime_profile_id, runtime_binding_source, created_at_ms, updated_at_ms
+         ) VALUES ('inherited-job', 'up', 'running', 'inherits', 'engine', '{}',
+                   'global', 'global_preference', 1, 1)",
+        (),
+    )
+    .await?;
+    let blocked = preview_preference_change(&db, Some("next")).await?;
+    assert!(!blocked.change_allowed);
+    assert_eq!(blocked.reason_code.as_deref(), Some("active_work"));
+    assert_eq!(blocked.affected_active_jobs, 1);
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn clearing_a_project_pin_previews_global_and_fails_closed_when_unavailable() -> TestResult {
+    let (db, path) = fresh_db().await?;
+    insert_profile(&db, "missing", "Missing", "missing", "external").await?;
+    insert_profile(&db, "pinned", "Pinned", "available", "external").await?;
+    pin_project(&db, "project", Some("pinned")).await?;
+    let conn = db.connect()?;
+    conn.execute(
+        "UPDATE runtime_policy SET preferred_profile_id = 'missing' WHERE singleton = 1",
+        (),
+    )
+    .await?;
+
+    let preview = preview_project_binding_change(&db, "project", None)
+        .await?
+        .ok_or("project preview")?;
+    assert_eq!(preview.current.source, RuntimeBindingSource::ProjectPin);
+    assert_eq!(
+        preview.target.source,
+        RuntimeBindingSource::GlobalPreference
+    );
+    assert_eq!(preview.target.state, RuntimeBindingState::Unavailable);
+    assert!(!preview.change_allowed);
+    assert_eq!(preview.reason_code.as_deref(), Some("target_unavailable"));
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn context_commits_recompute_fingerprints_and_leave_policy_and_pins_unchanged() -> TestResult
+{
+    let (db, path) = fresh_db().await?;
+    insert_profile(&db, "global", "Global", "available", "external").await?;
+    insert_profile(&db, "next", "Next", "available", "external").await?;
+    insert_profile(&db, "pinned", "Pinned", "available", "external").await?;
+    assert_eq!(
+        set_preferred(&db, Some("global")).await?,
+        SetPreferredOutcome::Updated
+    );
+    pin_project(&db, "project", Some("pinned")).await?;
+
+    let global_preview = preview_preference_change(&db, Some("next")).await?;
+    let conn = db.connect()?;
+    conn.execute(
+        "INSERT INTO jobs (
+            id, kind, status, project_id, engine_id, request_json,
+            runtime_profile_id, runtime_binding_source, created_at_ms, updated_at_ms
+         ) VALUES ('running-global', 'up', 'running', 'project', 'engine', '{}',
+                   'global', 'global_preference', 1, 1)",
+        (),
+    )
+    .await?;
+    assert_eq!(
+        commit_preference_change(&db, Some("next"), &global_preview.impact_fingerprint).await?,
+        ContextChangeCommit::Rejected(ContextChangeRejection::StalePreview)
+    );
+    assert_eq!(
+        read_preference(&db).await?.preferred_profile_id.as_deref(),
+        Some("global")
+    );
+
+    conn.execute("DELETE FROM jobs WHERE id = 'running-global'", ())
+        .await?;
+    let pin_preview = preview_project_binding_change(&db, "project", Some("next"))
+        .await?
+        .ok_or("project preview")?;
+    conn.execute(
+        "UPDATE projects SET runtime_profile_id = 'global' WHERE id = 'project'",
+        (),
+    )
+    .await?;
+    assert_eq!(
+        commit_project_binding_change(
+            &db,
+            "project",
+            Some("next"),
+            &pin_preview.impact_fingerprint
+        )
+        .await?,
+        Some(ContextChangeCommit::Rejected(
+            ContextChangeRejection::StalePreview
+        ))
     );
 
     let _ = std::fs::remove_file(path);

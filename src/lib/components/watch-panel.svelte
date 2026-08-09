@@ -2,6 +2,7 @@
   import * as Card from "$lib/components/ui/card/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
   import StatusBadge from "./status-badge.svelte";
+  import RuntimeIdentity from "./runtime-identity.svelte";
   import { Eye, Plus, X } from "@lucide/svelte";
   import {
     listProjectWatchSessions,
@@ -14,6 +15,7 @@
     type SyncSpec,
     type WatchAction,
   } from "$lib/daemon/client";
+  import { presentRuntimeAttribution } from "$lib/runtime/presentation";
 
   let { project }: { project: StudioProject | null } = $props();
 
@@ -30,6 +32,9 @@
   let servicesInput = $state("");
   let syncSpecs = $state<SyncSpec[]>([]);
   let trackRestartAsJob = $state(false);
+  const runtimePresentation = $derived(
+    session ? presentRuntimeAttribution(session) : null,
+  );
 
   async function refresh() {
     if (!projectId) return;
@@ -168,6 +173,9 @@
         >{session.action.replace("_", " + ")}</span
       >
     </p>
+    {#if runtimePresentation}
+      <RuntimeIdentity presentation={runtimePresentation} compact />
+    {/if}
     {#if session.last_action_status}
       <p class="text-xs">
         Last action:

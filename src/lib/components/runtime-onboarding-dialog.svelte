@@ -7,6 +7,7 @@
     completeRuntimeOnboarding,
     dismissRuntimeOnboarding,
     prepareRuntimeAction,
+    previewPreferredRuntime,
     setPreferredRuntime,
     type RuntimeOnboardingState,
     type RuntimeProfile,
@@ -124,7 +125,12 @@
     selectingProfileId = profile.id;
     message = null;
     try {
-      await setPreferredRuntime(profile.id);
+      const preview = await previewPreferredRuntime(profile.id);
+      if (!preview.change_allowed) {
+        message = "This runtime cannot be selected while it would redirect active work.";
+        return;
+      }
+      await setPreferredRuntime(profile.id, preview.impact_fingerprint);
       await completeRuntimeOnboarding("existing");
       await onchanged();
       open = false;

@@ -14,6 +14,7 @@
   import ImportProjectDialog from "$lib/components/import-project-dialog.svelte";
   import BetaOnboardingPanel from "$lib/components/beta-onboarding-panel.svelte";
   import RuntimeOnboardingDialog from "$lib/components/runtime-onboarding-dialog.svelte";
+  import RuntimeContextDialog from "$lib/components/runtime-context-dialog.svelte";
   import { createDaemonState } from "$lib/daemon/daemon-state.svelte";
   import {
     reopenRuntimeOnboarding,
@@ -21,6 +22,7 @@
     type ImportProjectResponse,
   } from "$lib/daemon/client";
   import { resolveOnboardingView } from "$lib/runtime/onboarding-state";
+  import type { RuntimeContextTarget } from "$lib/runtime/context-change";
   import {
     listenForTrayRequests,
     type TrayNavigationIntent,
@@ -34,6 +36,8 @@
   let runtimeOnboardingOpen = $state(false);
   let runtimeOnboardingReopened = $state(false);
   let trayRuntimeAction = $state<{ action: TrayRuntimeAction; requestId: number } | null>(null);
+  let runtimeContextIntent = $state<RuntimeContextTarget | null>(null);
+  let runtimeContextOpen = $state(false);
   let nextTrayRequestId = 0;
   const selectedProject = $derived(
     daemonState.projects.find((project) => project.id === selectedProjectId) ??
@@ -128,6 +132,11 @@
     runtimeOnboardingReopened = false;
   }
 
+  function openRuntimeContext(target: RuntimeContextTarget) {
+    runtimeContextIntent = target;
+    runtimeContextOpen = true;
+  }
+
   function handleTrayNavigation(intent: TrayNavigationIntent) {
     switch (intent) {
       case "open":
@@ -203,7 +212,7 @@
           runtimePreference={daemonState.runtimePreference}
           connected={daemonState.healthState.kind === "connected"}
           onManageRuntimes={() => (activeView = "runtime")}
-          onChanged={() => daemonState.refresh()}
+          onContextChange={openRuntimeContext}
         />
         <ProjectsTable
           projects={daemonState.projects}
@@ -215,7 +224,7 @@
         <ProjectWorkspace
           project={selectedProject}
           profiles={daemonState.runtimeProfiles}
-          onEngineChanged={() => daemonState.refresh()}
+          onContextChange={openRuntimeContext}
         />
       {:else if activeView === "jobs"}
         <JobsPage projects={daemonState.projects} />
@@ -225,6 +234,7 @@
           refreshing={daemonState.refreshing}
           onRecheck={daemonState.refresh}
           onChooseRuntime={openRuntimeSetup}
+          onContextChange={openRuntimeContext}
           {trayRuntimeAction}
           onTrayRuntimeActionHandled={() => (trayRuntimeAction = null)}
         />
@@ -249,6 +259,12 @@
   connected={daemonState.healthState.kind === "connected"}
   runtimeProfiles={daemonState.runtimeProfiles}
   onImport={handleImport}
+/>
+
+<RuntimeContextDialog
+  bind:open={runtimeContextOpen}
+  intent={runtimeContextIntent}
+  oncompleted={daemonState.refresh}
 />
 
 {#if runtimeOnboardingOpen && daemonState.runtimeStatus && daemonState.runtimeOnboarding}
