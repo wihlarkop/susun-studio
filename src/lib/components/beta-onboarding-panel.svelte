@@ -3,13 +3,18 @@
   import { Badge } from "$lib/components/ui/badge/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
   import { CheckCircle2, CircleAlert, FolderPlus, RefreshCw, Server } from "@lucide/svelte";
-  import { readRuntimeStatus, type RuntimeProfile } from "$lib/daemon/client";
+  import {
+    readRuntimeStatus,
+    type RuntimePreference,
+    type RuntimeProfile,
+  } from "$lib/daemon/client";
   import type { HealthState } from "$lib/daemon/daemon-state.svelte";
 
   let {
     healthState,
     projectCount,
     runtimeProfiles,
+    runtimePreference,
     onImportClick,
     onRetry,
     onSetupRuntime,
@@ -17,6 +22,7 @@
     healthState: HealthState;
     projectCount: number;
     runtimeProfiles: RuntimeProfile[];
+    runtimePreference: RuntimePreference | undefined;
     onImportClick: () => void;
     onRetry: () => void;
     onSetupRuntime: () => void;
@@ -26,10 +32,15 @@
 
   const connected = $derived(healthState.kind === "connected");
   const hasProjects = $derived(projectCount > 0);
+  const runtimeBinding = $derived(runtimePreference?.binding ?? null);
   const selectedProfile = $derived(
-    runtimeProfiles.find((profile) => profile.is_selected) ?? null,
+    runtimeBinding?.profile_id
+      ? (runtimeProfiles.find((profile) => profile.id === runtimeBinding.profile_id) ?? null)
+      : null,
   );
-  const engineReady = $derived(selectedProfile?.connection.state === "summarized");
+  const engineReady = $derived(
+    runtimeBinding?.state === "ready" || runtimeBinding?.state === "unconfigured",
+  );
   const showPanel = $derived(!connected || !hasProjects || !engineReady);
 
   // Re-runs provider detection daemon-side (repersisting profiles), then
@@ -103,8 +114,12 @@
           <p class="text-xs text-muted-foreground">
             {#if selectedProfile}
               {selectedProfile.display_name} — {selectedProfile.process.state.replace("_", " ")}
+            {:else if runtimeBinding?.state === "unconfigured"}
+              Platform default local engine is in use until you choose a runtime.
+            {:else if runtimeBinding}
+              {runtimeBinding.display_name} is {runtimeBinding.state}; project actions are blocked.
             {:else}
-              No runtime selected yet. Set one up to run project actions.
+              No runtime policy is available yet.
             {/if}
           </p>
           <div class="flex gap-2">

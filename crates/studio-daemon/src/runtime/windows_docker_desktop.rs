@@ -8,7 +8,7 @@ use super::{
     command_output, dimension, now_ms,
     provider::{
         EndpointSummary, ObservedProfile, PLACEHOLDER_KEY, RuntimeAction, RuntimeClass,
-        RuntimeObservation, RuntimeProvider, profile_id,
+        RuntimeObservation, RuntimeProvider, RuntimeProviderExperience, profile_id,
     },
 };
 use std::ffi::OsString;
@@ -43,6 +43,17 @@ impl RuntimeProvider for WindowsDockerDesktopProvider {
 
     fn supported(&self) -> bool {
         cfg!(target_os = "windows")
+    }
+
+    fn experience(&self) -> RuntimeProviderExperience {
+        RuntimeProviderExperience {
+            can_create_builtin: false,
+            can_discover_external: true,
+            can_manage_builtin_lifecycle: false,
+            can_manage_external_lifecycle: true,
+            can_manage_resources: false,
+            requires_external_desktop_app: true,
+        }
     }
 
     fn detect(&self) -> RuntimeObservation {
@@ -326,7 +337,6 @@ impl WindowsDockerDesktopProvider {
                 process: dimension(if running { "running" } else { "stopped" }, None),
                 connection: dimension(if running { "summarized" } else { "not_applicable" }, None),
                 endpoint_summary,
-                provider_default: false,
                 observed_at_ms,
             }],
             // Docker Desktop is a single logical engine keyed by the synthetic
@@ -391,7 +401,6 @@ impl WindowsDockerDesktopProvider {
             process: dimension(process_state, process_detail),
             connection: dimension(connection_state, connection_detail),
             endpoint_summary: None,
-            provider_default: false,
             observed_at_ms: now_ms(),
         }
     }

@@ -26,14 +26,8 @@
   let logsAutoStartToken = $state(0);
   let bindingBusy = $state(false);
 
-  const boundProfile = $derived(
-    project?.runtime_profile_id
-      ? (profiles.find((profile) => profile.id === project.runtime_profile_id) ?? null)
-      : null,
-  );
   const bindingBroken = $derived(
-    project?.runtime_profile_id != null &&
-      (boundProfile === null || boundProfile.connection.state !== "summarized"),
+    project?.runtime_binding.source === "project_pin" && project.runtime_binding.state !== "ready",
   );
 
   function handleJobFinished() {
@@ -65,7 +59,7 @@
         onchange={changeBinding}
         aria-label="Project engine binding"
       >
-        <option value="">Use active engine</option>
+        <option value="">Use global preference</option>
         {#each profiles as profile (profile.id)}
           <option value={profile.id}>{profile.display_name}</option>
         {/each}
@@ -76,7 +70,7 @@
     </div>
     {#if bindingBroken}
       <Badge variant="destructive" class="text-xs">
-        Bound engine unavailable, actions use the active engine
+        Pinned runtime unavailable; project actions are blocked until it returns or you change the pin.
       </Badge>
     {/if}
   </div>

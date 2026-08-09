@@ -17,7 +17,7 @@
     readRuntimeStatus,
     prepareRuntimeAction,
     prepareRuntimeResourceUpdate,
-    selectRuntimeProfile,
+    setPreferredRuntime,
     type RuntimeAction,
     type RuntimeActionResult,
     type RuntimeDimension,
@@ -78,8 +78,9 @@
   } as const;
 
   const providers = $derived(status?.providers ?? []);
-  const selectedProfiles = $derived(
-    providers.flatMap((provider) => provider.profiles.filter((profile) => profile.is_selected)),
+  const runtimePreference = $derived(status?.policy ?? null);
+  const pruneEngineId = $derived(
+    runtimePreference ? resolveActiveEngineId(runtimePreference.binding) : null,
   );
   const readyProviders = $derived(
     providers.filter((provider) => provider.connection.state === "summarized"),
@@ -228,8 +229,12 @@
   }
 
   async function handleSelect(profile: RuntimeProfile) {
-    await selectRuntimeProfile(profile.id);
+    await setPreferredRuntime(profile.id);
     await refresh();
+  }
+
+  function isPreferred(profile: RuntimeProfile): boolean {
+    return runtimePreference?.preferred_profile_id === profile.id;
   }
 
   async function handleForget(profile: RuntimeProfile) {
@@ -424,11 +429,11 @@
       </div>
     </div>
     <div class="rounded-md border p-3">
-      <div class="text-xs font-medium text-muted-foreground">Active profile</div>
+      <div class="text-xs font-medium text-muted-foreground">Preferred runtime</div>
       <div class="mt-2 flex min-w-0 items-center gap-2">
         <Server class="size-4 shrink-0 text-muted-foreground" />
         <span class="min-w-0 truncate text-sm">
-          {selectedProfiles[0]?.display_name ?? "No profile selected"}
+          {runtimePreference?.binding.display_name ?? "Loading runtime policy"}
         </span>
       </div>
     </div>
@@ -612,7 +617,7 @@
             <div>
               <h4 class="text-sm font-semibold">Runtime profiles</h4>
               <p class="text-xs text-muted-foreground">
-                Profiles are persisted observations. Projects can pin one or use the active profile.
+                Profiles are persisted observations. Projects can pin one or use the preferred runtime.
               </p>
             </div>
             <Badge variant="outline">{provider.profiles.length}</Badge>
@@ -635,10 +640,10 @@
                       {#if profile.runtime_class === "built_in"}
                         <span class="text-xs text-muted-foreground">Powered by Podman</span>
                       {/if}
-                      {#if profile.is_selected}
+                      {#if isPreferred(profile)}
                         <Badge variant="default" class="text-xs">
                           <CheckCircle2 />
-                          Active
+                          Preferred
                         </Badge>
                       {/if}
                       {#each ownershipBadges(profile) as badge (badge.label)}
@@ -679,10 +684,10 @@
                       <Button
                         size="sm"
                         variant="outline"
-                        disabled={!profile.is_selected || profile.connection.state !== "summarized"}
-                        title={profile.is_selected
+                        disabled={!isPreferred(profile) || profile.connection.state !== "summarized"}
+                        title={isPreferred(profile)
                           ? "Preview unused resources on this runtime."
-                          : "Make this runtime active before pruning it."}
+                          : "Set this runtime as preferred before pruning it."}
                         onclick={() => reviewPrune(profile)}
                       >
                         <Trash2 />
@@ -700,14 +705,14 @@
                     {/if}
                     <Button
                       size="sm"
-                      variant={profile.is_selected ? "secondary" : "outline"}
-                      disabled={profile.is_selected || !profile.management.can_select}
+                      variant={isPreferred(profile) ? "secondary" : "outline"}
+                      disabled={isPreferred(profile) || !profile.management.can_select}
                       title={profile.management.can_select
                         ? undefined
-                        : "This runtime is missing, so it can't be made active."}
+                        : "This runtime is missing, so it can't be preferred."}
                       onclick={() => handleSelect(profile)}
                     >
-                      {profile.is_selected ? "Active" : "Make active"}
+                      {isPreferred(profile) ? "Preferred" : "Set preferred"}
                     </Button>
                   </div>
                 </li>
@@ -855,12 +860,14 @@
     bind:open={dataScopeDialogOpen}
     oncompleted={() => refresh()}
   />
-  <PruneDialog
-    engineId={resolveActiveEngineId(pruneProfile?.id)}
-    runtimeName={pruneProfile
-      ? `${pruneProfile.display_name} (${pruneProfile.provider_runtime_key})`
-      : undefined}
-    bind:open={pruneDialogOpen}
-    oncompleted={() => refresh()}
-  />
+  {#if pruneEngineId}
+    <PruneDialog
+      engineId={pruneEngineId}
+      runtimeName={pruneProfile
+        ? `${pruneProfile.display_name} (${pruneProfile.provider_runtime_key})`
+        : undefined}
+      bind:open={pruneDialogOpen}
+      oncompleted={() => refresh()}
+    />
+  {/if}
 </div>

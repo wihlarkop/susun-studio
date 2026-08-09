@@ -15,7 +15,8 @@ use tokio_stream::Stream;
 use crate::{
     auth::authorize,
     error::ApiError,
-    project_source::load_project_source,
+    project_source::{ensure_project_exists, load_project_source},
+    runtime,
     state::AppState,
     susun_integration::{self, RuntimeContext},
 };
@@ -32,16 +33,24 @@ pub struct ServiceContainerState {
 pub struct ServiceActionResponse {
     pub service: String,
     pub containers: Vec<ServiceContainerState>,
+    pub runtime: runtime::RuntimeAttribution,
+}
+
+pub(crate) struct ServiceEngineContext {
+    pub context: RuntimeContext,
+    pub engine: BollardEngine,
+    pub attribution: runtime::RuntimeAttribution,
 }
 
 pub(crate) async fn engine_context(
     state: &AppState,
     project_id: &str,
-) -> Result<(RuntimeContext, BollardEngine), ApiError> {
-    let source = load_project_source(state, project_id).await?;
-    let engine = susun_integration::connect_engine(&state.db, Some(project_id))
+) -> Result<ServiceEngineContext, ApiError> {
+    ensure_project_exists(state, project_id).await?;
+    let connected = susun_integration::resolve_and_connect_project(&state.db, project_id)
         .await
         .map_err(ApiError::EngineUnavailable)?;
+    let source = load_project_source(state, project_id).await?;
     let context = susun_integration::runtime_context(
         &source.files,
         source.env_file.as_ref(),
@@ -49,7 +58,11 @@ pub(crate) async fn engine_context(
         &source.profiles,
     )
     .map_err(ApiError::PlanningFailed)?;
-    Ok((context, engine))
+    Ok(ServiceEngineContext {
+        context,
+        engine: connected.engine,
+        attribution: connected.attribution,
+    })
 }
 
 pub(crate) async fn require_containers(
@@ -100,7 +113,11 @@ pub async fn start_service(
     Path((project_id, service)): Path<(String, String)>,
 ) -> Result<Json<ServiceActionResponse>, ApiError> {
     authorize(&state, &headers)?;
-    let (context, engine) = engine_context(&state, &project_id).await?;
+    let ServiceEngineContext {
+        context,
+        engine,
+        attribution: runtime,
+    } = engine_context(&state, &project_id).await?;
     for (container, container_state) in require_containers(&engine, &context, &service).await? {
         if container_state != "running" {
             engine
@@ -112,6 +129,7 @@ pub async fn start_service(
     Ok(Json(ServiceActionResponse {
         containers: state_after(&engine, &context, &service).await?,
         service,
+        runtime,
     }))
 }
 
@@ -121,7 +139,11 @@ pub async fn stop_service(
     Path((project_id, service)): Path<(String, String)>,
 ) -> Result<Json<ServiceActionResponse>, ApiError> {
     authorize(&state, &headers)?;
-    let (context, engine) = engine_context(&state, &project_id).await?;
+    let ServiceEngineContext {
+        context,
+        engine,
+        attribution: runtime,
+    } = engine_context(&state, &project_id).await?;
     for (container, container_state) in require_containers(&engine, &context, &service).await? {
         if container_state == "running" {
             engine
@@ -136,6 +158,7 @@ pub async fn stop_service(
     Ok(Json(ServiceActionResponse {
         containers: state_after(&engine, &context, &service).await?,
         service,
+        runtime,
     }))
 }
 
@@ -170,17 +193,23 @@ pub async fn restart_service(
     Path((project_id, service)): Path<(String, String)>,
 ) -> Result<Json<ServiceActionResponse>, ApiError> {
     authorize(&state, &headers)?;
-    let (context, engine) = engine_context(&state, &project_id).await?;
+    let ServiceEngineContext {
+        context,
+        engine,
+        attribution: runtime,
+    } = engine_context(&state, &project_id).await?;
     restart_service_containers(&engine, &context, &service).await?;
     Ok(Json(ServiceActionResponse {
         containers: state_after(&engine, &context, &service).await?,
         service,
+        runtime,
     }))
 }
 
 #[derive(Debug, Serialize)]
 pub struct WaitResponse {
     pub exit_code: i64,
+    pub runtime: runtime::RuntimeAttribution,
 }
 
 pub async fn wait_service(
@@ -189,7 +218,11 @@ pub async fn wait_service(
     Path((project_id, service)): Path<(String, String)>,
 ) -> Result<Json<WaitResponse>, ApiError> {
     authorize(&state, &headers)?;
-    let (context, engine) = engine_context(&state, &project_id).await?;
+    let ServiceEngineContext {
+        context,
+        engine,
+        attribution: runtime,
+    } = engine_context(&state, &project_id).await?;
     let (container, _) = require_containers(&engine, &context, &service)
         .await?
         .into_iter()
@@ -201,6 +234,7 @@ pub async fn wait_service(
         .map_err(|e| ApiError::ActionUnavailable(e.to_string()))?;
     Ok(Json(WaitResponse {
         exit_code: result.exit_code,
+        runtime,
     }))
 }
 
@@ -215,6 +249,7 @@ pub struct PortBindingRow {
 #[derive(Debug, Serialize)]
 pub struct PortsResponse {
     pub bindings: Vec<PortBindingRow>,
+    pub runtime: runtime::RuntimeAttribution,
 }
 
 pub async fn service_ports(
@@ -223,7 +258,11 @@ pub async fn service_ports(
     Path((project_id, service)): Path<(String, String)>,
 ) -> Result<Json<PortsResponse>, ApiError> {
     authorize(&state, &headers)?;
-    let (context, engine) = engine_context(&state, &project_id).await?;
+    let ServiceEngineContext {
+        context,
+        engine,
+        attribution: runtime,
+    } = engine_context(&state, &project_id).await?;
     let mut bindings = Vec::new();
     for (container, _) in require_containers(&engine, &context, &service).await? {
         let ports = engine
@@ -241,7 +280,7 @@ pub async fn service_ports(
             host_port: binding.host_port,
         }));
     }
-    Ok(Json(PortsResponse { bindings }))
+    Ok(Json(PortsResponse { bindings, runtime }))
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -303,7 +342,9 @@ pub async fn stream_exec(
         .and_then(|p| serde_json::from_str(p).ok())
         .ok_or(ApiError::Unauthorized)?;
 
-    let (context, engine) = engine_context(&state, &project_id).await?;
+    let ServiceEngineContext {
+        context, engine, ..
+    } = engine_context(&state, &project_id).await?;
     let running = require_containers(&engine, &context, &service)
         .await?
         .into_iter()
@@ -388,7 +429,9 @@ pub async fn stream_run(
         .and_then(|p| serde_json::from_str(p).ok())
         .unwrap_or(RunStreamRequest { command: None });
 
-    let (context, engine) = engine_context(&state, &project_id).await?;
+    let ServiceEngineContext {
+        context, engine, ..
+    } = engine_context(&state, &project_id).await?;
     let create = susun_integration::build_run_request(&context, &service, request.command)
         .map_err(ApiError::ActionUnavailable)?;
 
@@ -547,7 +590,9 @@ pub async fn copy_service(
     Json(request): Json<CopyRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize(&state, &headers)?;
-    let (context, engine) = engine_context(&state, &project_id).await?;
+    let ServiceEngineContext {
+        context, engine, ..
+    } = engine_context(&state, &project_id).await?;
     let (container, _) = require_containers(&engine, &context, &service)
         .await?
         .into_iter()

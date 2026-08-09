@@ -32,7 +32,6 @@ fn observed(
     name: &str,
     class: RuntimeClass,
     process_state: &str,
-    provider_default: bool,
 ) -> ObservedProfile {
     let running = process_state == "running";
     ObservedProfile {
@@ -54,7 +53,6 @@ fn observed(
             None,
         ),
         endpoint_summary: None,
-        provider_default,
         observed_at_ms: now_ms(),
     }
 }
@@ -120,7 +118,7 @@ async fn upgrade_preserves_selection_binding_and_repairs_multiselect() -> TestRe
     )
     .await?;
 
-    db::apply_pending_migrations(&conn).await?;
+    db::apply_migrations_upto(&conn, 11).await?;
 
     // Exactly one selection survives, and it is the most recently updated one.
     assert_eq!(
@@ -167,7 +165,7 @@ async fn upgrade_preserves_selection_binding_and_repairs_multiselect() -> TestRe
 async fn recheck_is_observation_only_and_respects_user_selection() -> TestResult {
     let (db, path) = fresh_db().await?;
 
-    // Import machine A as the provider default -> selected + external.
+    // Discovery records both machines but never picks a preference.
     super::persist_observed(
         &db,
         &[observed(
@@ -176,11 +174,10 @@ async fn recheck_is_observation_only_and_respects_user_selection() -> TestResult
             "A",
             RuntimeClass::ExternalLocal,
             "running",
-            true,
         )],
     )
     .await?;
-    // Import machine B (not default) -> external, not selected.
+    // Import machine B as another external runtime.
     super::persist_observed(
         &db,
         &[observed(
@@ -189,7 +186,6 @@ async fn recheck_is_observation_only_and_respects_user_selection() -> TestResult
             "B",
             RuntimeClass::ExternalLocal,
             "running",
-            false,
         )],
     )
     .await?;
@@ -201,7 +197,7 @@ async fn recheck_is_observation_only_and_respects_user_selection() -> TestResult
         super::SelectOutcome::Selected
     ));
 
-    // A rescan still reports A as the provider default and now sees it stopped.
+    // A rescan sees A stopped without changing the user's preference.
     super::persist_observed(
         &db,
         &[observed(
@@ -210,16 +206,15 @@ async fn recheck_is_observation_only_and_respects_user_selection() -> TestResult
             "A",
             RuntimeClass::ExternalLocal,
             "stopped",
-            true,
         )],
     )
     .await?;
 
     let a = by_key(&db, "machine/a").await?;
     let b = by_key(&db, "machine/b").await?;
-    // Discovery did not steal the selection back to the provider default.
-    assert!(b.is_selected);
-    assert!(!a.is_selected);
+    // Discovery did not steal the preference back to another runtime.
+    assert!(b.is_preferred);
+    assert!(!a.is_preferred);
     // Ownership stayed put; observation advanced.
     assert_eq!(a.ownership_state, "external");
     assert_eq!(a.process.state, "stopped");
@@ -240,7 +235,6 @@ async fn missing_only_after_authoritative_scan() -> TestResult {
             "A",
             RuntimeClass::ExternalLocal,
             "running",
-            true,
         )],
     )
     .await?;
@@ -250,13 +244,20 @@ async fn missing_only_after_authoritative_scan() -> TestResult {
     let a = by_key(&db, "machine/a").await?;
     assert_eq!(a.availability_state, "available");
 
+    // Keep an explicit preference through a later authoritative absence.
+    let id = profile_id("windows-podman", "machine/a");
+    assert!(matches!(
+        super::select_profile(&db, &id).await?,
+        super::SelectOutcome::Selected
+    ));
+
     // Authoritative empty inventory -> genuinely missing, but not deleted and
-    // still selected/visible.
+    // still preferred/visible.
     super::reconcile_provider(&db, "windows-podman", &[], &Some(Vec::new())).await?;
     let a = by_key(&db, "machine/a").await?;
     assert_eq!(a.availability_state, "missing");
     assert!(a.missing_since_ms.is_some());
-    assert!(a.is_selected);
+    assert!(a.is_preferred);
 
     let _ = std::fs::remove_file(&path);
     Ok(())
@@ -274,7 +275,6 @@ async fn reserved_name_conflicts_cannot_be_adopted() -> TestResult {
             "Built-in",
             RuntimeClass::BuiltIn,
             "running",
-            true,
         )],
     )
     .await?;
@@ -284,7 +284,7 @@ async fn reserved_name_conflicts_cannot_be_adopted() -> TestResult {
     assert_eq!(profile.ownership_state, "ownership_conflict");
     // A conflict is never silently adopted as the active runtime, and lifecycle
     // actions against it are blocked.
-    assert!(!profile.is_selected);
+    assert!(!profile.is_preferred);
     assert!(!profile.management.can_select);
     assert!(!profile.management.can_forget);
     assert!(profile.management.blocks_destructive_actions);
@@ -305,16 +305,18 @@ async fn reserved_name_conflicts_cannot_be_adopted() -> TestResult {
         params![profile.id.clone()],
     )
     .await?;
-    assert!(matches!(
-        super::engine_endpoint_for(&db, Some("conflict-project"))
-            .await
-            ?,
-        super::EngineEndpointResolution::Unavailable { profile_id }
-            if profile_id == profile.id
-    ));
+    let resolved = super::policy::resolve_project(&db, "conflict-project").await?;
     assert_eq!(
-        super::attribution_for(&db, Some("conflict-project")).await?,
-        (Some(profile.id.clone()), Some("built_in".to_owned()))
+        resolved.summary().state,
+        super::RuntimeBindingState::Unavailable
+    );
+    assert_eq!(
+        resolved.summary().profile_id.as_deref(),
+        Some(profile.id.as_str())
+    );
+    assert_eq!(
+        resolved.attribution().runtime_class.as_deref(),
+        Some("built_in")
     );
 
     // A discovered reserved-name machine cannot manufacture ownership evidence.
@@ -330,7 +332,7 @@ async fn reserved_name_conflicts_cannot_be_adopted() -> TestResult {
     let managed = by_key(&db, &key).await?;
     assert_eq!(managed.ownership_state, "studio_managed");
     assert_eq!(managed.source, "studio_setup");
-    assert!(managed.is_selected);
+    assert!(managed.is_preferred);
     assert!(!managed.management.blocks_destructive_actions);
 
     let _ = std::fs::remove_file(&path);
@@ -348,7 +350,6 @@ async fn forget_removes_metadata_but_keeps_binding() -> TestResult {
             "A",
             RuntimeClass::ExternalLocal,
             "running",
-            false,
         )],
     )
     .await?;

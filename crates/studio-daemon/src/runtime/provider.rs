@@ -20,6 +20,7 @@ pub trait RuntimeProvider: Send + Sync {
     fn product(&self) -> &'static str;
     fn platform(&self) -> &'static str;
     fn supported(&self) -> bool;
+    fn experience(&self) -> RuntimeProviderExperience;
     fn detect(&self) -> RuntimeObservation;
     fn planned_actions(
         &self,
@@ -49,6 +50,19 @@ pub trait RuntimeProvider: Send + Sync {
     ) -> Option<RuntimeRecoveryPlan> {
         None
     }
+}
+
+/// Provider-owned description of Studio's runtime-management boundary. This
+/// is intentionally separate from engine capability probing: it tells the UI
+/// what Studio can manage for this provider without product-name matching.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct RuntimeProviderExperience {
+    pub can_create_builtin: bool,
+    pub can_discover_external: bool,
+    pub can_manage_builtin_lifecycle: bool,
+    pub can_manage_external_lifecycle: bool,
+    pub can_manage_resources: bool,
+    pub requires_external_desktop_app: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,9 +134,8 @@ pub struct RuntimeAction {
 }
 
 /// What a provider observes about one runtime during detection. It carries only
-/// identity and observed health; ownership, source, and selection live in the
-/// database and are never derived from a fresh scan (except the one-time
-/// initial-import selection, gated on `provider_default`).
+/// identity and observed health; ownership, source, and preference live in the
+/// database and are never derived from a fresh scan.
 #[derive(Debug, Clone)]
 pub struct ObservedProfile {
     pub id: String,
@@ -139,7 +152,6 @@ pub struct ObservedProfile {
     /// The provider's own "default" marker. Honoured only for the very first
     /// import selection when nothing is selected yet — never to override a
     /// later user choice on a recheck.
-    pub provider_default: bool,
     pub observed_at_ms: i64,
 }
 
@@ -164,7 +176,7 @@ pub struct RuntimeProfile {
     pub last_seen_at_ms: Option<i64>,
     pub missing_since_ms: Option<i64>,
     pub last_error: Option<RuntimeError>,
-    pub is_selected: bool,
+    pub is_preferred: bool,
     pub observation_revision: i64,
     pub observed_at_ms: i64,
     pub management: ManagementCapabilities,

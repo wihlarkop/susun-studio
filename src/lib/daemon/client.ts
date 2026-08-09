@@ -101,6 +101,7 @@ export type StudioProject = {
   summary: StudioProjectSummary | null;
   diagnostics: DiagnosticsPayload | null;
   runtime_profile_id: string | null;
+  runtime_binding: RuntimeBindingSummary;
 };
 
 export type StudioSettings = {
@@ -225,6 +226,30 @@ export type RuntimeProfileError = {
   at_ms: number;
 };
 
+export type RuntimeBindingSource = "project_pin" | "global_preference" | "platform_default";
+
+export type RuntimeBindingState = "ready" | "unavailable" | "missing" | "unconfigured";
+
+export type RuntimeBindingSummary = {
+  source: RuntimeBindingSource;
+  state: RuntimeBindingState;
+  profile_id: string | null;
+  runtime_class: RuntimeClass | null;
+  display_name: string;
+};
+
+export type RuntimePreference = {
+  preferred_profile_id: string | null;
+  binding: RuntimeBindingSummary;
+};
+
+/** Redacted runtime provenance persisted with work and immediate responses. */
+export type RuntimeAttribution = {
+  runtime_profile_id: string | null;
+  runtime_class: RuntimeClass | null;
+  binding_source: RuntimeBindingSource;
+};
+
 export type RuntimeManagementCapabilities = {
   can_select: boolean;
   can_forget: boolean;
@@ -251,7 +276,7 @@ export type RuntimeProfile = {
   last_seen_at_ms: number | null;
   missing_since_ms: number | null;
   last_error: RuntimeProfileError | null;
-  is_selected: boolean;
+  is_preferred: boolean;
   observation_revision: number;
   observed_at_ms: number;
   management: RuntimeManagementCapabilities;
@@ -305,6 +330,14 @@ export type RuntimeProviderStatus = {
   product: string;
   platform: string;
   supported: boolean;
+  experience: {
+    can_create_builtin: boolean;
+    can_discover_external: boolean;
+    can_manage_builtin_lifecycle: boolean;
+    can_manage_external_lifecycle: boolean;
+    can_manage_resources: boolean;
+    requires_external_desktop_app: boolean;
+  };
   installation: RuntimeDimension;
   process: RuntimeDimension;
   connection: RuntimeDimension;
@@ -316,6 +349,7 @@ export type RuntimeProviderStatus = {
 };
 
 export type RuntimeStatus = {
+  policy: RuntimePreference;
   providers: RuntimeProviderStatus[];
 };
 
@@ -465,9 +499,12 @@ export type BuildProgressEntry = {
 
 export type StudioJob = {
   id: string;
-  kind: "up" | "down" | "build" | "clean" | "image_build" | "image_pull" | "image_push";
+  kind: "up" | "down" | "build" | "clean" | "restart" | "image_build" | "image_pull" | "image_push";
   status: JobStatus;
   project_id: string;
+  runtime_profile_id: string | null;
+  runtime_class: string | null;
+  runtime_binding_source: RuntimeBindingSource | null;
   /** The build-declared service this job targets — only ever set for
    * `kind: "image_build"`. */
   service_name: string | null;
@@ -505,6 +542,7 @@ export type SnapshotResource = {
 
 export type ProjectSnapshot = {
   observed_at_ms: number;
+  runtime: RuntimeAttribution;
   containers: SnapshotContainer[];
   networks: SnapshotResource[];
   volumes: SnapshotResource[];
@@ -513,6 +551,7 @@ export type ProjectSnapshot = {
 export type ServiceActionResult = {
   service: string;
   containers: { id: string; state: string }[];
+  runtime: RuntimeAttribution;
 };
 
 export type PortBinding = {
@@ -680,6 +719,23 @@ export async function readRuntimeStatus(
   options: DaemonRequestOptions = {},
 ): Promise<RuntimeStatus> {
   return readJson("/v1/runtime/status", options);
+}
+
+export async function readRuntimePolicy(
+  options: DaemonRequestOptions = {},
+): Promise<RuntimePreference> {
+  return readJson("/v1/runtime/policy", options);
+}
+
+export async function setPreferredRuntime(
+  preferredProfileId: string | null,
+  options: DaemonRequestOptions = {},
+): Promise<RuntimePreference> {
+  return readJson("/v1/runtime/policy", {
+    ...options,
+    method: "PUT",
+    body: { preferred_profile_id: preferredProfileId },
+  });
 }
 
 export async function prepareRuntimeAction(
@@ -973,7 +1029,7 @@ export async function setProjectEngine(
   projectId: string,
   runtimeProfileId: string | null,
   options: DaemonRequestOptions = {},
-): Promise<{ updated: boolean }> {
+): Promise<StudioProject> {
   return readJson(`/v1/projects/${encodeURIComponent(projectId)}/engine`, {
     ...options,
     method: "PUT",
@@ -1079,8 +1135,8 @@ export async function commitEnginePrune(
 export type ArtifactRuntimeContext = {
   runtime_profile_id: string | null;
   runtime_class: string | null;
-  display_name: string | null;
-  is_selected: boolean | null;
+  binding_source: RuntimeBindingSource;
+  display_name: string;
 };
 
 export type ContainerArtifactSummary = {

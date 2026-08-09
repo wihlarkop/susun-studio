@@ -11,7 +11,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use turso::params;
 
-use crate::{auth::authorize, error::ApiError, logging, state::AppState, susun_integration};
+use crate::{
+    auth::authorize, error::ApiError, logging, project_source::ensure_project_exists,
+    state::AppState, susun_integration,
+};
 
 #[derive(Debug, Serialize)]
 pub struct PlanActionResponse {
@@ -85,6 +88,13 @@ async fn create_plan(
     project_id: &str,
     operation: PlanOperation,
 ) -> Result<(StatusCode, Json<PlanResponse>), ApiError> {
+    // Planning is a project action too. Resolve and validate its runtime
+    // before reading or persisting any plan so a configured missing/unavailable
+    // pin blocks rather than silently using the platform default.
+    ensure_project_exists(state, project_id).await?;
+    let _runtime = susun_integration::resolve_and_connect_project(&state.db, project_id)
+        .await
+        .map_err(ApiError::EngineUnavailable)?;
     let conn = state.db.connect()?;
     logging::info(
         "plan_create_started",
@@ -364,4 +374,32 @@ fn now_ms() -> Result<i64, ApiError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ApiError::Clock)?;
     i64::try_from(duration.as_millis()).map_err(|_| ApiError::Clock)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::extract::{Path, State};
+
+    use super::*;
+    use crate::test_support::{authorized_headers, fresh_db, test_state};
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    #[tokio::test]
+    async fn plan_creation_fails_closed_for_a_missing_project_pin() -> TestResult {
+        let state = test_state(fresh_db("plans-missing-project-pin").await?);
+        let conn = state.db.connect()?;
+        conn.execute(
+            "INSERT INTO projects (id, name, path, created_at_ms, runtime_profile_id)
+             VALUES ('p1', 'Project', 'C:/project', 1, 'missing-profile')",
+            (),
+        )
+        .await?;
+
+        let result =
+            create_up_plan(State(state), authorized_headers(), Path("p1".to_owned())).await;
+
+        assert!(matches!(result, Err(ApiError::EngineUnavailable(_))));
+        Ok(())
+    }
 }

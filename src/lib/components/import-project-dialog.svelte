@@ -213,7 +213,7 @@
             class="h-9 w-full appearance-none rounded-md border bg-background bg-none pr-8 pl-3 text-sm"
             bind:value={engineProfileId}
           >
-            <option value="">Use active engine</option>
+            <option value="">Use global preference</option>
             {#each runtimeProfiles as profile (profile.id)}
               <option value={profile.id}>{profile.display_name}</option>
             {/each}

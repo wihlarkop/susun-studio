@@ -134,6 +134,9 @@ pub enum ApiError {
     #[error("a restore is in progress; the daemon is not accepting changes")]
     RestoreInProgress,
 
+    #[error("runtime policy hydration was incomplete")]
+    RuntimePolicyIncomplete,
+
     #[error("database error: {0}")]
     Database(#[from] turso::Error),
 
@@ -205,6 +208,7 @@ impl IntoResponse for ApiError {
             Self::Database(_)
             | Self::Json(_)
             | Self::Clock
+            | Self::RuntimePolicyIncomplete
             | Self::CredentialOperationFailed
             | Self::BackupFailed(_)
             | Self::RestoreFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,

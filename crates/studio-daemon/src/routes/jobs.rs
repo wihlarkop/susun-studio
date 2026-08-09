@@ -18,8 +18,14 @@ use turso::{Database, params};
 
 use crate::jobs::transfer_progress::{TransferProgressEntry, read_transfer_progress};
 use crate::{
-    auth::authorize, error::ApiError, jobs::error_taxonomy::classify_build_error, logging,
-    project_source::load_project_source, runtime, state::AppState, susun_integration,
+    auth::authorize,
+    error::ApiError,
+    jobs::error_taxonomy::classify_build_error,
+    logging,
+    project_source::{ensure_project_exists, load_project_source},
+    runtime,
+    state::AppState,
+    susun_integration,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -52,6 +58,12 @@ pub struct JobResponse {
     pub kind: String,
     pub status: String,
     pub project_id: String,
+    /// Persisted attribution from the one policy resolution that supplied the
+    /// engine for this work. Historical rows remain null rather than being
+    /// retroactively guessed from the current preference.
+    pub runtime_profile_id: Option<String>,
+    pub runtime_class: Option<String>,
+    pub runtime_binding_source: Option<runtime::RuntimeBindingSource>,
     /// The build-declared service this job targets — only ever set for
     /// `kind = "image_build"`, parsed from the job's own `request_json`.
     /// Needed so a queued/running/failed build (which has no `result` yet)
@@ -546,8 +558,7 @@ async fn insert_build_job(
     project_id: &str,
     service_name: &str,
     image_tag: &str,
-    runtime_profile_id: Option<&str>,
-    runtime_class: Option<&str>,
+    attribution: &runtime::RuntimeAttribution,
     now: i64,
 ) -> Result<(), ApiError> {
     let request_json = serde_json::to_string(&serde_json::json!({
@@ -559,15 +570,16 @@ async fn insert_build_job(
     let conn = state.db.connect()?;
     conn.execute(
         "INSERT INTO jobs (id, kind, status, project_id, engine_id, request_json, manifest_json,
-            runtime_profile_id, runtime_class, created_at_ms, updated_at_ms)
-         VALUES (?1, 'image_build', 'queued', ?2, 'engine-docker-local', ?3, NULL, ?4, ?5, ?6, ?6)",
+            runtime_profile_id, runtime_class, runtime_binding_source, created_at_ms, updated_at_ms)
+         VALUES (?1, 'image_build', 'queued', ?2, 'engine-docker-local', ?3, NULL, ?4, ?5, ?6, ?7, ?7)",
         params![
             job_id.to_owned(),
             project_id.to_owned(),
             request_json,
-            runtime_profile_id,
-            runtime_class,
-            now
+            attribution.runtime_profile_id.clone(),
+            attribution.runtime_class.clone(),
+            runtime_binding_source_value(attribution.binding_source),
+            now,
         ],
     )
     .await?;
@@ -579,12 +591,16 @@ fn queued_build_job_response(
     project_id: String,
     service_name: String,
     now: i64,
+    attribution: runtime::RuntimeAttribution,
 ) -> JobResponse {
     JobResponse {
         id: job_id,
         kind: "image_build".to_owned(),
         status: "queued".to_owned(),
         project_id,
+        runtime_profile_id: attribution.runtime_profile_id,
+        runtime_class: attribution.runtime_class,
+        runtime_binding_source: Some(attribution.binding_source),
         service_name: Some(service_name),
         actions: Vec::new(),
         result: None,
@@ -712,6 +728,29 @@ pub async fn start_image_build(
 ) -> Result<Json<JobResponse>, ApiError> {
     authorize(&state, &headers)?;
 
+    ensure_project_exists(&state, &project_id).await?;
+    let resolved_runtime = runtime::policy::resolve_project(&state.db, &project_id).await?;
+    let attribution = resolved_runtime.attribution();
+    if attribution.runtime_profile_id.is_some() {
+        return Err(ApiError::ActionUnavailable(
+            "Image builds currently only run through the default engine. This project is \
+             bound to an external runtime profile; unbind it (or clear the global runtime \
+             selection) before building."
+                .to_owned(),
+        ));
+    }
+    let connected = susun_integration::connect_resolved_runtime(resolved_runtime)
+        .await
+        .map_err(ApiError::EngineUnavailable)?;
+    let health = susun_integration::engine_health(&connected.engine).await;
+    if !health.reachable {
+        return Err(ApiError::EngineUnavailable(
+            health
+                .error
+                .unwrap_or_else(|| "engine unreachable".to_owned()),
+        ));
+    }
+
     let source = load_project_source(&state, &project_id).await?;
     let sdk_project = susun_integration::analyze_sdk_project(
         &source.files,
@@ -751,33 +790,6 @@ pub async fn start_image_build(
     // so reject before even attempting to connect. Resolved once here and
     // threaded through to `insert_build_job` unchanged (never re-resolved)
     // to avoid a TOCTOU gap against a concurrent rebind.
-    let (runtime_profile_id, runtime_class) =
-        runtime::attribution_for(&state.db, Some(&project_id)).await?;
-    if runtime_profile_id.is_some() {
-        return Err(ApiError::ActionUnavailable(
-            "Image builds currently only run through the default engine. This project is \
-             bound to an external runtime profile; unbind it (or clear the global runtime \
-             selection) before building."
-                .to_owned(),
-        ));
-    }
-
-    // Capability check: confirm some engine is actually reachable before
-    // minting a durable job. Revalidated implicitly by the build process
-    // itself failing honestly if it cannot reach a provider by the time the
-    // spawned task runs.
-    let engine = susun_integration::connect_engine(&state.db, Some(&project_id))
-        .await
-        .map_err(ApiError::EngineUnavailable)?;
-    let health = susun_integration::engine_health(&engine).await;
-    if !health.reachable {
-        return Err(ApiError::EngineUnavailable(
-            health
-                .error
-                .unwrap_or_else(|| "engine unreachable".to_owned()),
-        ));
-    }
-
     let project_name = project.name.as_str().to_owned();
     let image_tag = susun_integration::default_build_image_tag(
         &project_name,
@@ -793,8 +805,7 @@ pub async fn start_image_build(
         &project_id,
         &service_name,
         &image_tag,
-        runtime_profile_id.as_deref(),
-        runtime_class.as_deref(),
+        &attribution,
         now,
     )
     .await?;
@@ -832,7 +843,25 @@ pub async fn start_image_build(
         project_id,
         service_name,
         now,
+        attribution,
     )))
+}
+
+fn runtime_binding_source_value(source: runtime::RuntimeBindingSource) -> &'static str {
+    match source {
+        runtime::RuntimeBindingSource::ProjectPin => "project_pin",
+        runtime::RuntimeBindingSource::GlobalPreference => "global_preference",
+        runtime::RuntimeBindingSource::PlatformDefault => "platform_default",
+    }
+}
+
+fn runtime_binding_source_from_db(value: Option<String>) -> Option<runtime::RuntimeBindingSource> {
+    match value.as_deref() {
+        Some("project_pin") => Some(runtime::RuntimeBindingSource::ProjectPin),
+        Some("global_preference") => Some(runtime::RuntimeBindingSource::GlobalPreference),
+        Some("platform_default") => Some(runtime::RuntimeBindingSource::PlatformDefault),
+        _ => None,
+    }
 }
 
 /// Runs one image build end to end: prepares (resolves + validates + hashes)
@@ -994,12 +1023,13 @@ pub(crate) async fn start_up_job(
     kind: &'static str,
     options: susun::UpPlanOptions,
 ) -> Result<Json<JobResponse>, ApiError> {
+    ensure_project_exists(&state, &project_id).await?;
+    let connected = susun_integration::resolve_and_connect_project(&state.db, &project_id)
+        .await
+        .map_err(ApiError::EngineUnavailable)?;
+    let attribution = connected.attribution;
+    let engine = Arc::new(connected.engine);
     let source = load_project_source(&state, &project_id).await?;
-    let engine = Arc::new(
-        susun_integration::connect_engine(&state.db, Some(&project_id))
-            .await
-            .map_err(ApiError::EngineUnavailable)?,
-    );
 
     // Plan up front so we can hand the UI a named step manifest, then execute
     // that same plan (no double-planning).
@@ -1016,7 +1046,16 @@ pub(crate) async fn start_up_job(
 
     let now = now_ms()?;
     let job_id = format!("job-{now}-{kind}");
-    insert_job(&state, &job_id, kind, &project_id, now, &manifest).await?;
+    insert_job(
+        &state,
+        &job_id,
+        kind,
+        &project_id,
+        now,
+        &manifest,
+        &attribution,
+    )
+    .await?;
     logging::info(
         "job_started",
         &[
@@ -1055,7 +1094,12 @@ pub(crate) async fn start_up_job(
     });
 
     Ok(Json(running_job_response(
-        job_id, kind, project_id, now, manifest,
+        job_id,
+        kind,
+        project_id,
+        now,
+        manifest,
+        attribution,
     )))
 }
 
@@ -1065,12 +1109,13 @@ async fn start_down_job(
     kind: &'static str,
     options: susun::DownPlanOptions,
 ) -> Result<Json<JobResponse>, ApiError> {
+    ensure_project_exists(&state, &project_id).await?;
+    let connected = susun_integration::resolve_and_connect_project(&state.db, &project_id)
+        .await
+        .map_err(ApiError::EngineUnavailable)?;
+    let attribution = connected.attribution;
+    let engine = Arc::new(connected.engine);
     let source = load_project_source(&state, &project_id).await?;
-    let engine = Arc::new(
-        susun_integration::connect_engine(&state.db, Some(&project_id))
-            .await
-            .map_err(ApiError::EngineUnavailable)?,
-    );
 
     let (plan, manifest) = susun_integration::plan_down_for_execution(
         &source.files,
@@ -1085,7 +1130,16 @@ async fn start_down_job(
 
     let now = now_ms()?;
     let job_id = format!("job-{now}-{kind}");
-    insert_job(&state, &job_id, kind, &project_id, now, &manifest).await?;
+    insert_job(
+        &state,
+        &job_id,
+        kind,
+        &project_id,
+        now,
+        &manifest,
+        &attribution,
+    )
+    .await?;
     logging::info(
         "job_started",
         &[
@@ -1120,7 +1174,12 @@ async fn start_down_job(
     });
 
     Ok(Json(running_job_response(
-        job_id, kind, project_id, now, manifest,
+        job_id,
+        kind,
+        project_id,
+        now,
+        manifest,
+        attribution,
     )))
 }
 
@@ -1162,6 +1221,7 @@ async fn insert_job(
     project_id: &str,
     now: i64,
     manifest: &[susun_integration::JobActionManifest],
+    attribution: &runtime::RuntimeAttribution,
 ) -> Result<(), ApiError> {
     let request_json =
         serde_json::to_string(&serde_json::json!({ "kind": kind })).unwrap_or_default();
@@ -1176,24 +1236,21 @@ async fn insert_job(
             .collect::<Vec<_>>(),
     )
     .unwrap_or_default();
-    // Attribute the job to the runtime it will actually use so reports keep
-    // provenance even after that profile later changes or disappears.
-    let (runtime_profile_id, runtime_class) =
-        runtime::attribution_for(&state.db, Some(project_id)).await?;
     let conn = state.db.connect()?;
     conn.execute(
         "INSERT INTO jobs (id, kind, status, project_id, engine_id, request_json, manifest_json,
-            runtime_profile_id, runtime_class, created_at_ms, updated_at_ms)
-         VALUES (?1, ?2, 'running', ?3, 'engine-docker-local', ?4, ?5, ?6, ?7, ?8, ?8)",
+            runtime_profile_id, runtime_class, runtime_binding_source, created_at_ms, updated_at_ms)
+         VALUES (?1, ?2, 'running', ?3, 'engine-docker-local', ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
         params![
             job_id.to_owned(),
             kind.to_owned(),
             project_id.to_owned(),
             request_json,
             manifest_json,
-            runtime_profile_id,
-            runtime_class,
-            now
+            attribution.runtime_profile_id.clone(),
+            attribution.runtime_class.clone(),
+            runtime_binding_source_value(attribution.binding_source),
+            now,
         ],
     )
     .await?;
@@ -1206,12 +1263,16 @@ fn running_job_response(
     project_id: String,
     now: i64,
     manifest: Vec<susun_integration::JobActionManifest>,
+    attribution: runtime::RuntimeAttribution,
 ) -> JobResponse {
     JobResponse {
         id: job_id,
         kind: kind.to_owned(),
         status: "running".to_owned(),
         project_id,
+        runtime_profile_id: attribution.runtime_profile_id,
+        runtime_class: attribution.runtime_class,
+        runtime_binding_source: Some(attribution.binding_source),
         service_name: None,
         actions: manifest
             .into_iter()
@@ -1403,7 +1464,8 @@ pub async fn list_jobs(
     let conn = state.db.connect()?;
     let mut rows = conn
         .query(
-            "SELECT id, kind, status, project_id, result_json, error, error_code, manifest_json, created_at_ms, updated_at_ms, request_json
+            "SELECT id, kind, status, project_id, result_json, error, error_code, manifest_json, created_at_ms, updated_at_ms, request_json,
+                    runtime_profile_id, runtime_class, runtime_binding_source
              FROM jobs ORDER BY created_at_ms DESC",
             (),
         )
@@ -1419,6 +1481,9 @@ pub async fn list_jobs(
             kind: row.get(1)?,
             status: row.get(2)?,
             project_id: row.get(3)?,
+            runtime_profile_id: row.get(11)?,
+            runtime_class: row.get(12)?,
+            runtime_binding_source: runtime_binding_source_from_db(row.get(13)?),
             service_name: service_name_from_request_json(&request_json),
             actions: manifest_json
                 .as_deref()
@@ -1449,7 +1514,8 @@ pub async fn list_project_jobs(
     let conn = state.db.connect()?;
     let mut rows = conn
         .query(
-            "SELECT id, kind, status, project_id, result_json, error, error_code, manifest_json, created_at_ms, updated_at_ms, request_json
+            "SELECT id, kind, status, project_id, result_json, error, error_code, manifest_json, created_at_ms, updated_at_ms, request_json,
+                    runtime_profile_id, runtime_class, runtime_binding_source
              FROM jobs WHERE project_id = ?1 ORDER BY created_at_ms DESC LIMIT 50",
             params![project_id],
         )
@@ -1465,6 +1531,9 @@ pub async fn list_project_jobs(
             kind: row.get(1)?,
             status: row.get(2)?,
             project_id: row.get(3)?,
+            runtime_profile_id: row.get(11)?,
+            runtime_class: row.get(12)?,
+            runtime_binding_source: runtime_binding_source_from_db(row.get(13)?),
             service_name: service_name_from_request_json(&request_json),
             actions: manifest_json
                 .as_deref()
@@ -1495,7 +1564,8 @@ pub async fn read_job(
     let conn = state.db.connect()?;
     let mut rows = conn
         .query(
-            "SELECT id, kind, status, project_id, result_json, error, error_code, manifest_json, created_at_ms, updated_at_ms, request_json
+            "SELECT id, kind, status, project_id, result_json, error, error_code, manifest_json, created_at_ms, updated_at_ms, request_json,
+                    runtime_profile_id, runtime_class, runtime_binding_source
              FROM jobs WHERE id = ?1 LIMIT 1",
             params![job_id],
         )
@@ -1524,6 +1594,9 @@ pub async fn read_job(
         kind,
         status: row.get(2)?,
         project_id: row.get(3)?,
+        runtime_profile_id: row.get(11)?,
+        runtime_class: row.get(12)?,
+        runtime_binding_source: runtime_binding_source_from_db(row.get(13)?),
         service_name: service_name_from_request_json(&request_json),
         actions: manifest_json
             .as_deref()
@@ -1807,6 +1880,72 @@ mod build_route_tests {
         .await;
 
         assert!(matches!(result, Err(ApiError::ProjectNotFound)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_jobs_fail_closed_when_the_pinned_runtime_is_missing() -> TestResult {
+        let state = test_state(fresh_db("jobs-missing-project-pin").await?);
+        let conn = state.db.connect()?;
+        conn.execute(
+            "INSERT INTO projects (id, name, path, created_at_ms, runtime_profile_id)
+             VALUES ('p1', 'Project', 'C:/project', 1, 'missing-profile')",
+            (),
+        )
+        .await?;
+
+        let result = start_up_job(
+            state,
+            "p1".to_owned(),
+            "up",
+            susun::UpPlanOptions::default(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::EngineUnavailable(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn listed_and_read_jobs_keep_their_persisted_runtime_attribution() -> TestResult {
+        let state = test_state(fresh_db("jobs-runtime-attribution-response").await?);
+        let conn = state.db.connect()?;
+        conn.execute(
+            "INSERT INTO jobs (
+                id, kind, status, project_id, engine_id, request_json,
+                runtime_profile_id, runtime_class, runtime_binding_source,
+                created_at_ms, updated_at_ms
+             ) VALUES (
+                'job-runtime', 'up', 'running', 'p1', 'profile-1', '{}',
+                'profile-1', 'external_local', 'project_pin', 1, 1
+             )",
+            (),
+        )
+        .await?;
+
+        let listed = list_jobs(State(state.clone()), authorized_headers())
+            .await?
+            .0;
+        let job = listed.jobs.first().ok_or("missing listed job")?;
+        assert_eq!(job.runtime_profile_id.as_deref(), Some("profile-1"));
+        assert_eq!(job.runtime_class.as_deref(), Some("external_local"));
+        assert_eq!(
+            job.runtime_binding_source,
+            Some(runtime::RuntimeBindingSource::ProjectPin)
+        );
+
+        let read = read_job(
+            State(state),
+            authorized_headers(),
+            Path("job-runtime".to_owned()),
+        )
+        .await?
+        .0;
+        assert_eq!(read.runtime_profile_id.as_deref(), Some("profile-1"));
+        assert_eq!(
+            read.runtime_binding_source,
+            Some(runtime::RuntimeBindingSource::ProjectPin)
+        );
         Ok(())
     }
 

@@ -422,7 +422,9 @@ async fn run_restart(
             .map(|_job_id| ())
             .map_err(|error| error.to_string());
     }
-    let (context, engine) = engine_context(state, project_id)
+    let crate::routes::service_actions::ServiceEngineContext {
+        context, engine, ..
+    } = engine_context(state, project_id)
         .await
         .map_err(|error| error.to_string())?;
     let targets: Vec<String> = if services.is_empty() {
@@ -461,7 +463,9 @@ async fn sync_watch_event(
     if matching.is_empty() {
         return Ok(());
     }
-    let (context, engine) = engine_context(state, project_id)
+    let crate::routes::service_actions::ServiceEngineContext {
+        context, engine, ..
+    } = engine_context(state, project_id)
         .await
         .map_err(|error| error.to_string())?;
     for spec in matching {
@@ -494,26 +498,22 @@ async fn start_restart_job(
     project_id: &str,
     services: Vec<String>,
 ) -> Result<String, ApiError> {
+    let crate::routes::service_actions::ServiceEngineContext {
+        context,
+        engine,
+        attribution,
+    } = engine_context(state, project_id).await?;
     let now = now_ms()?;
     let job_id = format!("job-{now}-restart");
     let request_json =
         serde_json::to_string(&serde_json::json!({ "kind": "restart", "services": services }))
             .unwrap_or_default();
-    let conn = state.db.connect()?;
-    conn.execute(
-        "INSERT INTO jobs (id, kind, status, project_id, engine_id, request_json, created_at_ms, updated_at_ms)
-         VALUES (?1, 'restart', 'running', ?2, 'engine-docker-local', ?3, ?4, ?4)",
-        params![job_id.clone(), project_id.to_owned(), request_json, now],
-    )
-    .await?;
+    insert_restart_job(state, &job_id, project_id, &request_json, &attribution, now).await?;
 
     let db = state.db.clone();
-    let spawn_state = state.clone();
-    let spawn_project_id = project_id.to_owned();
     let spawn_job_id = job_id.clone();
     tokio::spawn(async move {
         let result: Result<(), ApiError> = async {
-            let (context, engine) = engine_context(&spawn_state, &spawn_project_id).await?;
             let targets: Vec<String> = if services.is_empty() {
                 context
                     .project
@@ -557,6 +557,38 @@ async fn start_restart_job(
     });
 
     Ok(job_id)
+}
+
+async fn insert_restart_job(
+    state: &AppState,
+    job_id: &str,
+    project_id: &str,
+    request_json: &str,
+    attribution: &crate::runtime::RuntimeAttribution,
+    now: i64,
+) -> Result<(), ApiError> {
+    let conn = state.db.connect()?;
+    conn.execute(
+        "INSERT INTO jobs (
+            id, kind, status, project_id, engine_id, request_json,
+            runtime_profile_id, runtime_class, runtime_binding_source, created_at_ms, updated_at_ms
+         ) VALUES (?1, 'restart', 'running', ?2, 'engine-docker-local', ?3, ?4, ?5, ?6, ?7, ?7)",
+        params![
+            job_id.to_owned(),
+            project_id.to_owned(),
+            request_json.to_owned(),
+            attribution.runtime_profile_id.clone(),
+            attribution.runtime_class.clone(),
+            match attribution.binding_source {
+                crate::runtime::RuntimeBindingSource::ProjectPin => "project_pin",
+                crate::runtime::RuntimeBindingSource::GlobalPreference => "global_preference",
+                crate::runtime::RuntimeBindingSource::PlatformDefault => "platform_default",
+            },
+            now,
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -792,4 +824,41 @@ pub async fn watch_session_events(
     });
 
     Ok(axum::response::sse::Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{fresh_db, test_state};
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    #[tokio::test]
+    async fn watch_restart_jobs_persist_the_runtime_that_will_execute_them() -> TestResult {
+        let state = test_state(fresh_db("watch-restart-runtime-attribution").await?);
+        let attribution = crate::runtime::RuntimeAttribution {
+            runtime_profile_id: Some("profile-1".to_owned()),
+            runtime_class: Some("external_local".to_owned()),
+            binding_source: crate::runtime::RuntimeBindingSource::ProjectPin,
+        };
+
+        insert_restart_job(&state, "job-restart", "project-1", "{}", &attribution, 1).await?;
+
+        let conn = state.db.connect()?;
+        let mut rows = conn
+            .query(
+                "SELECT runtime_profile_id, runtime_class, runtime_binding_source
+                 FROM jobs WHERE id = 'job-restart'",
+                (),
+            )
+            .await?;
+        let row = rows.next().await?.ok_or("missing restart job")?;
+        let profile_id: Option<String> = row.get(0)?;
+        let runtime_class: Option<String> = row.get(1)?;
+        let binding_source: Option<String> = row.get(2)?;
+        assert_eq!(profile_id.as_deref(), Some("profile-1"));
+        assert_eq!(runtime_class.as_deref(), Some("external_local"));
+        assert_eq!(binding_source.as_deref(), Some("project_pin"));
+        Ok(())
+    }
 }

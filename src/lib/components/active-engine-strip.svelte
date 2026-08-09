@@ -6,22 +6,25 @@
   import PruneDialog from "./prune-dialog.svelte";
   import {
     readEngineHealth,
-    selectRuntimeProfile,
+    setPreferredRuntime,
     type EngineHealth,
+    type RuntimePreference,
     type RuntimeProfile,
   } from "$lib/daemon/client";
   import { resolveActiveEngineId } from "$lib/engine-identity";
 
   let {
     profiles,
+    runtimePreference,
     connected,
     onManageRuntimes,
     onChanged,
   }: {
     profiles: RuntimeProfile[];
+    runtimePreference: RuntimePreference | undefined;
     connected: boolean;
     onManageRuntimes: () => void;
-    onChanged: () => void;
+    onChanged: () => void | Promise<void>;
   } = $props();
 
   let health = $state<EngineHealth | null>(null);
@@ -29,30 +32,28 @@
   let switching = $state(false);
   let pruneDialogOpen = $state(false);
 
-  const selected = $derived(profiles.find((profile) => profile.is_selected) ?? null);
-  const selectedReady = $derived(selected?.connection.state === "summarized");
-  // The daemon validates this against whichever runtime is actually
-  // selected — it must never be a hardcoded id, or the request is rejected
-  // (or worse, silently mislabels a different runtime's data) once any
-  // non-default profile is selected.
-  const activeEngineId = $derived(resolveActiveEngineId(selected?.id));
+  const binding = $derived(runtimePreference?.binding ?? null);
+  const selected = $derived(
+    binding?.profile_id
+      ? (profiles.find((profile) => profile.id === binding.profile_id) ?? null)
+      : null,
+  );
+  const selectedReady = $derived(binding?.state === "ready");
+  const activeEngineId = $derived(binding ? resolveActiveEngineId(binding) : null);
 
   $effect(() => {
-    if (!connected) {
+    const engineId = activeEngineId;
+    if (!connected || !engineId) {
       health = null;
       return;
     }
-    // Reading `activeEngineId` here (rather than only in `switchProfile`)
-    // makes this effect re-run whenever the selected profile changes for
-    // any reason, not only through this component's own switcher — e.g. a
-    // selection made from the Runtime page.
-    const engineId = activeEngineId;
     const controller = new AbortController();
     void recheck(engineId, controller.signal);
     return () => controller.abort();
   });
 
-  async function recheck(engineId: string = activeEngineId, signal?: AbortSignal) {
+  async function recheck(engineId: string | null = activeEngineId, signal?: AbortSignal) {
+    if (!engineId) return;
     checking = true;
     try {
       health = await readEngineHealth(engineId, { signal });
@@ -64,16 +65,12 @@
   }
 
   async function switchProfile(event: Event) {
-    const profileId = (event.currentTarget as HTMLSelectElement).value;
-    if (!profileId || profileId === selected?.id) return;
+    const profileId = (event.currentTarget as HTMLSelectElement).value || null;
+    if (profileId === runtimePreference?.preferred_profile_id) return;
     switching = true;
     try {
-      await selectRuntimeProfile(profileId);
-      onChanged();
-      // Recheck against the profile we just switched to directly, rather
-      // than the reactive `activeEngineId` — the parent's `profiles` prop
-      // refresh from `onChanged()` may not have landed yet.
-      await recheck(profileId);
+      await setPreferredRuntime(profileId);
+      await onChanged();
     } finally {
       switching = false;
     }
@@ -83,12 +80,18 @@
 <Card.Root class="gap-3 p-4">
   <div class="flex flex-wrap items-center justify-between gap-3">
     <div class="flex flex-wrap items-center gap-2">
-      <h3 class="text-sm font-semibold">Active engine</h3>
-      {#if selected}
-        <span class="text-sm">{selected.display_name}</span>
-        <Badge variant={selectedReady ? "default" : "outline"}>
-          {selected.process.state.replace("_", " ")}
+      <h3 class="text-sm font-semibold">Active runtime</h3>
+      {#if binding?.state === "unconfigured"}
+        <Badge variant="outline">Platform default</Badge>
+        <span class="text-xs text-muted-foreground">Local engine compatibility mode.</span>
+      {:else if binding}
+        <span class="text-sm">{binding.display_name}</span>
+        <Badge variant={selectedReady ? "default" : "destructive"}>
+          {binding.state.replace("_", " ")}
         </Badge>
+        {#if selected}
+          <Badge variant="outline">{selected.runtime_class.replace("_", " ")}</Badge>
+        {/if}
         {#if health}
           <Badge variant={health.reachable ? "default" : "destructive"}>
             {health.reachable ? "Reachable" : "Unreachable"}
@@ -98,10 +101,7 @@
           <span class="text-xs text-muted-foreground">Docker API {health.api_version}</span>
         {/if}
       {:else}
-        <Badge variant="outline">None selected</Badge>
-        <span class="text-xs text-muted-foreground">
-          Projects fall back to the platform-default local engine.
-        </span>
+        <Badge variant="outline">Loading policy</Badge>
       {/if}
     </div>
     <div class="flex min-w-0 flex-wrap items-center justify-end gap-2">
@@ -110,15 +110,16 @@
           <select
             class="h-9 w-full appearance-none rounded-md border bg-background bg-none pr-9 pl-3 text-sm leading-5"
             disabled={switching || !connected}
-            value={selected?.id ?? ""}
+            value={runtimePreference?.preferred_profile_id ?? ""}
             onchange={switchProfile}
-            aria-label="Switch active engine"
+            aria-label="Set preferred runtime"
           >
-            {#if !selected}
-              <option value="">Select an engine…</option>
+            <option value="">Use platform default</option>
+            {#if binding?.state === "missing" && binding.profile_id}
+              <option value={binding.profile_id} disabled>{binding.display_name}</option>
             {/if}
             {#each profiles as profile (profile.id)}
-              <option value={profile.id}>
+              <option value={profile.id} disabled={!profile.management.can_select}>
                 {profile.display_name} ({profile.process.state.replace("_", " ")})
               </option>
             {/each}
@@ -131,7 +132,7 @@
       <Button
         size="sm"
         variant="outline"
-        disabled={checking || !connected}
+        disabled={checking || !connected || !activeEngineId}
         onclick={() => recheck()}
       >
         <RefreshCw />
@@ -144,7 +145,7 @@
       <Button
         size="sm"
         variant="destructive"
-        disabled={!connected}
+        disabled={!connected || !activeEngineId}
         onclick={() => (pruneDialogOpen = true)}
       >
         <Trash2 />
@@ -156,18 +157,20 @@
   {#if health?.error}
     <p class="text-xs text-destructive">{health.error}</p>
   {/if}
-  {#if selected && !selectedReady}
-    <p class="text-xs text-muted-foreground">
-      The active engine is not ready — open Manage runtimes to start it.
+  {#if binding && binding.state !== "ready" && binding.state !== "unconfigured"}
+    <p class="text-xs text-destructive">
+      This configured runtime is unavailable. Studio will not switch engines automatically.
     </p>
   {/if}
 </Card.Root>
 
-<PruneDialog
-  engineId={activeEngineId}
-  runtimeName={selected
-    ? `${selected.display_name} (${selected.provider_runtime_key})`
-    : undefined}
-  bind:open={pruneDialogOpen}
-  oncompleted={recheck}
-/>
+{#if activeEngineId}
+  <PruneDialog
+    engineId={activeEngineId}
+    runtimeName={selected
+      ? `${selected.display_name} (${selected.provider_runtime_key})`
+      : binding?.display_name}
+    bind:open={pruneDialogOpen}
+    oncompleted={() => recheck()}
+  />
+{/if}

@@ -22,7 +22,7 @@ use super::engines::{self, resolve_and_validate_engine};
 use crate::{
     action_audit::{self, AffectedCount, AuditEntry},
     action_plans::{ActionKind, ActionPlanPayload, ImageRemovePlan, ImageTagPlan, PlanState},
-    artifact_inventory::{self, DetailLookup, RuntimeContextRow},
+    artifact_inventory::{self, DetailLookup},
     auth::authorize,
     error::ApiError,
     logging, runtime,
@@ -36,24 +36,23 @@ use crate::{
 pub struct ArtifactRuntimeContext {
     pub runtime_profile_id: Option<String>,
     pub runtime_class: Option<String>,
-    pub display_name: Option<String>,
-    pub is_selected: Option<bool>,
+    pub binding_source: runtime::RuntimeBindingSource,
+    pub display_name: String,
 }
 
-impl From<RuntimeContextRow> for ArtifactRuntimeContext {
-    fn from(row: RuntimeContextRow) -> Self {
+impl From<&engines::ResolvedEngine> for ArtifactRuntimeContext {
+    fn from(resolved: &engines::ResolvedEngine) -> Self {
         Self {
-            runtime_profile_id: row.runtime_profile_id,
-            runtime_class: row.runtime_class,
-            display_name: row.display_name,
-            is_selected: row.is_selected,
+            runtime_profile_id: resolved.runtime_profile_id.clone(),
+            runtime_class: resolved.runtime_class.clone(),
+            binding_source: resolved.runtime_binding_source,
+            display_name: resolved.runtime_summary.display_name.clone(),
         }
     }
 }
 
 /// Resolves and validates `requested_engine_id` exactly once, then connects
-/// using that same resolution's `runtime_profile_id` — never a fresh
-/// `attribution_for` call. Resolving twice (once to validate the path, once
+/// using that same resolution's endpoint. Resolving twice (once to validate the path, once
 /// to connect) would open a race: a concurrent profile switch between the
 /// two queries could validate one engine's identity while actually
 /// connecting to a different one.
@@ -69,16 +68,8 @@ async fn connect_selected_engine(
     ApiError,
 > {
     let resolved = resolve_and_validate_engine(state, requested_engine_id).await?;
-    let engine = susun_integration::connect_engine_for_profile(
-        &state.db,
-        resolved.runtime_profile_id.as_deref(),
-    )
-    .await
-    .map_err(ApiError::EngineUnavailable)?;
-    let runtime_ctx =
-        artifact_inventory::runtime_context(&state.db, resolved.runtime_profile_id.as_deref())
-            .await?
-            .into();
+    let runtime_ctx = ArtifactRuntimeContext::from(&resolved);
+    let engine = engines::connect_resolved_engine(&resolved).await?.engine;
     Ok((engine, resolved.engine_id, runtime_ctx))
 }
 
@@ -408,8 +399,8 @@ pub async fn preview_tag_image(
 ) -> Result<Json<ImageTagPreview>, ApiError> {
     authorize(&state, &headers)?;
     let resolved = resolve_and_validate_engine(&state, &engine_id).await?;
-    let engine_id = resolved.engine_id;
-    let runtime_profile_id = resolved.runtime_profile_id;
+    let engine_id = resolved.engine_id.clone();
+    let runtime_profile_id = resolved.runtime_profile_id.clone();
     let owner = runtime::stable_suffix(&state.auth_token);
 
     let target_reference = request.target_reference.trim().to_owned();
@@ -422,13 +413,8 @@ pub async fn preview_tag_image(
     // Connect using the exact profile just resolved above — never
     // re-resolve selection here, for the same race-avoidance reason as the
     // read-only artifact routes.
-    let engine =
-        susun_integration::connect_engine_for_profile(&state.db, runtime_profile_id.as_deref())
-            .await
-            .map_err(ApiError::EngineUnavailable)?;
-    let runtime_ctx = artifact_inventory::runtime_context(&state.db, runtime_profile_id.as_deref())
-        .await?
-        .into();
+    let runtime_ctx = ArtifactRuntimeContext::from(&resolved);
+    let engine = engines::connect_resolved_engine(&resolved).await?.engine;
 
     let lookup = artifact_inventory::image_for_mutation(&engine, &image_id).await?;
     let (active_jobs, active_watch_sessions) =
@@ -777,17 +763,12 @@ pub async fn preview_remove_image(
 ) -> Result<Json<ImageRemovePreview>, ApiError> {
     authorize(&state, &headers)?;
     let resolved = resolve_and_validate_engine(&state, &engine_id).await?;
-    let engine_id = resolved.engine_id;
-    let runtime_profile_id = resolved.runtime_profile_id;
+    let engine_id = resolved.engine_id.clone();
+    let runtime_profile_id = resolved.runtime_profile_id.clone();
     let owner = runtime::stable_suffix(&state.auth_token);
 
-    let engine =
-        susun_integration::connect_engine_for_profile(&state.db, runtime_profile_id.as_deref())
-            .await
-            .map_err(ApiError::EngineUnavailable)?;
-    let runtime_ctx = artifact_inventory::runtime_context(&state.db, runtime_profile_id.as_deref())
-        .await?
-        .into();
+    let runtime_ctx = ArtifactRuntimeContext::from(&resolved);
+    let engine = engines::connect_resolved_engine(&resolved).await?.engine;
 
     let lookup = artifact_inventory::image_for_mutation(&engine, &image_id).await?;
     let (active_jobs, active_watch_sessions) =
@@ -1188,8 +1169,8 @@ mod tests {
         ArtifactRuntimeContext {
             runtime_profile_id: Some("profile-1".to_owned()),
             runtime_class: Some("built_in".to_owned()),
-            display_name: Some("Susun Runtime".to_owned()),
-            is_selected: Some(true),
+            binding_source: runtime::RuntimeBindingSource::GlobalPreference,
+            display_name: "Susun Runtime".to_owned(),
         }
     }
 
@@ -1255,7 +1236,7 @@ mod tests {
 
         let value = serde_json::to_value(&response)?;
         assert_eq!(value["runtime"]["runtime_class"], "built_in");
-        assert_eq!(value["runtime"]["is_selected"], true);
+        assert_eq!(value["runtime"]["binding_source"], "global_preference");
         assert_eq!(value["containers"][0]["known_project_id"], "proj-1");
         // A container's own filesystem path never appears in the wire shape.
         assert!(!value.to_string().contains("C:\\") && !value.to_string().contains("C:/"));

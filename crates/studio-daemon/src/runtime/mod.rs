@@ -1,6 +1,7 @@
 mod command;
 mod endpoint_policy;
 mod package_source;
+pub mod policy;
 mod provider;
 pub mod transitions;
 mod trusted_exec;
@@ -29,9 +30,13 @@ use windows_docker_desktop::WindowsDockerDesktopProvider;
 use windows_podman::WindowsPodmanProvider;
 
 pub use endpoint_policy::validate_engine_endpoint;
+pub use policy::{
+    RuntimeAttribution, RuntimeBindingSource, RuntimeBindingState, RuntimeBindingSummary,
+    RuntimePreference,
+};
 pub use provider::{
     ManagementCapabilities, RuntimeAction, RuntimeDimension, RuntimeError, RuntimeProfile,
-    RuntimeResourceSnapshot,
+    RuntimeProviderExperience, RuntimeResourceSnapshot,
 };
 
 /// Columns selected to hydrate a [`RuntimeProfile`]; the order matches
@@ -43,10 +48,13 @@ const PROFILE_COLUMNS: &str =
     connection_state, connection_detail, endpoint_summary,
     availability_state, last_seen_at_ms, missing_since_ms,
     last_error_code, last_error_detail, last_error_at_ms,
-    is_selected, observation_revision, observed_at_ms";
+    CASE WHEN id = (SELECT preferred_profile_id FROM runtime_policy WHERE singleton = 1)
+        THEN 1 ELSE 0 END AS is_preferred,
+    observation_revision, observed_at_ms";
 
 #[derive(Debug, Serialize)]
 pub struct RuntimeStatus {
+    pub policy: RuntimePreference,
     pub providers: Vec<RuntimeProviderStatus>,
 }
 
@@ -57,6 +65,7 @@ pub struct RuntimeProviderStatus {
     pub product: String,
     pub platform: String,
     pub supported: bool,
+    pub experience: RuntimeProviderExperience,
     pub installation: RuntimeDimension,
     pub process: RuntimeDimension,
     pub connection: RuntimeDimension,
@@ -79,12 +88,6 @@ pub struct RuntimeActionResult {
 pub struct RuntimeLogLine {
     pub level: String,
     pub message: String,
-}
-
-pub enum EngineEndpointResolution {
-    Explicit(EngineEndpoint),
-    PlatformDefault,
-    Unavailable { profile_id: String },
 }
 
 /// Outcome of forgetting an external profile's Studio metadata.
@@ -167,6 +170,7 @@ pub async fn status(db: &Database) -> Result<RuntimeStatus, turso::Error> {
             product: provider.product().to_owned(),
             platform: provider.platform().to_owned(),
             supported: provider.supported(),
+            experience: provider.experience(),
             installation: observation.installation,
             process: observation.process,
             connection: observation.connection,
@@ -178,7 +182,10 @@ pub async fn status(db: &Database) -> Result<RuntimeStatus, turso::Error> {
         });
     }
 
-    Ok(RuntimeStatus { providers })
+    Ok(RuntimeStatus {
+        policy: policy::read_preference(db).await?,
+        providers,
+    })
 }
 
 pub async fn resource_snapshot(
@@ -204,50 +211,14 @@ pub async fn select_profile(
     db: &Database,
     profile_id: &str,
 ) -> Result<SelectOutcome, turso::Error> {
-    let mut conn = db.connect()?;
     // Fully materialize the existence check before writing on the same
     // connection — turso silently drops a write issued while an earlier
     // read cursor is still open (see project memory on this quirk).
-    let selectable = {
-        let mut rows = conn
-            .query(
-                "SELECT runtime_class, ownership_state, availability_state
-                 FROM runtime_profiles WHERE id = ?1 LIMIT 1",
-                params![profile_id.to_owned()],
-            )
-            .await?;
-        match rows.next().await? {
-            Some(row) => {
-                let runtime_class: String = row.get(0)?;
-                let ownership_state: String = row.get(1)?;
-                let availability_state: String = row.get(2)?;
-                ManagementCapabilities::derive(
-                    &runtime_class,
-                    &ownership_state,
-                    &availability_state,
-                )
-                .can_select
-            }
-            None => return Ok(SelectOutcome::NotFound),
-        }
-    };
-    if !selectable {
-        return Ok(SelectOutcome::Unavailable);
-    }
-
-    let tx = conn.transaction().await?;
-    tx.execute("UPDATE runtime_profiles SET is_selected = 0", ())
-        .await?;
-    // Selection is user metadata, so it advances updated_at_ms (not the
-    // observation timeline). The single-selected partial unique index is
-    // satisfied because every other row was just cleared above.
-    tx.execute(
-        "UPDATE runtime_profiles SET is_selected = 1, updated_at_ms = ?1 WHERE id = ?2",
-        params![now_ms(), profile_id.to_owned()],
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(SelectOutcome::Selected)
+    Ok(match policy::set_preferred(db, Some(profile_id)).await? {
+        policy::SetPreferredOutcome::Updated => SelectOutcome::Selected,
+        policy::SetPreferredOutcome::NotFound => SelectOutcome::NotFound,
+        policy::SetPreferredOutcome::Unavailable => SelectOutcome::Unavailable,
+    })
 }
 
 /// Forget an external profile: remove Studio's stored metadata for it. The row
@@ -349,144 +320,21 @@ pub async fn adopt_profile(db: &Database, profile_id: &str) -> Result<AdoptOutco
     Ok(AdoptOutcome::OwnershipUnproven)
 }
 
-/// The runtime profile Studio attributes a new job to: the project's own bound
-/// profile when it is still present, otherwise the globally selected profile.
-/// Returns `(profile_id, runtime_class)` so job records keep attribution even
-/// after the profile later disappears.
-pub async fn attribution_for(
-    db: &Database,
-    project_id: Option<&str>,
-) -> Result<(Option<String>, Option<String>), turso::Error> {
-    let conn = db.connect()?;
-
-    if let Some(project_id) = project_id {
-        let bound: Option<String> = {
-            let mut rows = conn
-                .query(
-                    "SELECT runtime_profile_id FROM projects WHERE id = ?1 LIMIT 1",
-                    params![project_id.to_owned()],
-                )
-                .await?;
-            match rows.next().await? {
-                Some(row) => row.get(0)?,
-                None => None,
-            }
-        };
-        if let Some(profile_id) = bound {
-            let class: Option<String> = {
-                let mut rows = conn
-                    .query(
-                        "SELECT runtime_class FROM runtime_profiles
-                         WHERE id = ?1 LIMIT 1",
-                        params![profile_id.clone()],
-                    )
-                    .await?;
-                match rows.next().await? {
-                    Some(row) => Some(row.get(0)?),
-                    None => None,
-                }
-            };
-            return Ok((Some(profile_id), class));
-        }
-    }
-
-    let mut rows = conn
-        .query(
-            "SELECT id, runtime_class FROM runtime_profiles
-             WHERE is_selected = 1 LIMIT 1",
-            (),
-        )
-        .await?;
-    match rows.next().await? {
-        Some(row) => Ok((Some(row.get(0)?), Some(row.get(1)?))),
-        None => Ok((None, None)),
-    }
-}
-
-/// Engine endpoint for a specific project: the project's own binding wins
-/// (when the bound profile still exists, is present, and is connectable), then
-/// the globally selected profile, then `None` (platform default).
-pub async fn engine_endpoint_for(
-    db: &Database,
-    project_id: Option<&str>,
-) -> Result<EngineEndpointResolution, turso::Error> {
-    if let Some(project_id) = project_id {
-        let conn = db.connect()?;
-        let bound_profile_id: Option<String> = {
-            let mut rows = conn
-                .query(
-                    "SELECT runtime_profile_id FROM projects WHERE id = ?1 LIMIT 1",
-                    params![project_id.to_owned()],
-                )
-                .await?;
-            match rows.next().await? {
-                Some(row) => row.get(0)?,
-                None => None,
-            }
-        };
-        if let Some(profile_id) = bound_profile_id {
-            return Ok(match endpoint_for_profile(db, &profile_id).await? {
-                Some(endpoint) => EngineEndpointResolution::Explicit(endpoint),
-                None => EngineEndpointResolution::Unavailable { profile_id },
-            });
-        }
-    }
-
-    let conn = db.connect()?;
-    let selected_profile_id: Option<String> = {
-        let mut rows = conn
-            .query(
-                "SELECT id FROM runtime_profiles WHERE is_selected = 1 LIMIT 1",
-                (),
-            )
-            .await?;
-        match rows.next().await? {
-            Some(row) => Some(row.get(0)?),
-            None => None,
-        }
-    };
-    let Some(profile_id) = selected_profile_id else {
-        return Ok(EngineEndpointResolution::PlatformDefault);
-    };
-    Ok(match endpoint_for_profile(db, &profile_id).await? {
-        Some(endpoint) => EngineEndpointResolution::Explicit(endpoint),
-        None => EngineEndpointResolution::Unavailable { profile_id },
-    })
-}
-
+/// Resolve one explicit profile without consulting project or global policy.
+/// The caller supplies this id from an already-bound operation, so a missing
+/// or unavailable profile remains unavailable rather than falling back.
 pub(crate) async fn endpoint_for_profile(
     db: &Database,
     profile_id: &str,
 ) -> Result<Option<EngineEndpoint>, turso::Error> {
-    let conn = db.connect()?;
-    let mut rows = conn
-        .query(
-            "SELECT provider_id, provider_runtime_key, runtime_class, ownership_state,
-                    connection_state, availability_state
-             FROM runtime_profiles WHERE id = ?1 LIMIT 1",
-            params![profile_id.to_owned()],
-        )
-        .await?;
-    let Some(row) = rows.next().await? else {
-        return Ok(None);
-    };
-    let provider_id: String = row.get(0)?;
-    let provider_runtime_key: String = row.get(1)?;
-    let runtime_class: String = row.get(2)?;
-    let ownership_state: String = row.get(3)?;
-    let connection_state: String = row.get(4)?;
-    let availability_state: String = row.get(5)?;
-    // A missing or unreachable bound profile falls through to the selected /
-    // default endpoint. The binding row itself is left untouched so the project
-    // still shows which runtime it prefers once that runtime returns.
-    if connection_state != "summarized"
-        || !ManagementCapabilities::derive(&runtime_class, &ownership_state, &availability_state)
-            .can_select
-    {
-        return Ok(None);
-    }
-    Ok(find_provider(&provider_id)
-        .and_then(|provider| provider.endpoint_for_runtime_key(&provider_runtime_key)))
+    Ok(policy::resolve_profile(
+        db,
+        RuntimeBindingSource::GlobalPreference,
+        profile_id.to_owned(),
+    )
+    .await?
+    .endpoint()
+    .cloned())
 }
 
 pub async fn logs(db: &Database) -> Result<Vec<RuntimeLogLine>, turso::Error> {
@@ -897,7 +745,7 @@ async fn claim_setup_profile(
         .execute(
             "UPDATE runtime_profiles
          SET ownership_state = 'studio_managed', source = 'studio_setup',
-             owner_token = ?1, is_selected = 1, updated_at_ms = ?2
+             owner_token = ?1, updated_at_ms = ?2
          WHERE id = ?3 AND ownership_state = 'ownership_conflict'",
             params![owner_token.clone(), now_ms(), profile_id.to_owned()],
         )
@@ -905,11 +753,7 @@ async fn claim_setup_profile(
     if updated != 1 {
         return Ok(false);
     }
-    tx.execute(
-        "UPDATE runtime_profiles SET is_selected = 0 WHERE id <> ?1",
-        params![profile_id.to_owned()],
-    )
-    .await?;
+    policy::set_preferred_in_transaction(&tx, profile_id).await?;
     record_ownership_event(
         &tx,
         profile_id,
@@ -978,7 +822,7 @@ async fn resolve_trusted_action(
         return Ok(None);
     }
     if profiles.iter().any(|profile| {
-        profile.is_selected
+        profile.is_preferred
             && profile.provider_id == provider_id
             && profile.management.blocks_destructive_actions
     }) {
@@ -1257,16 +1101,6 @@ async fn persist_observed(db: &Database, observed: &[ObservedProfile]) -> Result
     let conn = db.connect()?;
     // Whether any profile is already globally selected — the initial-import
     // selection is only honoured when nothing is selected yet.
-    let mut any_selected = {
-        let mut rows = conn
-            .query(
-                "SELECT 1 FROM runtime_profiles WHERE is_selected = 1 LIMIT 1",
-                (),
-            )
-            .await?;
-        rows.next().await?.is_some()
-    };
-
     for profile in observed {
         let already_exists = {
             let mut rows = conn
@@ -1331,9 +1165,6 @@ async fn persist_observed(db: &Database, observed: &[ObservedProfile]) -> Result
         // Honour the provider's default only for the first import and never for
         // an ownership conflict — Studio must not silently adopt a reserved-name
         // machine it cannot prove it created by making it the active runtime.
-        let select_now =
-            profile.provider_default && !any_selected && ownership_state != "ownership_conflict";
-
         conn.execute(
             "INSERT INTO runtime_profiles (
                 id, provider_id, provider_runtime_key, display_name, product, platform,
@@ -1341,14 +1172,14 @@ async fn persist_observed(db: &Database, observed: &[ObservedProfile]) -> Result
                 installation_state, installation_detail, process_state, process_detail,
                 connection_state, connection_detail, endpoint_summary,
                 availability_state, last_seen_at_ms, missing_since_ms,
-                is_selected, observation_revision, observed_at_ms, created_at_ms, updated_at_ms
+                observation_revision, observed_at_ms, created_at_ms, updated_at_ms
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, 'provider_discovery', NULL,
                 ?9, ?10, ?11, ?12,
                 ?13, ?14, ?15,
                 'available', ?16, NULL,
-                ?17, 0, ?16, ?18, ?18
+                0, ?16, ?17, ?17
             )",
             params![
                 profile.id.clone(),
@@ -1367,14 +1198,10 @@ async fn persist_observed(db: &Database, observed: &[ObservedProfile]) -> Result
                 profile.connection.detail.clone(),
                 profile.endpoint_summary.clone(),
                 observed_at,
-                i64::from(select_now),
                 now,
             ],
         )
         .await?;
-        if select_now {
-            any_selected = true;
-        }
         record_ownership_event(
             &conn,
             &profile.id,
@@ -1384,11 +1211,7 @@ async fn persist_observed(db: &Database, observed: &[ObservedProfile]) -> Result
             None,
             Some(ownership_state),
             None,
-            Some(if select_now {
-                "initial import; selected as default"
-            } else {
-                "initial import"
-            }),
+            Some("initial import"),
         )
         .await?;
     }
@@ -1482,7 +1305,9 @@ async fn list_profiles_for_provider(
     let conn = db.connect()?;
     let sql = format!(
         "SELECT {PROFILE_COLUMNS} FROM runtime_profiles
-         WHERE provider_id = ?1 ORDER BY is_selected DESC, display_name ASC"
+         WHERE provider_id = ?1 ORDER BY
+             id = (SELECT preferred_profile_id FROM runtime_policy WHERE singleton = 1) DESC,
+             display_name ASC"
     );
     let mut rows = conn.query(&sql, params![provider_id.to_owned()]).await?;
     let mut profiles = Vec::new();
@@ -1500,7 +1325,7 @@ fn profile_from_row(row: &turso::Row) -> Result<RuntimeProfile, turso::Error> {
     let last_error_code: Option<String> = row.get(19)?;
     let last_error_detail: Option<String> = row.get(20)?;
     let last_error_at_ms: Option<i64> = row.get(21)?;
-    let is_selected: i64 = row.get(22)?;
+    let is_preferred: i64 = row.get(22)?;
     let management =
         ManagementCapabilities::derive(&runtime_class, &ownership_state, &availability_state);
     let last_error = last_error_code.map(|code| RuntimeError {
@@ -1536,7 +1361,7 @@ fn profile_from_row(row: &turso::Row) -> Result<RuntimeProfile, turso::Error> {
         last_seen_at_ms: row.get(17)?,
         missing_since_ms: row.get(18)?,
         last_error,
-        is_selected: is_selected != 0,
+        is_preferred: is_preferred != 0,
         observation_revision: row.get(23)?,
         observed_at_ms: row.get(24)?,
         management,
@@ -1548,7 +1373,8 @@ pub async fn list_all_profiles(db: &Database) -> Result<Vec<RuntimeProfile>, tur
     let conn = db.connect()?;
     let sql = format!(
         "SELECT {PROFILE_COLUMNS} FROM runtime_profiles
-         ORDER BY is_selected DESC, display_name ASC"
+         ORDER BY id = (SELECT preferred_profile_id FROM runtime_policy WHERE singleton = 1) DESC,
+             display_name ASC"
     );
     let mut rows = conn.query(&sql, ()).await?;
     let mut profiles = Vec::new();

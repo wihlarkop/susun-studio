@@ -107,12 +107,14 @@
           healthState={daemonState.healthState}
           projectCount={daemonState.projects.length}
           runtimeProfiles={daemonState.runtimeProfiles}
+          runtimePreference={daemonState.runtimePreference}
           onImportClick={() => (importDialogOpen = true)}
           onRetry={daemonState.refresh}
           onSetupRuntime={() => (activeView = "runtime")}
         />
         <ActiveEngineStrip
           profiles={daemonState.runtimeProfiles}
+          runtimePreference={daemonState.runtimePreference}
           connected={daemonState.healthState.kind === "connected"}
           onManageRuntimes={() => (activeView = "runtime")}
           onChanged={() => daemonState.refresh()}
@@ -137,6 +139,7 @@
       {:else if activeView === "artifacts"}
         <ArtifactsPage
           profiles={daemonState.runtimeProfiles}
+          runtimePreference={daemonState.runtimePreference}
           connected={daemonState.healthState.kind === "connected"}
           projects={daemonState.projects}
         />

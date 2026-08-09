@@ -20,7 +20,7 @@ use crate::{
 };
 
 /// Identity of the platform-default local engine: used only when no runtime
-/// profile is selected or bound. Kept as this literal string — matching the
+/// profile is preferred or bound. Kept as this literal string — matching the
 /// legacy `engines` table's one seeded row — so existing logs, responses,
 /// and stored plans keep reading a familiar id. It is no longer *looked up*
 /// from that table for identity purposes, though: runtime profiles are what
@@ -35,37 +35,47 @@ pub(crate) const PLATFORM_DEFAULT_ENGINE_ID: &str = "engine-docker-local";
 /// (once to validate, once to connect) opens a race: a concurrent profile
 /// switch between the two queries could validate one engine's identity
 /// while actually connecting to a different one.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ResolvedEngine {
     pub engine_id: String,
     pub runtime_profile_id: Option<String>,
     pub runtime_class: Option<String>,
+    pub runtime_binding_source: runtime::RuntimeBindingSource,
+    pub runtime_summary: runtime::RuntimeBindingSummary,
+    runtime: runtime::policy::ResolvedRuntime,
 }
 
-/// Resolves the engine actually selected right now — once — and confirms
+/// Resolves the engine selected by the persisted policy right now — once — and confirms
 /// `engine_id` names it. A fabricated *or stale* id (including one left
 /// over from before the user switched runtimes, e.g. an external Podman
 /// profile echoed back as `engine-docker-local`) is rejected before the
 /// caller does anything else with it: connecting to an engine, mutating
 /// state, or minting a plan.
 ///
-/// This never selects a connection endpoint or overrides the
-/// selected/bound runtime profile — it only reads the same selection engine
-/// connection already uses (`runtime::attribution_for`), it never chooses
-/// it. Callers must connect using `runtime_profile_id` from the returned
-/// value, never by calling `attribution_for` again.
+/// This never overrides the persisted preference. The private resolution it
+/// returns must be passed directly to the connection boundary, so callers
+/// cannot validate one engine identity and connect to another.
 pub(crate) async fn resolve_and_validate_engine(
     state: &AppState,
     requested_engine_id: &str,
 ) -> Result<ResolvedEngine, ApiError> {
-    let (engine_id, runtime_profile_id, runtime_class) = resolved_engine_id(&state.db).await?;
+    let runtime = runtime::policy::resolve_global(&state.db).await?;
+    let attribution = runtime.attribution();
+    let runtime_summary = runtime.summary().clone();
+    let engine_id = attribution
+        .runtime_profile_id
+        .clone()
+        .unwrap_or_else(|| PLATFORM_DEFAULT_ENGINE_ID.to_owned());
     if requested_engine_id != engine_id {
         return Err(ApiError::EngineNotFound);
     }
     Ok(ResolvedEngine {
         engine_id,
-        runtime_profile_id,
-        runtime_class,
+        runtime_profile_id: attribution.runtime_profile_id.clone(),
+        runtime_class: attribution.runtime_class.clone(),
+        runtime_binding_source: attribution.binding_source,
+        runtime_summary,
+        runtime,
     })
 }
 
@@ -75,14 +85,53 @@ pub(crate) async fn resolve_and_validate_engine(
 /// exact profile id (if any) that identity came from. This is the single
 /// source of truth for "which engine a request is about" — never derive it
 /// from the legacy `engines` table, which does not drive engine selection.
-async fn resolved_engine_id(
-    db: &turso::Database,
-) -> Result<(String, Option<String>, Option<String>), ApiError> {
-    let (runtime_profile_id, runtime_class) = runtime::attribution_for(db, None).await?;
-    let engine_id = runtime_profile_id
-        .clone()
-        .unwrap_or_else(|| PLATFORM_DEFAULT_ENGINE_ID.to_owned());
-    Ok((engine_id, runtime_profile_id, runtime_class))
+pub(crate) async fn connect_resolved_engine(
+    resolved: &ResolvedEngine,
+) -> Result<susun_integration::ConnectedRuntime, ApiError> {
+    susun_integration::connect_resolved_runtime(resolved.runtime.clone())
+        .await
+        .map_err(ApiError::EngineUnavailable)
+}
+
+#[cfg(test)]
+pub(crate) fn resolved_engine_for_test(
+    engine_id: &str,
+    runtime_profile_id: Option<&str>,
+    runtime_class: Option<&str>,
+    runtime_binding_source: runtime::RuntimeBindingSource,
+) -> ResolvedEngine {
+    let attribution = runtime::RuntimeAttribution {
+        runtime_profile_id: runtime_profile_id.map(str::to_owned),
+        runtime_class: runtime_class.map(str::to_owned),
+        binding_source: runtime_binding_source,
+    };
+    let runtime_summary = runtime::RuntimeBindingSummary {
+        source: attribution.binding_source,
+        state: if attribution.runtime_profile_id.is_some() {
+            runtime::RuntimeBindingState::Ready
+        } else {
+            runtime::RuntimeBindingState::Unconfigured
+        },
+        profile_id: attribution.runtime_profile_id.clone(),
+        runtime_class: attribution.runtime_class.clone(),
+        display_name: "Test runtime".to_owned(),
+    };
+    ResolvedEngine {
+        engine_id: engine_id.to_owned(),
+        runtime_profile_id: attribution.runtime_profile_id.clone(),
+        runtime_class: attribution.runtime_class.clone(),
+        runtime_binding_source: attribution.binding_source,
+        runtime_summary,
+        runtime: runtime::policy::resolved_runtime_for_test(attribution),
+    }
+}
+
+async fn current_global_engine_id(db: &turso::Database) -> Result<String, ApiError> {
+    let resolved = runtime::policy::resolve_global(db).await?;
+    Ok(resolved
+        .attribution()
+        .runtime_profile_id
+        .unwrap_or_else(|| PLATFORM_DEFAULT_ENGINE_ID.to_owned()))
 }
 
 #[derive(Debug, Serialize)]
@@ -165,23 +214,18 @@ pub async fn engine_health(
 ) -> Result<Json<EngineHealthResponse>, ApiError> {
     authorize(&state, &headers)?;
     let resolved = resolve_and_validate_engine(&state, &engine_id).await?;
-    let engine_id = resolved.engine_id;
+    let engine_id = resolved.engine_id.clone();
     logging::info("engine_health_started", &[("engine_id", engine_id.clone())]);
 
     // Connect using the exact profile just resolved above — never
     // re-resolve selection here, or a concurrent profile switch could
     // validate one engine while checking the health of another.
-    let health = match susun_integration::connect_engine_for_profile(
-        &state.db,
-        resolved.runtime_profile_id.as_deref(),
-    )
-    .await
-    {
-        Ok(engine) => susun_integration::engine_health(&engine).await,
+    let health = match connect_resolved_engine(&resolved).await {
+        Ok(connected) => susun_integration::engine_health(&connected.engine).await,
         Err(error) => susun_integration::EngineHealthRow {
             reachable: false,
             api_version: None,
-            error: Some(error),
+            error: Some(error.to_string()),
         },
     };
     let response = EngineHealthResponse {
@@ -240,13 +284,8 @@ pub async fn engine_capabilities(
     // Connect using the exact profile just resolved above — never
     // re-resolve selection here, for the same race-avoidance reason as
     // `engine_health`.
-    let engine = susun_integration::connect_engine_for_profile(
-        &state.db,
-        resolved.runtime_profile_id.as_deref(),
-    )
-    .await
-    .map_err(ApiError::EngineUnavailable)?;
-    let capabilities = susun_integration::engine_capabilities(&engine)
+    let connected = connect_resolved_engine(&resolved).await?;
+    let capabilities = susun_integration::engine_capabilities(&connected.engine)
         .await
         .map_err(ApiError::EngineUnavailable)?;
 
@@ -356,7 +395,7 @@ pub(crate) async fn engine_identity_fingerprint(
             profile.availability_state,
             profile.endpoint_summary.unwrap_or_default(),
             profile.observation_revision,
-            profile.is_selected
+            profile.is_preferred
         ),
         (None, None) => "platform_default".to_owned(),
     };
@@ -364,7 +403,7 @@ pub(crate) async fn engine_identity_fingerprint(
 }
 
 /// Confirms the plan's server-stored engine identity still matches what's
-/// actually selected right now. `plan_engine_id` was resolved and validated
+/// preferred by the policy right now. `plan_engine_id` was resolved and validated
 /// once already, at preview time (`resolve_and_validate_engine`); this
 /// re-derives the same identity fresh and reports any drift, so a
 /// destructive commit can never execute under a stale or superseded engine
@@ -379,7 +418,7 @@ pub(crate) async fn revalidate_engine_still_selected(
     db: &turso::Database,
     plan_engine_id: &str,
 ) -> Result<bool, ApiError> {
-    let (current, _, _) = resolved_engine_id(db).await?;
+    let current = current_global_engine_id(db).await?;
     Ok(current == plan_engine_id)
 }
 
@@ -493,8 +532,8 @@ pub async fn preview_prune(
 ) -> Result<Json<PrunePreview>, ApiError> {
     authorize(&state, &headers)?;
     let resolved = resolve_and_validate_engine(&state, &engine_id).await?;
-    let engine_id = resolved.engine_id;
-    let runtime_profile_id = resolved.runtime_profile_id;
+    let engine_id = resolved.engine_id.clone();
+    let runtime_profile_id = resolved.runtime_profile_id.clone();
     let owner = runtime::stable_suffix(&state.auth_token);
 
     if request.scopes.is_empty()
@@ -513,10 +552,7 @@ pub async fn preview_prune(
     // Connect using the exact profile just resolved above — never
     // re-resolve selection here, for the same race-avoidance reason as
     // `engine_health`/`engine_capabilities`.
-    let engine =
-        susun_integration::connect_engine_for_profile(&state.db, runtime_profile_id.as_deref())
-            .await
-            .map_err(ApiError::EngineUnavailable)?;
+    let engine = connect_resolved_engine(&resolved).await?.engine;
 
     let (active_jobs, active_watch_sessions) =
         engine_active_work(&state.db, runtime_profile_id.as_deref()).await?;
@@ -894,17 +930,22 @@ mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-    async fn insert_selected_runtime_profile(state: &AppState, id: &str) -> TestResult {
+    async fn insert_preferred_runtime_profile(state: &AppState, id: &str) -> TestResult {
         let conn = state.db.connect()?;
         conn.execute(
             "INSERT INTO runtime_profiles (
                 id, provider_id, provider_runtime_key, display_name, product, platform,
                 runtime_class, ownership_state, source,
                 installation_state, process_state, connection_state,
-                is_selected, observed_at_ms, created_at_ms, updated_at_ms
+                observed_at_ms, created_at_ms, updated_at_ms
             ) VALUES (?1, ?2, ?2, ?3, 'podman', 'windows', 'external_local', 'external',
-                'provider_discovery', 'installed', 'running', 'summarized', 1, 1, 1, 1)",
+                'provider_discovery', 'installed', 'running', 'summarized', 1, 1, 1)",
             params![id.to_owned(), format!("key-{id}"), format!("Runtime {id}")],
+        )
+        .await?;
+        conn.execute(
+            "UPDATE runtime_policy SET preferred_profile_id = ?1 WHERE singleton = 1",
+            params![id.to_owned()],
         )
         .await?;
         Ok(())
@@ -921,7 +962,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_and_validate_engine_accepts_the_platform_default_when_no_profile_is_selected()
+    async fn resolve_and_validate_engine_accepts_the_platform_default_when_no_profile_is_preferred()
     -> TestResult {
         let state = test_state(fresh_db("engines-validate-platform-default").await?);
 
@@ -941,7 +982,7 @@ mod tests {
     async fn resolve_and_validate_engine_returns_the_exact_profile_id_used_to_connect() -> TestResult
     {
         let state = test_state(fresh_db("engines-validate-profile").await?);
-        insert_selected_runtime_profile(&state, "profile-podman-1").await?;
+        insert_preferred_runtime_profile(&state, "profile-podman-1").await?;
 
         let resolved = resolve_and_validate_engine(&state, "profile-podman-1").await?;
 
@@ -954,15 +995,15 @@ mod tests {
     }
 
     /// The regression this whole reconciliation exists to prevent: once a
-    /// Podman (or any non-default) profile is selected, the platform-default
+    /// Podman (or any non-default) profile is preferred, the platform-default
     /// id — the only id a caller could have gotten from before the switch,
     /// or by guessing — must no longer resolve. Labeling Podman's data as
     /// `engine-docker-local` would misrepresent which runtime it came from.
     #[tokio::test]
-    async fn resolve_and_validate_engine_rejects_platform_default_once_another_engine_is_selected()
+    async fn resolve_and_validate_engine_rejects_platform_default_once_another_engine_is_preferred()
     -> TestResult {
         let state = test_state(fresh_db("engines-validate-stale-default").await?);
-        insert_selected_runtime_profile(&state, "profile-podman-1").await?;
+        insert_preferred_runtime_profile(&state, "profile-podman-1").await?;
 
         let result = resolve_and_validate_engine(&state, PLATFORM_DEFAULT_ENGINE_ID).await;
 
@@ -1040,12 +1081,12 @@ mod tests {
 
     /// Covers the specific gap this check closes: `commit_prune` always
     /// reconnects to the exact profile pinned at preview time (by design,
-    /// so a later global selection switch never redirects an in-flight
-    /// prune), so a merely-different *global* selection cannot be caught by
+    /// so a later global preference change never redirects an in-flight
+    /// prune), so a merely-different *global* preference cannot be caught by
     /// the connect step or the identity fingerprint — both are scoped to
-    /// the pinned profile, not "whatever is selected now". This explicit
+    /// the pinned profile, not "whatever is preferred now". This explicit
     /// check is what rejects a commit whose server-stored engine id has
-    /// gone stale relative to the currently selected engine.
+    /// gone stale relative to the currently preferred engine.
     ///
     /// The other half of "preview -> disable -> commit rejection" — the
     /// *same* previewed profile becoming unavailable rather than a
@@ -1058,11 +1099,11 @@ mod tests {
     async fn revalidate_engine_still_selected_rejects_when_a_different_engine_is_now_selected()
     -> TestResult {
         let state = test_state(fresh_db("engines-revalidate-changed").await?);
-        // At preview time no profile was selected, so the plan's stored
+        // At preview time no profile was preferred, so the plan's stored
         // engine_id is the platform default.
         let plan_engine_id = PLATFORM_DEFAULT_ENGINE_ID;
-        // Before commit, the user switches to a different runtime.
-        insert_selected_runtime_profile(&state, "profile-podman-1").await?;
+        // Before commit, the user prefers a different runtime.
+        insert_preferred_runtime_profile(&state, "profile-podman-1").await?;
 
         let matches = revalidate_engine_still_selected(&state.db, plan_engine_id).await?;
 
@@ -1079,7 +1120,7 @@ mod tests {
     -> TestResult {
         let state = test_state(fresh_db("engines-revalidate-db-error").await?);
         let conn = state.db.connect()?;
-        conn.execute("DROP TABLE runtime_profiles", ()).await?;
+        conn.execute("DROP TABLE runtime_policy", ()).await?;
 
         let result = revalidate_engine_still_selected(&state.db, PLATFORM_DEFAULT_ENGINE_ID).await;
 
