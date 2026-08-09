@@ -182,7 +182,6 @@
         />
       {:else if activeView === "artifacts"}
         <ArtifactsPage
-          profiles={daemonState.runtimeProfiles}
           runtimePreference={daemonState.runtimePreference}
           connected={daemonState.healthState.kind === "connected"}
           projects={daemonState.projects}

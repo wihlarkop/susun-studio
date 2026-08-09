@@ -4,6 +4,7 @@
   import { Button } from "$lib/components/ui/button/index.js";
   import { ChevronDown, RefreshCw, Settings2, Trash2 } from "@lucide/svelte";
   import PruneDialog from "./prune-dialog.svelte";
+  import RuntimeIdentity from "./runtime-identity.svelte";
   import {
     readEngineHealth,
     setPreferredRuntime,
@@ -12,6 +13,7 @@
     type RuntimeProfile,
   } from "$lib/daemon/client";
   import { resolveActiveEngineId } from "$lib/engine-identity";
+  import { presentRuntimeBinding } from "$lib/runtime/presentation";
 
   let {
     profiles,
@@ -38,7 +40,6 @@
       ? (profiles.find((profile) => profile.id === binding.profile_id) ?? null)
       : null,
   );
-  const selectedReady = $derived(binding?.state === "ready");
   const activeEngineId = $derived(binding ? resolveActiveEngineId(binding) : null);
 
   $effect(() => {
@@ -80,18 +81,9 @@
 <Card.Root class="gap-3 p-4">
   <div class="flex flex-wrap items-center justify-between gap-3">
     <div class="flex flex-wrap items-center gap-2">
-      <h3 class="text-sm font-semibold">Active runtime</h3>
-      {#if binding?.state === "unconfigured"}
-        <Badge variant="outline">Platform default</Badge>
-        <span class="text-xs text-muted-foreground">Local engine compatibility mode.</span>
-      {:else if binding}
-        <span class="text-sm">{binding.display_name}</span>
-        <Badge variant={selectedReady ? "default" : "destructive"}>
-          {binding.state.replace("_", " ")}
-        </Badge>
-        {#if selected}
-          <Badge variant="outline">{selected.runtime_class.replace("_", " ")}</Badge>
-        {/if}
+      <h3 class="text-sm font-semibold">Preferred runtime</h3>
+      {#if binding}
+        <RuntimeIdentity presentation={presentRuntimeBinding(binding)} compact />
         {#if health}
           <Badge variant={health.reachable ? "default" : "destructive"}>
             {health.reachable ? "Reachable" : "Unreachable"}

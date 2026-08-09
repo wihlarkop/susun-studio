@@ -2,6 +2,7 @@
   import * as Card from "$lib/components/ui/card/index.js";
   import * as Table from "$lib/components/ui/table/index.js";
   import StatusBadge from "./status-badge.svelte";
+  import RuntimeIdentity from "./runtime-identity.svelte";
   import {
     listJobs,
     readJob,
@@ -17,6 +18,7 @@
     visibleTransferProgress,
   } from "$lib/jobs/transfer-job";
   import { relativeTime } from "$lib/utils";
+  import { presentRuntimeAttribution } from "$lib/runtime/presentation";
 
   let { projects }: { projects: StudioProject[] } = $props();
 
@@ -160,13 +162,14 @@
           <Table.Head>Project</Table.Head>
           <Table.Head>Kind</Table.Head>
           <Table.Head>Status</Table.Head>
+          <Table.Head>Runtime</Table.Head>
           <Table.Head>When</Table.Head>
         </Table.Row>
       </Table.Header>
       <Table.Body>
         {#if visible.length === 0}
           <Table.Row>
-            <Table.Cell colspan={4} class="text-muted-foreground h-24 text-center">
+            <Table.Cell colspan={5} class="text-muted-foreground h-24 text-center">
               No jobs match these filters.
             </Table.Cell>
           </Table.Row>
@@ -179,13 +182,16 @@
               <Table.Cell>{projectName(job.project_id)}</Table.Cell>
               <Table.Cell class="font-medium">{job.kind}</Table.Cell>
               <Table.Cell><StatusBadge status={job.status} /></Table.Cell>
+              <Table.Cell class="max-w-52">
+                <RuntimeIdentity presentation={presentRuntimeAttribution(job)} compact />
+              </Table.Cell>
               <Table.Cell class="text-muted-foreground text-xs">
                 {relativeTime(job.created_at_ms)}
               </Table.Cell>
             </Table.Row>
             {#if expandedId === job.id}
               <Table.Row>
-                <Table.Cell colspan={4} class="bg-muted/40 whitespace-normal">
+                <Table.Cell colspan={5} class="bg-muted/40 whitespace-normal">
                   {@const detail = detailCache[job.id] ?? job}
                   <div class="flex flex-col gap-3 py-1">
                     {#if detail.error}

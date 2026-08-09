@@ -4,7 +4,11 @@ import type {
   RuntimeProfile,
   RuntimeProviderStatus,
 } from "$lib/daemon/client";
-import { presentRuntimeBinding, presentRuntimeProfile } from "./presentation";
+import {
+  presentRuntimeAttribution,
+  presentRuntimeBinding,
+  presentRuntimeProfile,
+} from "./presentation";
 
 const management = {
   can_select: true,
@@ -185,5 +189,20 @@ describe("runtime presentation", () => {
 
     expect(result.title.length).toBeLessThan(display_name.length);
     expect(result.tooltip).toBe(display_name);
+  });
+
+  it("keeps persisted historical attribution independent from the current profile list", () => {
+    expect(
+      presentRuntimeAttribution({
+        runtime_profile_id: "removed-profile",
+        runtime_class: "external_local",
+        binding_source: "project_pin",
+      }),
+    ).toMatchObject({
+      title: "Recorded runtime",
+      classLabel: "External",
+      stateLabel: "Historical",
+      supportingText: "Recorded from project pin",
+    });
   });
 });

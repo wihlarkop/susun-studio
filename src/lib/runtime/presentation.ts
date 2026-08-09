@@ -1,4 +1,5 @@
 import type {
+  RuntimeBindingSource,
   RuntimeBindingSummary,
   RuntimeProfile,
   RuntimeProviderStatus,
@@ -10,7 +11,7 @@ export type RuntimePresentation = {
   title: string;
   tooltip: string;
   supportingText: string | null;
-  classLabel: "Built-in" | "External" | "External remote" | "Platform default";
+  classLabel: "Built-in" | "External" | "External remote" | "Platform default" | "Recorded runtime";
   stateLabel: string;
   tone: RuntimePresentationTone;
   actionBlockedReason: string | null;
@@ -126,14 +127,41 @@ export function presentRuntimeProfile(
   });
 }
 
+export function presentRuntimeAttribution(attribution: {
+  runtime_profile_id: string | null;
+  runtime_class: string | null;
+  binding_source?: RuntimeBindingSource | null;
+}): RuntimePresentation {
+  const knownClass = historicalClassLabel(attribution.runtime_class);
+  const title = knownClass === "Built-in" ? "Susun Runtime" : "Recorded runtime";
+  const tooltip = attribution.runtime_profile_id
+    ? `${title} (${attribution.runtime_profile_id})`
+    : title;
+  const source = attribution.binding_source?.replaceAll("_", " ") ?? "historical record";
+
+  return presentation({
+    title,
+    tooltip,
+    classLabel: knownClass,
+    stateLabel: "Historical",
+    tone: "neutral",
+    externalAppNote: null,
+    actionBlockedReason: null,
+    supportingText: `Recorded from ${source}`,
+  });
+}
+
 function presentation(
   input: Omit<RuntimePresentation, "supportingText" | "actionBlockedReason" | "externalAppNote"> &
-    Partial<Pick<RuntimePresentation, "actionBlockedReason" | "externalAppNote">>,
+    Partial<
+      Pick<RuntimePresentation, "supportingText" | "actionBlockedReason" | "externalAppNote">
+    >,
 ): RuntimePresentation {
   return {
     ...input,
     title: boundedLabel(input.title),
-    supportingText: input.classLabel === "Built-in" ? "Powered by Podman" : null,
+    supportingText:
+      input.supportingText ?? (input.classLabel === "Built-in" ? "Powered by Podman" : null),
     actionBlockedReason: input.actionBlockedReason ?? null,
     externalAppNote: input.externalAppNote ?? null,
   };
@@ -152,6 +180,13 @@ function classLabelFor(
     case null:
       return "Platform default";
   }
+}
+
+function historicalClassLabel(runtimeClass: string | null): RuntimePresentation["classLabel"] {
+  if (runtimeClass === "built_in") return "Built-in";
+  if (runtimeClass === "external_local") return "External";
+  if (runtimeClass === "external_remote") return "External remote";
+  return "Recorded runtime";
 }
 
 function boundedLabel(label: string): string {
