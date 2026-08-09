@@ -1687,6 +1687,9 @@ export type StudioWatchSession = {
   last_action_status: string | null;
   last_action_error: string | null;
   error: string | null;
+  runtime_profile_id: string | null;
+  runtime_class: RuntimeClass | null;
+  runtime_binding_source: RuntimeBindingSource | null;
   created_at_ms: number;
   updated_at_ms: number;
 };
