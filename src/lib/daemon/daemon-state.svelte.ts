@@ -3,6 +3,7 @@ import {
   importProject as importProjectRequest,
   listProjects,
   readDaemonHealth,
+  readRuntimeOnboarding,
   readRuntimeStatus,
   readSettings,
   updateSettings as updateSettingsRequest,
@@ -11,6 +12,7 @@ import {
   type ImportProjectResponse,
   type RuntimeProfile,
   type RuntimePreference,
+  type RuntimeOnboardingState,
   type RuntimeStatus,
   type StudioProject,
   type StudioSettings,
@@ -32,6 +34,7 @@ export function createDaemonState() {
   let projects = $state<StudioProject[]>([]);
   let runtimeProfiles = $state<RuntimeProfile[]>([]);
   let runtimeStatus = $state<RuntimeStatus | undefined>(undefined);
+  let runtimeOnboarding = $state<RuntimeOnboardingState | undefined>(undefined);
   let settings = $state<StudioSettings | undefined>(undefined);
   let workspaceDetail = $state(
     "Persisted projects will appear here after the daemon API is wired.",
@@ -46,15 +49,17 @@ export function createDaemonState() {
   async function refresh(signal?: AbortSignal) {
     try {
       const health = await readDaemonHealth(getDaemonBaseUrl(), signal);
-      const [projectList, daemonSettings, nextRuntimeStatus] = await Promise.all([
+      const [projectList, daemonSettings, nextRuntimeStatus, nextRuntimeOnboarding] = await Promise.all([
         listProjects({ signal }),
         readSettings({ signal }),
         readRuntimeStatus({ signal }),
+        readRuntimeOnboarding({ signal }),
       ]);
 
       projects = projectList;
       settings = daemonSettings;
       runtimeStatus = nextRuntimeStatus;
+      runtimeOnboarding = nextRuntimeOnboarding;
       runtimeProfiles = nextRuntimeStatus.providers.flatMap((provider) => provider.profiles);
       workspaceDetail = describeWorkspace(projectList);
       healthState = {
@@ -71,6 +76,7 @@ export function createDaemonState() {
       projects = [];
       runtimeProfiles = [];
       runtimeStatus = undefined;
+      runtimeOnboarding = undefined;
       settings = undefined;
       workspaceDetail = "Start the local daemon to load projects and settings.";
       healthState = {
@@ -133,6 +139,9 @@ export function createDaemonState() {
     },
     get runtimePreference(): RuntimePreference | undefined {
       return runtimeStatus?.policy;
+    },
+    get runtimeOnboarding() {
+      return runtimeOnboarding;
     },
     get settings() {
       return settings;

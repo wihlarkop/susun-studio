@@ -12,13 +12,16 @@
   import SettingsPage from "$lib/components/settings-page.svelte";
   import ImportProjectDialog from "$lib/components/import-project-dialog.svelte";
   import BetaOnboardingPanel from "$lib/components/beta-onboarding-panel.svelte";
+  import RuntimeOnboardingDialog from "$lib/components/runtime-onboarding-dialog.svelte";
   import { createDaemonState } from "$lib/daemon/daemon-state.svelte";
   import type { ImportProjectRequest, ImportProjectResponse } from "$lib/daemon/client";
+  import { resolveOnboardingView } from "$lib/runtime/onboarding-state";
 
   const daemonState = createDaemonState();
   let importDialogOpen = $state(false);
   let activeView = $state<"projects" | "jobs" | "runtime" | "artifacts" | "settings">("projects");
   let selectedProjectId = $state<string | null>(null);
+  let runtimeOnboardingOpen = $state(true);
   const selectedProject = $derived(
     daemonState.projects.find((project) => project.id === selectedProjectId) ??
       daemonState.projects[0] ??
@@ -78,6 +81,13 @@
             ? "Artifacts"
             : "Settings",
   );
+  const onboardingView = $derived(
+    resolveOnboardingView({
+      connected: daemonState.healthState.kind === "connected",
+      onboarding: daemonState.runtimeOnboarding,
+      binding: daemonState.runtimePreference?.binding,
+    }),
+  );
 </script>
 
 <svelte:head>
@@ -110,7 +120,7 @@
           runtimePreference={daemonState.runtimePreference}
           onImportClick={() => (importDialogOpen = true)}
           onRetry={daemonState.refresh}
-          onSetupRuntime={() => (activeView = "runtime")}
+          onManageRuntime={() => (activeView = "runtime")}
         />
         <ActiveEngineStrip
           profiles={daemonState.runtimeProfiles}
@@ -156,3 +166,12 @@
   runtimeProfiles={daemonState.runtimeProfiles}
   onImport={handleImport}
 />
+
+{#if onboardingView.kind === "chooser" && daemonState.runtimeStatus && daemonState.runtimeOnboarding}
+  <RuntimeOnboardingDialog
+    bind:open={runtimeOnboardingOpen}
+    status={daemonState.runtimeStatus}
+    onboarding={daemonState.runtimeOnboarding}
+    onchanged={daemonState.refresh}
+  />
+{/if}
