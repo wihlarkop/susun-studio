@@ -448,6 +448,31 @@ pub async fn set_project_engine(
     Ok(Json(project))
 }
 
+pub async fn mark_project_opened(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<ProjectResponse>, ApiError> {
+    authorize(&state, &headers)?;
+
+    let opened_at_ms = now_ms()?;
+    let conn = state.db.connect()?;
+    let affected = conn
+        .execute(
+            "UPDATE projects SET last_opened_at_ms = ?1 WHERE id = ?2",
+            params![opened_at_ms, project_id.clone()],
+        )
+        .await?;
+    if affected == 0 {
+        return Err(ApiError::ProjectNotFound);
+    }
+
+    let project = read_project_response(&state.db, &project_id)
+        .await?
+        .ok_or(ApiError::ProjectNotFound)?;
+    Ok(Json(project))
+}
+
 pub async fn delete_project(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -747,29 +772,4 @@ mod tests {
         assert!(matches!(result, Err(ApiError::ProjectNotFound)));
         Ok(())
     }
-}
-
-pub async fn mark_project_opened(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(project_id): Path<String>,
-) -> Result<Json<ProjectResponse>, ApiError> {
-    authorize(&state, &headers)?;
-
-    let opened_at_ms = now_ms()?;
-    let conn = state.db.connect()?;
-    let affected = conn
-        .execute(
-            "UPDATE projects SET last_opened_at_ms = ?1 WHERE id = ?2",
-            params![opened_at_ms, project_id.clone()],
-        )
-        .await?;
-    if affected == 0 {
-        return Err(ApiError::ProjectNotFound);
-    }
-
-    let project = read_project_response(&state.db, &project_id)
-        .await?
-        .ok_or(ApiError::ProjectNotFound)?;
-    Ok(Json(project))
 }
