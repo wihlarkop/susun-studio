@@ -103,6 +103,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "runtime_onboarding",
         sql: include_str!("../migrations/0020_runtime_onboarding.sql"),
     },
+    Migration {
+        version: 21,
+        name: "project_recency",
+        sql: include_str!("../migrations/0021_project_recency.sql"),
+    },
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -664,6 +669,41 @@ mod tests {
             .await?,
             vec!["pending".to_owned()]
         );
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn project_recency_migration_is_registered() {
+        assert_eq!(latest_migration_version(), 21);
+    }
+
+    #[tokio::test]
+    async fn project_recency_migration_preserves_existing_projects_with_null_recency() -> TestResult
+    {
+        let (_db, conn, path) = version_nineteen_database().await?;
+        conn.execute(
+            "INSERT INTO projects (id, name, path, created_at_ms)
+             VALUES ('existing', 'Existing', 'C:/projects/existing', 1)",
+            (),
+        )
+        .await?;
+
+        apply_pending_migrations(&conn).await?;
+
+        let mut rows = conn
+            .query(
+                "SELECT id, last_opened_at_ms FROM projects WHERE id = 'existing'",
+                (),
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| std::io::Error::other("existing project"))?;
+        assert_eq!(row.get::<String>(0)?, "existing");
+        assert_eq!(row.get::<Option<i64>>(1)?, None);
 
         let _ = std::fs::remove_file(path);
         Ok(())

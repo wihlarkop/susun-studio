@@ -68,6 +68,10 @@ pub fn app(state: AppState) -> Router {
             get(projects::list_projects).post(projects::create_project),
         )
         .route("/v1/projects/import", post(projects::import_project))
+        .route(
+            "/v1/projects/{id}/opened",
+            post(projects::mark_project_opened),
+        )
         .route("/v1/projects/{id}", delete(projects::delete_project))
         .route(
             "/v1/projects/{id}/engine",

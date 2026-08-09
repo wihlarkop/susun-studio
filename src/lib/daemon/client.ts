@@ -96,6 +96,7 @@ export type StudioProject = {
   name: string;
   path: string;
   created_at_ms: number;
+  last_opened_at_ms: number | null;
   last_analyzed_at_ms: number | null;
   has_errors: boolean | null;
   summary: StudioProjectSummary | null;
@@ -628,6 +629,16 @@ export async function readDaemonHealth(
 export async function listProjects(options: DaemonRequestOptions = {}): Promise<StudioProject[]> {
   const response = await readJson<ProjectListResponse>("/v1/projects", options);
   return response.projects;
+}
+
+export async function markProjectOpened(
+  projectId: string,
+  options: DaemonRequestOptions = {},
+): Promise<StudioProject> {
+  return readJson(`/v1/projects/${encodeURIComponent(projectId)}/opened`, {
+    ...options,
+    method: "POST",
+  });
 }
 
 export async function createProject(

@@ -28,6 +28,7 @@ pub struct ProjectResponse {
     pub name: String,
     pub path: String,
     pub created_at_ms: i64,
+    pub last_opened_at_ms: Option<i64>,
     pub last_analyzed_at_ms: Option<i64>,
     pub has_errors: Option<bool>,
     pub summary: Option<ProjectSummary>,
@@ -41,6 +42,7 @@ struct ProjectRecord {
     name: String,
     path: String,
     created_at_ms: i64,
+    last_opened_at_ms: Option<i64>,
     last_analyzed_at_ms: Option<i64>,
     has_errors: Option<bool>,
     summary: Option<ProjectSummary>,
@@ -55,6 +57,7 @@ impl ProjectRecord {
             name: self.name,
             path: self.path,
             created_at_ms: self.created_at_ms,
+            last_opened_at_ms: self.last_opened_at_ms,
             last_analyzed_at_ms: self.last_analyzed_at_ms,
             has_errors: self.has_errors,
             summary: self.summary,
@@ -93,9 +96,10 @@ pub async fn list_projects(
     let conn = state.db.connect()?;
     let mut rows = conn
         .query(
-            "SELECT id, name, path, created_at_ms, last_analyzed_at_ms, has_errors,
+            "SELECT id, name, path, created_at_ms, last_opened_at_ms, last_analyzed_at_ms, has_errors,
                     summary_json, diagnostics_json, runtime_profile_id
-             FROM projects ORDER BY created_at_ms DESC",
+             FROM projects
+             ORDER BY COALESCE(last_opened_at_ms, created_at_ms) DESC, name ASC",
             (),
         )
         .await?;
@@ -146,7 +150,8 @@ pub async fn create_project(
 
     let conn = state.db.connect()?;
     conn.execute(
-        "INSERT INTO projects (id, name, path, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO projects (id, name, path, created_at_ms, last_opened_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?4)",
         params![
             project_id.clone(),
             project_name.clone(),
@@ -260,14 +265,15 @@ pub async fn import_project(
     let conn = state.db.connect()?;
     conn.execute(
         "INSERT INTO projects (
-            id, name, path, created_at_ms,
+            id, name, path, created_at_ms, last_opened_at_ms,
             compose_files, env_file, project_name_override, profiles,
             last_analyzed_at_ms, summary_json, diagnostics_json, has_errors,
             runtime_profile_id
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        ) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             path = excluded.path,
+            last_opened_at_ms = excluded.last_opened_at_ms,
             compose_files = excluded.compose_files,
             env_file = excluded.env_file,
             project_name_override = excluded.project_name_override,
@@ -334,16 +340,17 @@ fn canonicalize_paths(paths: &[String]) -> Result<Vec<PathBuf>, ApiError> {
 }
 
 fn project_record_from_row(row: &turso::Row) -> Result<ProjectRecord, turso::Error> {
-    let has_errors: Option<i64> = row.get(5)?;
-    let summary_json: Option<String> = row.get(6)?;
-    let diagnostics_json: Option<String> = row.get(7)?;
+    let has_errors: Option<i64> = row.get(6)?;
+    let summary_json: Option<String> = row.get(7)?;
+    let diagnostics_json: Option<String> = row.get(8)?;
 
     Ok(ProjectRecord {
         id: row.get(0)?,
         name: row.get(1)?,
         path: row.get(2)?,
         created_at_ms: row.get(3)?,
-        last_analyzed_at_ms: row.get(4)?,
+        last_opened_at_ms: row.get(4)?,
+        last_analyzed_at_ms: row.get(5)?,
         has_errors: has_errors.map(|value| value != 0),
         summary: summary_json
             .as_deref()
@@ -351,7 +358,7 @@ fn project_record_from_row(row: &turso::Row) -> Result<ProjectRecord, turso::Err
         diagnostics: diagnostics_json
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok()),
-        runtime_profile_id: row.get(8)?,
+        runtime_profile_id: row.get(9)?,
     })
 }
 
@@ -362,7 +369,7 @@ async fn read_project_response(
     let conn = db.connect()?;
     let mut rows = conn
         .query(
-            "SELECT id, name, path, created_at_ms, last_analyzed_at_ms, has_errors,
+            "SELECT id, name, path, created_at_ms, last_opened_at_ms, last_analyzed_at_ms, has_errors,
                     summary_json, diagnostics_json, runtime_profile_id
              FROM projects WHERE id = ?1 LIMIT 1",
             params![project_id.to_owned()],
@@ -688,4 +695,81 @@ mod tests {
         );
         Ok(())
     }
+
+    #[tokio::test]
+    async fn opening_a_project_updates_only_recency_and_returns_the_updated_project() -> TestResult
+    {
+        let state = test_state(fresh_db("project-recency-route").await?);
+        insert_project(&state, "older", None).await?;
+        insert_project(&state, "newer", None).await?;
+
+        let conn = state.db.connect()?;
+        conn.execute(
+            "UPDATE projects SET created_at_ms = ?1 WHERE id = ?2",
+            params![10_i64, "older"],
+        )
+        .await?;
+        conn.execute(
+            "UPDATE projects SET created_at_ms = ?1 WHERE id = ?2",
+            params![20_i64, "newer"],
+        )
+        .await?;
+
+        let opened = mark_project_opened(
+            State(state.clone()),
+            authorized_headers(),
+            Path("older".to_owned()),
+        )
+        .await?
+        .0;
+        assert!(opened.last_opened_at_ms.is_some());
+        assert_eq!(opened.last_analyzed_at_ms, None);
+
+        let listed = list_projects(State(state), authorized_headers()).await?.0;
+        assert_eq!(listed.projects[0].id, "older");
+        assert_eq!(
+            listed.projects[0].last_opened_at_ms,
+            opened.last_opened_at_ms
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn opening_an_unknown_project_is_not_found() -> TestResult {
+        let state = test_state(fresh_db("project-recency-not-found").await?);
+        let result = mark_project_opened(
+            State(state),
+            authorized_headers(),
+            Path("missing".to_owned()),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::ProjectNotFound)));
+        Ok(())
+    }
+}
+
+pub async fn mark_project_opened(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<ProjectResponse>, ApiError> {
+    authorize(&state, &headers)?;
+
+    let opened_at_ms = now_ms()?;
+    let conn = state.db.connect()?;
+    let affected = conn
+        .execute(
+            "UPDATE projects SET last_opened_at_ms = ?1 WHERE id = ?2",
+            params![opened_at_ms, project_id.clone()],
+        )
+        .await?;
+    if affected == 0 {
+        return Err(ApiError::ProjectNotFound);
+    }
+
+    let project = read_project_response(&state.db, &project_id)
+        .await?
+        .ok_or(ApiError::ProjectNotFound)?;
+    Ok(Json(project))
 }
