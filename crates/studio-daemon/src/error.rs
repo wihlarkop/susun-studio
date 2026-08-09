@@ -5,7 +5,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::{artifact_inventory, db, logging};
+use crate::{artifact_inventory, db, logging, runtime};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -137,6 +137,9 @@ pub enum ApiError {
     #[error("runtime policy hydration was incomplete")]
     RuntimePolicyIncomplete,
 
+    #[error("runtime onboarding state is unavailable")]
+    RuntimeOnboardingIncomplete,
+
     #[error("database error: {0}")]
     Database(#[from] turso::Error),
 
@@ -163,6 +166,19 @@ impl From<artifact_inventory::ArtifactError> for ApiError {
                 Self::EngineUnavailable(message)
             }
             artifact_inventory::ArtifactError::Database(source) => Self::Database(source),
+        }
+    }
+}
+
+impl From<runtime::onboarding::OnboardingError> for ApiError {
+    fn from(error: runtime::onboarding::OnboardingError) -> Self {
+        match error {
+            runtime::onboarding::OnboardingError::Database(source) => Self::Database(source),
+            runtime::onboarding::OnboardingError::MissingSingleton
+            | runtime::onboarding::OnboardingError::InvalidState
+            | runtime::onboarding::OnboardingError::InvalidChoice => {
+                Self::RuntimeOnboardingIncomplete
+            }
         }
     }
 }
@@ -209,6 +225,7 @@ impl IntoResponse for ApiError {
             | Self::Json(_)
             | Self::Clock
             | Self::RuntimePolicyIncomplete
+            | Self::RuntimeOnboardingIncomplete
             | Self::CredentialOperationFailed
             | Self::BackupFailed(_)
             | Self::RestoreFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,

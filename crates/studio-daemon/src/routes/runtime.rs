@@ -14,6 +14,47 @@ pub struct RuntimePolicyUpdateRequest {
     pub preferred_profile_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeOnboardingCompleteRequest {
+    pub choice: runtime::onboarding::OnboardingChoice,
+}
+
+pub async fn read_runtime_onboarding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<runtime::onboarding::RuntimeOnboarding>, ApiError> {
+    authorize(&state, &headers)?;
+    Ok(Json(runtime::onboarding::read(&state.db).await?))
+}
+
+pub async fn complete_runtime_onboarding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RuntimeOnboardingCompleteRequest>,
+) -> Result<Json<runtime::onboarding::RuntimeOnboarding>, ApiError> {
+    authorize(&state, &headers)?;
+    Ok(Json(
+        runtime::onboarding::complete(&state.db, request.choice).await?,
+    ))
+}
+
+pub async fn dismiss_runtime_onboarding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<runtime::onboarding::RuntimeOnboarding>, ApiError> {
+    authorize(&state, &headers)?;
+    Ok(Json(runtime::onboarding::dismiss(&state.db).await?))
+}
+
+pub async fn reopen_runtime_onboarding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<runtime::onboarding::RuntimeOnboarding>, ApiError> {
+    authorize(&state, &headers)?;
+    Ok(Json(runtime::onboarding::reopen(&state.db).await?))
+}
+
 pub async fn read_runtime_policy(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -436,6 +477,84 @@ mod tests {
         )
         .await;
         assert!(matches!(unavailable, Err(ApiError::ActionUnavailable(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_onboarding_completion_request_is_strict() {
+        let request = serde_json::from_value::<RuntimeOnboardingCompleteRequest>(
+            serde_json::json!({ "choice": "existing" }),
+        )
+        .expect("valid onboarding choice");
+        assert_eq!(
+            request.choice,
+            runtime::onboarding::OnboardingChoice::Existing
+        );
+        assert!(
+            serde_json::from_value::<RuntimeOnboardingCompleteRequest>(
+                serde_json::json!({ "choice": "other" }),
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<RuntimeOnboardingCompleteRequest>(
+                serde_json::json!({ "choice": "existing", "endpoint": "//./pipe/secret" }),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn onboarding_routes_are_local_redacted_and_do_not_mutate_runtime_policy() -> TestResult {
+        let state = test_state(fresh_db("runtime-onboarding-routes").await?);
+        assert_eq!(
+            read_runtime_onboarding(State(state.clone()), authorized_headers())
+                .await?
+                .0
+                .state,
+            runtime::onboarding::OnboardingState::Pending
+        );
+
+        let dismissed = dismiss_runtime_onboarding(State(state.clone()), authorized_headers())
+            .await?
+            .0;
+        assert_eq!(
+            dismissed.state,
+            runtime::onboarding::OnboardingState::Dismissed
+        );
+        let reopened = reopen_runtime_onboarding(State(state.clone()), authorized_headers())
+            .await?
+            .0;
+        assert_eq!(
+            reopened.state,
+            runtime::onboarding::OnboardingState::Pending
+        );
+
+        let completed = complete_runtime_onboarding(
+            State(state.clone()),
+            authorized_headers(),
+            Json(RuntimeOnboardingCompleteRequest {
+                choice: runtime::onboarding::OnboardingChoice::Existing,
+            }),
+        )
+        .await?
+        .0;
+        assert_eq!(
+            completed.state,
+            runtime::onboarding::OnboardingState::Completed
+        );
+        let value = serde_json::to_value(completed)?;
+        for forbidden in ["endpoint", "command", "argv", "executable"] {
+            assert!(
+                value.get(forbidden).is_none(),
+                "response exposed {forbidden}"
+            );
+        }
+
+        let preference = read_runtime_policy(State(state), authorized_headers())
+            .await?
+            .0;
+        assert_eq!(preference.preferred_profile_id, None);
         Ok(())
     }
 }
