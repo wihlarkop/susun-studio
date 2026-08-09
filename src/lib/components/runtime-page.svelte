@@ -5,12 +5,11 @@
   import { Button } from "$lib/components/ui/button/index.js";
   import RuntimeMigrationDialog from "$lib/components/runtime-migration-dialog.svelte";
   import RuntimeDataScopeDialog from "$lib/components/runtime-data-scope-dialog.svelte";
+  import RuntimeActionDialog from "$lib/components/runtime-action-dialog.svelte";
   import RuntimeActionAudit from "$lib/components/runtime-action-audit.svelte";
   import RuntimeResourcePanel from "$lib/components/runtime-resource-panel.svelte";
   import PruneDialog from "$lib/components/prune-dialog.svelte";
   import {
-    cancelRuntimePlan,
-    executeRuntimePlan,
     forgetRuntimeProfile,
     readRuntimeLogs,
     readRuntimeProfileResources,
@@ -19,7 +18,6 @@
     prepareRuntimeResourceUpdate,
     setPreferredRuntime,
     type RuntimeAction,
-    type RuntimeActionResult,
     type RuntimeDimension,
     type RuntimeEndpointSummary,
     type RuntimeLogLine,
@@ -27,9 +25,9 @@
     type RuntimeResourceSnapshot,
     type RuntimeProviderStatus,
     type RuntimeStatus,
-    type TrustedRuntimePlan,
   } from "$lib/daemon/client";
   import { resolveActiveEngineId } from "$lib/engine-identity";
+  import type { RuntimeActionDialogRequest } from "$lib/components/runtime-action-dialog.svelte";
   import {
     AlertCircle,
     ArrowRightLeft,
@@ -50,16 +48,14 @@
   let status = $state<RuntimeStatus | null>(null);
   let logs = $state<RuntimeLogLine[]>([]);
   let loading = $state(false);
-  let actionResult = $state<RuntimeActionResult | null>(null);
   let errorMessage = $state<string | null>(null);
   let expandedProviders = $state<Set<string>>(new Set());
   let ownershipDialogOpen = $state(false);
   let ownershipDialogBusy = $state(false);
   let pendingOwnershipProfile = $state<RuntimeProfile | null>(null);
   let pendingOwnershipAction = $state<"forget" | null>(null);
-  let trustedPlan = $state<TrustedRuntimePlan | null>(null);
-  let trustedPlanDialogOpen = $state(false);
-  let trustedPlanBusy = $state(false);
+  let runtimeActionRequest = $state<RuntimeActionDialogRequest | null>(null);
+  let runtimeActionDialogOpen = $state(false);
   let migrationDialogOpen = $state(false);
   let dataScopeDialogOpen = $state(false);
   let dataScopeProfile = $state<RuntimeProfile | null>(null);
@@ -110,12 +106,6 @@
     return () => controller.abort();
   });
 
-  $effect(() => {
-    if (!trustedPlanDialogOpen && trustedPlan && !trustedPlanBusy) {
-      void cancelPreparedPlan();
-    }
-  });
-
   async function refresh(signal?: AbortSignal) {
     loading = true;
     try {
@@ -160,72 +150,26 @@
     }
   }
 
-  async function handleAction(providerId: string, action: RuntimeAction) {
-    try {
-      const prepared = await prepareRuntimeAction(providerId, action.id);
-      if (prepared.result) {
-        actionResult = prepared.result;
-        await refresh();
-        return;
-      }
-      if (prepared.plan) {
-        trustedPlan = prepared.plan;
-        trustedPlanDialogOpen = true;
-      }
-    } catch (error) {
-      errorMessage = error instanceof Error ? error.message : String(error);
-    }
+  function handleAction(providerId: string, action: RuntimeAction) {
+    runtimeActionRequest = {
+      identity: { providerId, action: action.id },
+      prepare: () => prepareRuntimeAction(providerId, action.id),
+    };
+    runtimeActionDialogOpen = true;
   }
 
-  async function handleResourceUpdate(
+  function handleResourceUpdate(
     profile: RuntimeProfile,
     networkMode: "wsl" | "user_mode",
   ) {
-    try {
-      const prepared = await prepareRuntimeResourceUpdate(profile.id, networkMode);
-      if (prepared.result) {
-        actionResult = prepared.result;
-        return;
-      }
-      if (prepared.plan) {
-        trustedPlan = prepared.plan;
-        trustedPlanDialogOpen = true;
-      }
-    } catch (error) {
-      errorMessage = error instanceof Error ? error.message : String(error);
-    }
-  }
-
-  async function executePreparedPlan() {
-    if (!trustedPlan) return;
-    trustedPlanBusy = true;
-    try {
-      actionResult = await executeRuntimePlan(trustedPlan.plan_id);
-      trustedPlanDialogOpen = false;
-      trustedPlan = null;
-      await refresh();
-    } catch (error) {
-      errorMessage = error instanceof Error ? error.message : String(error);
-    } finally {
-      trustedPlanBusy = false;
-    }
-  }
-
-  async function cancelPreparedPlan() {
-    if (!trustedPlan) {
-      trustedPlanDialogOpen = false;
-      return;
-    }
-    trustedPlanBusy = true;
-    try {
-      actionResult = await cancelRuntimePlan(trustedPlan.plan_id);
-      trustedPlanDialogOpen = false;
-      trustedPlan = null;
-    } catch (error) {
-      errorMessage = error instanceof Error ? error.message : String(error);
-    } finally {
-      trustedPlanBusy = false;
-    }
+    runtimeActionRequest = {
+      identity: {
+        providerId: profile.provider_id,
+        action: `resource_network_${networkMode}:${profile.id}`,
+      },
+      prepare: () => prepareRuntimeResourceUpdate(profile.id, networkMode),
+    };
+    runtimeActionDialogOpen = true;
   }
 
   async function handleSelect(profile: RuntimeProfile) {
@@ -452,20 +396,6 @@
     <div class="flex gap-2 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
       <AlertCircle class="mt-0.5 size-4 shrink-0" />
       <span>{errorMessage}</span>
-    </div>
-  {/if}
-
-  {#if actionResult}
-    <div class="rounded-md border bg-muted/30 p-3">
-      <div class="flex flex-wrap items-center gap-2">
-        <Badge variant={actionResult.status === "failed" ? "destructive" : "secondary"}>
-          {stateLabel(actionResult.status)}
-        </Badge>
-        <span class="text-sm">{actionResult.message}</span>
-      </div>
-      {#if actionResult.next_steps.length > 0}
-        <p class="mt-1 text-xs text-muted-foreground">{actionResult.next_steps.join(" ")}</p>
-      {/if}
     </div>
   {/if}
 
@@ -750,74 +680,11 @@
 
   <RuntimeActionAudit />
 
-  <Dialog.Root bind:open={trustedPlanDialogOpen}>
-    <Dialog.Content class="sm:max-w-lg">
-      <Dialog.Header>
-        <Dialog.Title>{trustedPlan?.label ?? "Approve runtime action"}</Dialog.Title>
-        <Dialog.Description>
-          Review the exact consequence before allowing this single-use runtime plan.
-        </Dialog.Description>
-      </Dialog.Header>
-      {#if trustedPlan}
-        <div class="grid gap-3 text-sm">
-          <div class="grid gap-1">
-            <span class="font-medium">Consequence</span>
-            <span class="text-muted-foreground">{trustedPlan.consequence}</span>
-          </div>
-          <div class="grid gap-1">
-            <span class="font-medium">Verified operation</span>
-            <span class="text-muted-foreground">{trustedPlan.command_summary}</span>
-          </div>
-          {#if trustedPlan.software_provenance}
-            <dl class="grid grid-cols-[minmax(7rem,auto)_minmax(0,1fr)] gap-x-4 gap-y-1 border-y py-3 text-xs">
-              <dt class="text-muted-foreground">Package</dt>
-              <dd class="min-w-0 font-mono [overflow-wrap:anywhere]">
-                {trustedPlan.software_provenance.package_id}
-              </dd>
-              <dt class="text-muted-foreground">Source</dt>
-              <dd class="min-w-0 [overflow-wrap:anywhere]">
-                {trustedPlan.software_provenance.source} · {trustedPlan.software_provenance.source_url}
-              </dd>
-              <dt class="text-muted-foreground">Expected publisher</dt>
-              <dd>{trustedPlan.software_provenance.expected_publisher}</dd>
-              <dt class="text-muted-foreground">Version</dt>
-              <dd>{trustedPlan.software_provenance.version_intent}</dd>
-              <dt class="text-muted-foreground">Restart impact</dt>
-              <dd>{trustedPlan.software_provenance.restart_impact}</dd>
-            </dl>
-          {/if}
-          <div class="flex flex-wrap gap-2">
-            <Badge variant={trustedPlan.destructive ? "destructive" : "secondary"}>
-              {trustedPlan.destructive ? "Destructive" : "Runtime mutation"}
-            </Badge>
-            <Badge variant="outline">
-              {trustedPlan.elevation === "os_mediated_consent"
-                ? "Administrator consent expected"
-                : "Current user"}
-            </Badge>
-            <Badge variant="outline">Expires in {trustedPlan.expires_in_seconds}s</Badge>
-          </div>
-          <p class="text-xs text-muted-foreground">
-            Executable paths, arguments, environment values, and credentials are intentionally
-            hidden. They are fixed by Studio and cannot be changed from this dialog.
-          </p>
-        </div>
-      {/if}
-      <Dialog.Footer>
-        <Button type="button" variant="outline" disabled={trustedPlanBusy} onclick={cancelPreparedPlan}>
-          Cancel
-        </Button>
-        <Button
-          type="button"
-          variant={trustedPlan?.destructive ? "destructive" : "default"}
-          disabled={trustedPlanBusy || !trustedPlan}
-          onclick={executePreparedPlan}
-        >
-          {trustedPlanBusy ? "Working..." : "Approve and run"}
-        </Button>
-      </Dialog.Footer>
-    </Dialog.Content>
-  </Dialog.Root>
+  <RuntimeActionDialog
+    request={runtimeActionRequest}
+    bind:open={runtimeActionDialogOpen}
+    oncompleted={refresh}
+  />
 
   <Dialog.Root bind:open={ownershipDialogOpen}>
     <Dialog.Content class="sm:max-w-lg">
