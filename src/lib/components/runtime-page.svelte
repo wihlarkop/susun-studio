@@ -8,6 +8,7 @@
   import RuntimeActionDialog from "$lib/components/runtime-action-dialog.svelte";
   import RuntimeActionAudit from "$lib/components/runtime-action-audit.svelte";
   import RuntimeResourcePanel from "$lib/components/runtime-resource-panel.svelte";
+  import RuntimeIdentity from "$lib/components/runtime-identity.svelte";
   import PruneDialog from "$lib/components/prune-dialog.svelte";
   import {
     forgetRuntimeProfile,
@@ -26,6 +27,7 @@
     type RuntimeStatus,
   } from "$lib/daemon/client";
   import { resolveActiveEngineId } from "$lib/engine-identity";
+  import { presentRuntimeBinding, presentRuntimeProfile } from "$lib/runtime/presentation";
   import type { RuntimeActionDialogRequest } from "$lib/components/runtime-action-dialog.svelte";
   import {
     AlertCircle,
@@ -74,6 +76,8 @@
   let resourceSnapshots = $state<Record<string, RuntimeResourceSnapshot>>({});
   let resourceLoading = $state<Record<string, boolean>>({});
   let resourceErrors = $state<Record<string, string>>({});
+  let builtInExpanded = $state(false);
+  let existingExpanded = $state(false);
 
   const actionIcons = {
     install: Wrench,
@@ -110,6 +114,31 @@
     providers.find((provider) => provider.provider_id === "windows-podman"),
   );
   const setupAction = $derived(podmanProvider?.actions.find((action) => action.id === "setup"));
+  const preferredPresentation = $derived(
+    runtimePreference ? presentRuntimeBinding(runtimePreference.binding) : null,
+  );
+  const profileEntries = $derived(
+    providers.flatMap((provider) => provider.profiles.map((profile) => ({ profile, provider }))),
+  );
+  const builtInEntries = $derived(
+    profileEntries.filter((entry) => entry.profile.runtime_class === "built_in"),
+  );
+  const externalEntries = $derived(
+    profileEntries.filter((entry) => entry.profile.runtime_class !== "built_in"),
+  );
+  const builtInNeedsAttention = $derived(
+    !managedBuiltIn ||
+      builtInEntries.some(
+        (entry) =>
+          entry.profile.management.requires_recovery || entry.profile.availability_state !== "available",
+      ),
+  );
+
+  $effect(() => {
+    if (builtInNeedsAttention) {
+      builtInExpanded = true;
+    }
+  });
 
   $effect(() => {
     const controller = new AbortController();
@@ -285,13 +314,6 @@
     return stateLabel(provider.connection.state);
   }
 
-  function profileStatus(profile: RuntimeProfile): string {
-    return [profile.installation.state, profile.process.state, profile.connection.state]
-      .filter(Boolean)
-      .map(stateLabel)
-      .join(" / ");
-  }
-
   function endpointLabel(summary: RuntimeProfile["endpoint_summary"]): string | null {
     if (!summary) return null;
     if (typeof summary !== "string") return summary.redacted;
@@ -335,15 +357,6 @@
     return expandedProviders.has(providerId);
   }
 
-  function showExistingRuntimes() {
-    expandedProviders = new Set(providers.map((provider) => provider.provider_id));
-    for (const profile of providers
-      .flatMap((provider) => provider.profiles)
-      .filter((profile) => profile.runtime_class === "built_in")) {
-      void loadResources(profile);
-    }
-  }
-
   function reviewDataScope(profile: RuntimeProfile) {
     dataScopeProfile = profile;
     dataScopeDialogOpen = true;
@@ -353,15 +366,19 @@
     pruneProfile = profile;
     pruneDialogOpen = true;
   }
+
+  function entryPresentation(profile: RuntimeProfile, provider: RuntimeProviderStatus) {
+    return presentRuntimeProfile(profile, provider);
+  }
 </script>
 
 <div class="flex flex-col gap-4">
   <div class="flex flex-wrap items-start justify-between gap-3">
     <div class="max-w-3xl">
-      <h3 class="text-lg font-semibold">Runtime</h3>
+      <h3 class="text-lg font-semibold">Runtime choices</h3>
       <p class="text-sm text-muted-foreground">
-        Manage local container providers and choose the profile Studio should use for project
-        actions. Existing Docker-compatible engines can still be used as the platform default.
+        Choose the runtime Studio prefers for new project actions. Existing runtimes remain
+        external; unavailable choices block actions instead of falling back silently.
       </p>
     </div>
     <Button size="sm" variant="outline" disabled={refreshing} onclick={refreshRuntime}>
@@ -392,11 +409,12 @@
     </div>
     <div class="rounded-md border p-3">
       <div class="text-xs font-medium text-muted-foreground">Preferred runtime</div>
-      <div class="mt-2 flex min-w-0 items-center gap-2">
-        <Server class="size-4 shrink-0 text-muted-foreground" />
-        <span class="min-w-0 truncate text-sm">
-          {runtimePreference?.binding.display_name ?? "Loading runtime policy"}
-        </span>
+      <div class="mt-2 min-w-0">
+        {#if preferredPresentation}
+          <RuntimeIdentity presentation={preferredPresentation} compact />
+        {:else}
+          <span class="text-sm text-muted-foreground">Loading runtime policy</span>
+        {/if}
       </div>
     </div>
     <div class="rounded-md border p-3">
@@ -417,36 +435,99 @@
     </div>
   {/if}
 
-  {#if status && !managedBuiltIn && podmanProvider}
-    <div class="grid gap-4 border-y py-4 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
+  <Card.Root class="gap-0 overflow-hidden p-0">
+    <button
+      type="button"
+      class="flex w-full items-center justify-between gap-3 border-b bg-primary/5 p-4 text-left"
+      aria-expanded={builtInExpanded}
+      onclick={() => (builtInExpanded = !builtInExpanded)}
+    >
       <div class="min-w-0">
         <div class="flex flex-wrap items-center gap-2">
-          <Server class="size-4 text-primary" />
+          <ChevronRight class="size-4 transition-transform {builtInExpanded ? 'rotate-90' : ''}" />
           <h4 class="text-sm font-semibold">Susun Runtime</h4>
+          <Badge>Built-in</Badge>
           <Badge variant="secondary">Recommended</Badge>
         </div>
-        <p class="mt-1 text-sm text-muted-foreground">
-          A dedicated local runtime managed by Studio. Powered by Podman.
-        </p>
+        <p class="mt-1 text-sm text-muted-foreground">Powered by Podman and managed by Studio.</p>
       </div>
-      <div class="flex flex-wrap gap-2 md:justify-end">
-        <Button size="sm" variant="outline" onclick={showExistingRuntimes}>
-          Use existing runtime
-        </Button>
-        {#if setupAction}
-          <Button
-            size="sm"
-            disabled={!setupAction.enabled}
-            title={setupAction.reason}
-            onclick={() => handleAction(podmanProvider.provider_id, setupAction)}
-          >
-            <HardDrive />
-            Set up Susun Runtime
-          </Button>
+      <Badge variant={builtInNeedsAttention ? "outline" : "secondary"}>
+        {builtInNeedsAttention ? "Needs attention" : "Ready"}
+      </Badge>
+    </button>
+    {#if builtInExpanded}
+      <div class="space-y-3 p-4">
+        {#if !managedBuiltIn && podmanProvider}
+          <div class="grid gap-3 rounded-md border p-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
+            <p class="text-sm text-muted-foreground">
+              Set up a dedicated local runtime without installing Docker Desktop.
+            </p>
+            {#if setupAction}
+              <Button
+                size="sm"
+                disabled={!setupAction.enabled}
+                title={setupAction.reason}
+                onclick={() => handleAction(podmanProvider.provider_id, setupAction)}
+              >
+                <HardDrive />
+                Set up Susun Runtime
+              </Button>
+            {/if}
+          </div>
+        {/if}
+        {#if builtInEntries.length === 0}
+          <p class="text-sm text-muted-foreground">No managed Susun Runtime has been observed yet.</p>
+        {:else}
+          <div class="space-y-2">
+            {#each builtInEntries as entry (entry.profile.id)}
+              <RuntimeIdentity presentation={entryPresentation(entry.profile, entry.provider)} />
+            {/each}
+          </div>
         {/if}
       </div>
-    </div>
-  {/if}
+    {/if}
+  </Card.Root>
+
+  <Card.Root class="gap-0 overflow-hidden p-0">
+    <button
+      type="button"
+      class="flex w-full items-center justify-between gap-3 border-b bg-muted/20 p-4 text-left"
+      aria-expanded={existingExpanded}
+      onclick={() => (existingExpanded = !existingExpanded)}
+    >
+      <div>
+        <div class="flex items-center gap-2">
+          <ChevronRight class="size-4 transition-transform {existingExpanded ? 'rotate-90' : ''}" />
+          <h4 class="text-sm font-semibold">Existing runtimes</h4>
+        </div>
+        <p class="mt-1 text-sm text-muted-foreground">External Podman, Docker Desktop, and remote runtimes.</p>
+      </div>
+      <Badge variant="outline">{externalEntries.length}</Badge>
+    </button>
+    {#if existingExpanded}
+      <div class="space-y-3 p-4">
+        {#if externalEntries.length === 0}
+          <p class="text-sm text-muted-foreground">No selectable external runtime has been observed.</p>
+        {:else}
+          {#each externalEntries as entry (entry.profile.id)}
+            <div class="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-md border p-3">
+              <div class="min-w-0 flex-1">
+                <RuntimeIdentity presentation={entryPresentation(entry.profile, entry.provider)} />
+              </div>
+              <Button
+                size="sm"
+                variant={isPreferred(entry.profile) ? "secondary" : "outline"}
+                disabled={isPreferred(entry.profile) || !entry.profile.management.can_select}
+                onclick={() => handleSelect(entry.profile)}
+              >
+                {isPreferred(entry.profile) ? "Preferred" : "Make preferred"}
+              </Button>
+            </div>
+          {/each}
+        {/if}
+      </div>
+    {/if}
+  </Card.Root>
 
   {#if !status && !errorMessage}
     <div class="rounded-md border p-4 text-sm text-muted-foreground">
@@ -456,10 +537,9 @@
 
   <div class="flex flex-wrap items-end justify-between gap-2">
     <div>
-      <h4 class="text-sm font-semibold">Runtime providers</h4>
+      <h4 class="text-sm font-semibold">Advanced provider diagnostics</h4>
       <p class="text-xs text-muted-foreground">
-        Installed and available runtimes are listed together. Expand one to manage profiles and
-        lifecycle actions.
+        Inspect provider health and the safe actions currently supported by the daemon.
       </p>
     </div>
     <Badge variant="outline">{providers.length}</Badge>
@@ -582,12 +662,9 @@
                 <li class="grid gap-3 p-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-start">
                   <div class="min-w-0">
                     <div class="flex flex-wrap items-center gap-2">
-                      <span class="min-w-0 truncate text-sm font-medium">
-                        {profile.display_name}
-                      </span>
-                      {#if profile.runtime_class === "built_in"}
-                        <span class="text-xs text-muted-foreground">Powered by Podman</span>
-                      {/if}
+                      <div class="min-w-0 flex-1">
+                        <RuntimeIdentity presentation={entryPresentation(profile, provider)} compact />
+                      </div>
                       {#if isPreferred(profile)}
                         <Badge variant="default" class="text-xs">
                           <CheckCircle2 />
@@ -597,9 +674,8 @@
                       {#each ownershipBadges(profile) as badge (badge.label)}
                         <Badge variant={badge.variant} class="text-xs">{badge.label}</Badge>
                       {/each}
-                      <Badge variant="secondary" class="text-xs">{profileStatus(profile)}</Badge>
                     </div>
-                    <div class="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                    <div class="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground [overflow-wrap:anywhere]">
                       <span>{profile.provider_runtime_key}</span>
                       <span>{profile.freshness}</span>
                       {#if endpoint}
