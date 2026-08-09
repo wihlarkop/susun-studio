@@ -12,13 +12,21 @@
   import SettingsPage from "$lib/components/settings-page.svelte";
   import ImportProjectDialog from "$lib/components/import-project-dialog.svelte";
   import BetaOnboardingPanel from "$lib/components/beta-onboarding-panel.svelte";
+  import RuntimeOnboardingDialog from "$lib/components/runtime-onboarding-dialog.svelte";
   import { createDaemonState } from "$lib/daemon/daemon-state.svelte";
-  import type { ImportProjectRequest, ImportProjectResponse } from "$lib/daemon/client";
+  import {
+    reopenRuntimeOnboarding,
+    type ImportProjectRequest,
+    type ImportProjectResponse,
+  } from "$lib/daemon/client";
+  import { resolveOnboardingView } from "$lib/runtime/onboarding-state";
 
   const daemonState = createDaemonState();
   let importDialogOpen = $state(false);
   let activeView = $state<"projects" | "jobs" | "runtime" | "artifacts" | "settings">("projects");
   let selectedProjectId = $state<string | null>(null);
+  let runtimeOnboardingOpen = $state(false);
+  let runtimeOnboardingReopened = $state(false);
   const selectedProject = $derived(
     daemonState.projects.find((project) => project.id === selectedProjectId) ??
       daemonState.projects[0] ??
@@ -78,6 +86,38 @@
             ? "Artifacts"
             : "Settings",
   );
+  const onboardingView = $derived(
+    resolveOnboardingView({
+      connected: daemonState.healthState.kind === "connected",
+      onboarding: daemonState.runtimeOnboarding,
+      binding: daemonState.runtimePreference?.binding,
+    }),
+  );
+
+  $effect(() => {
+    if (runtimeOnboardingReopened) return;
+    runtimeOnboardingOpen = onboardingView.kind === "chooser";
+  });
+
+  async function openRuntimeSetup() {
+    if (daemonState.healthState.kind !== "connected" || !daemonState.runtimeOnboarding) return;
+    try {
+      if (daemonState.runtimeOnboarding.state === "dismissed") {
+        await reopenRuntimeOnboarding();
+        await daemonState.refresh();
+      }
+      runtimeOnboardingReopened = true;
+      runtimeOnboardingOpen = true;
+    } catch {
+      // The existing Runtime recovery UI remains available if reopening cannot
+      // reach the local daemon; no policy or completion state is changed.
+    }
+  }
+
+  function finishRuntimeSetup() {
+    runtimeOnboardingOpen = false;
+    runtimeOnboardingReopened = false;
+  }
 </script>
 
 <svelte:head>
@@ -110,7 +150,7 @@
           runtimePreference={daemonState.runtimePreference}
           onImportClick={() => (importDialogOpen = true)}
           onRetry={daemonState.refresh}
-          onSetupRuntime={() => (activeView = "runtime")}
+          onManageRuntime={() => (activeView = "runtime")}
         />
         <ActiveEngineStrip
           profiles={daemonState.runtimeProfiles}
@@ -135,7 +175,7 @@
       {:else if activeView === "jobs"}
         <JobsPage projects={daemonState.projects} />
       {:else if activeView === "runtime"}
-        <RuntimePage />
+        <RuntimePage onChooseRuntime={openRuntimeSetup} />
       {:else if activeView === "artifacts"}
         <ArtifactsPage
           profiles={daemonState.runtimeProfiles}
@@ -144,7 +184,10 @@
           projects={daemonState.projects}
         />
       {:else}
-        <SettingsPage />
+        <SettingsPage
+          onboarding={daemonState.runtimeOnboarding}
+          onRunRuntimeSetup={openRuntimeSetup}
+        />
       {/if}
     </div>
   </Sidebar.Inset>
@@ -156,3 +199,14 @@
   runtimeProfiles={daemonState.runtimeProfiles}
   onImport={handleImport}
 />
+
+{#if runtimeOnboardingOpen && daemonState.runtimeStatus && daemonState.runtimeOnboarding}
+  <RuntimeOnboardingDialog
+    bind:open={runtimeOnboardingOpen}
+    status={daemonState.runtimeStatus}
+    onboarding={daemonState.runtimeOnboarding}
+    reopened={runtimeOnboardingReopened}
+    onchanged={daemonState.refresh}
+    onfinished={finishRuntimeSetup}
+  />
+{/if}

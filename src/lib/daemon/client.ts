@@ -243,6 +243,15 @@ export type RuntimePreference = {
   binding: RuntimeBindingSummary;
 };
 
+export type RuntimeOnboardingChoice = "built_in" | "existing";
+
+export type RuntimeOnboardingState = {
+  state: "pending" | "completed" | "dismissed";
+  choice: RuntimeOnboardingChoice | null;
+  completed_at_ms: number | null;
+  updated_at_ms: number;
+};
+
 /** Redacted runtime provenance persisted with work and immediate responses. */
 export type RuntimeAttribution = {
   runtime_profile_id: string | null;
@@ -736,6 +745,35 @@ export async function setPreferredRuntime(
     method: "PUT",
     body: { preferred_profile_id: preferredProfileId },
   });
+}
+
+export async function readRuntimeOnboarding(
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeOnboardingState> {
+  return readJson("/v1/runtime/onboarding", options);
+}
+
+export async function completeRuntimeOnboarding(
+  choice: RuntimeOnboardingChoice,
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeOnboardingState> {
+  return readJson("/v1/runtime/onboarding/complete", {
+    ...options,
+    method: "POST",
+    body: { choice },
+  });
+}
+
+export async function dismissRuntimeOnboarding(
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeOnboardingState> {
+  return readJson("/v1/runtime/onboarding/dismiss", { ...options, method: "POST" });
+}
+
+export async function reopenRuntimeOnboarding(
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeOnboardingState> {
+  return readJson("/v1/runtime/onboarding/reopen", { ...options, method: "POST" });
 }
 
 export async function prepareRuntimeAction(

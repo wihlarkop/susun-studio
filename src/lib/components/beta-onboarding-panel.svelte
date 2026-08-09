@@ -17,7 +17,7 @@
     runtimePreference,
     onImportClick,
     onRetry,
-    onSetupRuntime,
+    onManageRuntime,
   }: {
     healthState: HealthState;
     projectCount: number;
@@ -25,7 +25,7 @@
     runtimePreference: RuntimePreference | undefined;
     onImportClick: () => void;
     onRetry: () => void;
-    onSetupRuntime: () => void;
+    onManageRuntime: () => void;
   } = $props();
 
   let checkingEngine = $state(false);
@@ -133,7 +133,7 @@
               {checkingEngine ? "Checking" : "Recheck"}
             </Button>
             {#if !engineReady}
-              <Button size="sm" disabled={!connected} onclick={onSetupRuntime}>Set up</Button>
+              <Button size="sm" disabled={!connected} onclick={onManageRuntime}>Manage</Button>
             {/if}
           </div>
         </div>
