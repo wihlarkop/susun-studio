@@ -1,5 +1,9 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use log::warn;
 use serde::{Deserialize, Serialize};
 use tauri::{
+    Emitter, Manager,
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
 };
@@ -13,6 +17,21 @@ const MENU_RUNTIME_SETUP: &str = "runtime-setup";
 const MENU_START: &str = "start";
 const MENU_STOP: &str = "stop";
 const MENU_QUIT: &str = "quit";
+const EVENT_NAVIGATION: &str = "studio-tray-navigation-requested";
+const EVENT_RUNTIME_ACTION: &str = "runtime-tray-action-requested";
+
+#[derive(Default)]
+pub struct QuitIntent(AtomicBool);
+
+impl QuitIntent {
+    pub fn request(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn requested(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,6 +66,22 @@ pub enum TrayAction {
     Start,
     Stop,
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TrayNavigationIntent {
+    Open,
+    RuntimeSettings,
+    RuntimeSetup,
+    Runtime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TrayRuntimeAction {
+    Start,
+    Stop,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,18 +121,34 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
         state: TrayRuntimeState::Unconfigured,
     };
     let model = menu_model(summary);
-    let menu = native_menu(app, &model)?;
+    let menu = native_menu(app.handle(), &model)?;
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
         .tooltip(&model.status_label);
     if let Some(icon) = app.default_window_icon() {
         builder = builder.icon(icon.clone());
     }
-    builder.build(app)?;
+    builder
+        .on_menu_event(|app, event| {
+            if let Some(action) = action_from_menu_id(&event.id().0) {
+                handle_action(app, action);
+            }
+        })
+        .build(app)?;
     Ok(())
 }
 
-fn native_menu(app: &tauri::App, model: &TrayMenuModel) -> tauri::Result<Menu<tauri::Wry>> {
+pub fn update_summary(app: &tauri::AppHandle, summary: TrayRuntimeSummary) -> tauri::Result<()> {
+    let model = menu_model(summary);
+    let menu = native_menu(app, &model)?;
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        tray.set_menu(Some(menu))?;
+        tray.set_tooltip(Some(model.status_label))?;
+    }
+    Ok(())
+}
+
+fn native_menu(app: &tauri::AppHandle, model: &TrayMenuModel) -> tauri::Result<Menu<tauri::Wry>> {
     let open = menu_item(app, MENU_OPEN, "Open Susun Studio", true)?;
     let status = menu_item(app, "status", &model.status_label, false)?;
     let settings = menu_item(app, MENU_RUNTIME_SETTINGS, "Runtime settings", true)?;
@@ -128,12 +179,69 @@ fn native_menu(app: &tauri::App, model: &TrayMenuModel) -> tauri::Result<Menu<ta
 }
 
 fn menu_item(
-    app: &tauri::App,
+    app: &tauri::AppHandle,
     id: &str,
     label: &str,
     enabled: bool,
 ) -> tauri::Result<MenuItem<tauri::Wry>> {
     MenuItem::with_id(app, id, bounded_label(label), enabled, None::<&str>)
+}
+
+fn action_from_menu_id(id: &str) -> Option<TrayAction> {
+    match id {
+        MENU_OPEN => Some(TrayAction::Open),
+        MENU_RUNTIME_SETTINGS => Some(TrayAction::RuntimeSettings),
+        MENU_RUNTIME_SETUP => Some(TrayAction::RuntimeSetup),
+        MENU_START => Some(TrayAction::Start),
+        MENU_STOP => Some(TrayAction::Stop),
+        MENU_QUIT => Some(TrayAction::Quit),
+        _ => None,
+    }
+}
+
+fn handle_action(app: &tauri::AppHandle, action: TrayAction) {
+    match action {
+        TrayAction::Quit => {
+            app.state::<QuitIntent>().request();
+            app.state::<crate::daemon::DaemonSupervisor>().shutdown();
+            app.exit(0);
+        }
+        TrayAction::Open => emit_navigation(app, TrayNavigationIntent::Open),
+        TrayAction::RuntimeSettings => emit_navigation(app, TrayNavigationIntent::RuntimeSettings),
+        TrayAction::RuntimeSetup => emit_navigation(app, TrayNavigationIntent::RuntimeSetup),
+        TrayAction::Start => emit_runtime_action(app, TrayRuntimeAction::Start),
+        TrayAction::Stop => emit_runtime_action(app, TrayRuntimeAction::Stop),
+    }
+}
+
+fn emit_navigation(app: &tauri::AppHandle, intent: TrayNavigationIntent) {
+    show_and_focus(app);
+    if let Err(error) = app.emit(EVENT_NAVIGATION, intent) {
+        warn!("event=tray_navigation_emit_failed error={error}");
+    }
+}
+
+fn emit_runtime_action(app: &tauri::AppHandle, action: TrayRuntimeAction) {
+    show_and_focus(app);
+    if let Err(error) = app.emit(EVENT_NAVIGATION, TrayNavigationIntent::Runtime) {
+        warn!("event=tray_navigation_emit_failed error={error}");
+        return;
+    }
+    if let Err(error) = app.emit(EVENT_RUNTIME_ACTION, action) {
+        warn!("event=tray_runtime_action_emit_failed error={error}");
+    }
+}
+
+fn show_and_focus(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    if let Err(error) = window.show() {
+        warn!("event=tray_window_show_failed error={error}");
+    }
+    if let Err(error) = window.set_focus() {
+        warn!("event=tray_window_focus_failed error={error}");
+    }
 }
 
 fn state_label(state: TrayRuntimeState) -> &'static str {

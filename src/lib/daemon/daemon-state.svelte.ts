@@ -18,6 +18,7 @@ import {
   type StudioProject,
   type StudioSettings,
 } from "$lib/daemon/client";
+import { syncTrayRuntimeSummary } from "$lib/tauri/tray";
 
 export type HealthState =
   | { kind: "checking"; label: "Checking"; detail: string; health?: undefined }
@@ -72,6 +73,7 @@ export function createDaemonState() {
       runtimeStatus = nextRuntimeStatus;
       runtimeOnboarding = nextRuntimeOnboarding;
       runtimeProfiles = nextRuntimeStatus.providers.flatMap((provider) => provider.profiles);
+      void syncTrayRuntimeSummary(nextRuntimeStatus);
       workspaceDetail = describeWorkspace(projectList);
       healthState = {
         kind: "connected",
@@ -87,6 +89,7 @@ export function createDaemonState() {
       projects = [];
       runtimeProfiles = [];
       runtimeStatus = undefined;
+      void syncTrayRuntimeSummary(undefined);
       runtimeOnboarding = undefined;
       settings = undefined;
       workspaceDetail = "Start the local daemon to load projects and settings.";
