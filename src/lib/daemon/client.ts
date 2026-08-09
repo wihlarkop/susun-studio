@@ -932,8 +932,7 @@ export async function prepareRuntimeResourceUpdate(
 }
 
 export type RuntimeMigrationProject = {
-  id: string;
-  name: string;
+  project_id: string;
   currently_bound_to_source: boolean;
 };
 
@@ -997,8 +996,8 @@ export type RuntimeArtifactPolicy = {
 };
 
 export type RuntimeMigrationPreview = {
-  source: RuntimeProfile;
-  target: RuntimeProfile;
+  source: RuntimeBindingSummary;
+  target: RuntimeBindingSummary;
   projects: RuntimeMigrationProject[];
   can_migrate: boolean;
   blockers: string[];
@@ -1023,6 +1022,10 @@ export type RuntimeMigrationResult = {
 
 export type RuntimeMigrationRollbackPreview = {
   migration_id: string;
+  source: RuntimeBindingSummary;
+  target: RuntimeBindingSummary;
+  project_count: number;
+  excluded_categories: string[];
   restorable: boolean;
   blocker: string | null;
   plan_id: string | null;

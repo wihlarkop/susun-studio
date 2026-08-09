@@ -23,9 +23,14 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 use turso::{Connection, Database, params};
 
+#[cfg(not(test))]
+use super::compatibility;
 use super::policy::{self, RuntimeBindingSummary};
 use super::provider::{RuntimeRecoveryAction, RuntimeRecoveryPlan};
-use super::{RuntimeProfile, list_all_profiles, now_ms, stable_suffix};
+use super::{
+    RuntimeBindingSource, RuntimeBindingState, RuntimeProfile, list_all_profiles, now_ms,
+    stable_suffix,
+};
 use crate::action_audit::{self, AffectedCount, AuditEntry};
 use crate::action_plans::{
     ActionKind, ActionPlanPayload, ActionPlanStore, DestructivePlan, MigrationCommitPlan,
@@ -36,6 +41,7 @@ use crate::action_plans::{
 mod tests;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MigrationRequest {
     pub source_profile_id: String,
     pub target_profile_id: String,
@@ -94,8 +100,8 @@ pub struct RuntimeMigrationHistoryEntry {
 
 #[derive(Debug, Serialize)]
 pub struct MigrationPreview {
-    pub source: RuntimeProfile,
-    pub target: RuntimeProfile,
+    pub source: RuntimeBindingSummary,
+    pub target: RuntimeBindingSummary,
     pub projects: Vec<MigrationProject>,
     pub can_migrate: bool,
     pub blockers: Vec<String>,
@@ -109,10 +115,17 @@ pub struct MigrationPreview {
 
 #[derive(Debug, Serialize)]
 pub struct MigrationProject {
-    pub id: String,
-    pub name: String,
+    pub project_id: String,
     pub currently_bound_to_source: bool,
 }
+
+#[derive(Clone)]
+struct MigrationTargetCompatibility {
+    allowed: bool,
+    fingerprint: String,
+}
+
+const MAX_MIGRATION_PROJECTS: usize = 100;
 
 #[derive(Debug, Serialize)]
 pub struct ArtifactPolicy {
@@ -136,6 +149,10 @@ pub struct MigrationResult {
 #[derive(Debug, Serialize)]
 pub struct MigrationRollbackPreview {
     pub migration_id: String,
+    pub source: RuntimeBindingSummary,
+    pub target: RuntimeBindingSummary,
+    pub project_count: usize,
+    pub excluded_categories: Vec<String>,
     pub restorable: bool,
     pub blocker: Option<String>,
     pub plan_id: Option<String>,
@@ -402,31 +419,36 @@ pub async fn preview_migration(
     owner: &str,
     request: &MigrationRequest,
 ) -> Result<Option<MigrationPreview>, turso::Error> {
-    let profiles = list_all_profiles(db).await?;
-    let Some(source) = profiles
-        .iter()
-        .find(|profile| profile.id == request.source_profile_id)
-        .cloned()
-    else {
+    let Some(target) = load_profile(db, &request.target_profile_id).await? else {
         return Ok(None);
     };
-    let Some(target) = profiles
-        .iter()
-        .find(|profile| profile.id == request.target_profile_id)
-        .cloned()
-    else {
-        return Ok(None);
-    };
+    let compatibility = migration_target_compatibility(db, &target).await?;
+    preview_migration_with_compatibility(db, store, owner, request, target, compatibility).await
+}
 
-    let projects = migration_projects(db, &request.project_ids, &source.id).await?;
+async fn preview_migration_with_compatibility(
+    db: &Database,
+    store: &ActionPlanStore,
+    owner: &str,
+    request: &MigrationRequest,
+    target: RuntimeProfile,
+    compatibility: MigrationTargetCompatibility,
+) -> Result<Option<MigrationPreview>, turso::Error> {
+    let (project_ids, over_limit) = canonical_project_ids(&request.project_ids);
+    let source = migration_binding_summary(db, &request.source_profile_id).await?;
+    let target_summary = migration_binding_summary(db, &target.id).await?;
+    let projects = migration_projects(db, &project_ids, &request.source_profile_id).await?;
     let mut blockers = Vec::new();
-    if source.id == target.id {
+    if request.source_profile_id == target.id {
         blockers.push("Source and target runtime must differ.".to_owned());
     }
-    if request.project_ids.is_empty() {
+    if project_ids.is_empty() {
         blockers.push("Select at least one project.".to_owned());
     }
-    if projects.len() != request.project_ids.len() {
+    if over_limit {
+        blockers.push("Select no more than 100 explicitly pinned projects.".to_owned());
+    }
+    if projects.len() != project_ids.len() {
         blockers.push("One or more selected projects do not exist.".to_owned());
     }
     if projects
@@ -442,7 +464,10 @@ pub async fn preview_migration(
     {
         blockers.push("Target runtime must be available, reachable, and selectable.".to_owned());
     }
-    let (running_jobs, running_watch) = active_work(db, &source.id).await?;
+    if !compatibility.allowed {
+        blockers.push("Target runtime is not compatible for project binding migration.".to_owned());
+    }
+    let (running_jobs, running_watch) = active_work(db, &request.source_profile_id).await?;
     if running_jobs > 0 || running_watch > 0 {
         blockers.push(
             "Stop running jobs and watch sessions on the source runtime before migrating."
@@ -452,16 +477,20 @@ pub async fn preview_migration(
 
     let can_migrate = blockers.is_empty();
     let (plan_id, expires_in_seconds) = if can_migrate {
-        let fingerprint =
-            migration_fingerprint(db, &source.id, &target, &request.project_ids).await?;
+        let binding_inventory_fingerprint =
+            migration_fingerprint(db, &request.source_profile_id, &target, &project_ids).await?;
+        let active_work_fingerprint = active_work_fingerprint(running_jobs, running_watch);
         let ticket = store.prepare(
             owner,
             ActionKind::MigrationCommit,
             ActionPlanPayload::MigrationCommit(MigrationCommitPlan {
-                source_profile_id: source.id.clone(),
+                source_profile_id: request.source_profile_id.clone(),
                 target_profile_id: target.id.clone(),
-                project_ids: request.project_ids.clone(),
-                fingerprint,
+                project_ids,
+                target_observation_revision: target.observation_revision,
+                compatibility_fingerprint: compatibility.fingerprint,
+                active_work_fingerprint,
+                binding_inventory_fingerprint,
             }),
         );
         (Some(ticket.plan_id), Some(ticket.expires_in_seconds))
@@ -471,14 +500,11 @@ pub async fn preview_migration(
 
     Ok(Some(MigrationPreview {
         source,
-        target,
+        target: target_summary,
         projects,
         can_migrate,
         blockers,
-        unavailable_capabilities: vec![
-            "Volume data migration is not supported.".to_owned(),
-            "Runtime ownership is not transferred.".to_owned(),
-        ],
+        unavailable_capabilities: vec!["volumes".to_owned(), "runtime_ownership".to_owned()],
         artifact_policy: vec![
             ArtifactPolicy {
                 category: "images",
@@ -500,6 +526,131 @@ pub async fn preview_migration(
         plan_id,
         expires_in_seconds,
     }))
+}
+
+async fn migration_target_compatibility(
+    db: &Database,
+    target: &RuntimeProfile,
+) -> Result<MigrationTargetCompatibility, turso::Error> {
+    #[cfg(test)]
+    {
+        let _ = db;
+        Ok(test_migration_target_compatibility(target))
+    }
+
+    #[cfg(not(test))]
+    {
+        let report = compatibility::report_for_profile(db, &target.id).await?;
+        let (allowed, fingerprint) = match report.as_ref() {
+            Some(report) => {
+                let migration = report
+                    .workflows
+                    .iter()
+                    .find(|workflow| workflow.id == "metadata_migration");
+                let allowed = report.availability_state == "available"
+                    && migration.is_some_and(|workflow| workflow.level == "supported");
+                let fingerprint = match migration {
+                    Some(workflow) => stable_suffix(&format!(
+                        "id={};class={};owner={};availability={};observed={};workflow={};level={};reason={};",
+                        report.profile_id,
+                        report.runtime_class,
+                        report.ownership_state,
+                        report.availability_state,
+                        target.observation_revision,
+                        workflow.id,
+                        workflow.level,
+                        workflow.reason_code,
+                    )),
+                    None => stable_suffix(&format!(
+                        "id={};availability={};observed={};workflow=missing;",
+                        report.profile_id, report.availability_state, target.observation_revision
+                    )),
+                };
+                (allowed, fingerprint)
+            }
+            None => (
+                false,
+                stable_suffix(&format!(
+                    "id={};availability=unavailable;observed={};",
+                    target.id, target.observation_revision
+                )),
+            ),
+        };
+        Ok(MigrationTargetCompatibility {
+            allowed,
+            fingerprint,
+        })
+    }
+}
+
+#[cfg(test)]
+fn test_migration_target_compatibility(target: &RuntimeProfile) -> MigrationTargetCompatibility {
+    MigrationTargetCompatibility {
+        allowed: true,
+        fingerprint: stable_suffix(&format!(
+            "test-compatible={};rev={};",
+            target.id, target.observation_revision
+        )),
+    }
+}
+
+async fn migration_binding_summary(
+    db: &Database,
+    profile_id: &str,
+) -> Result<RuntimeBindingSummary, turso::Error> {
+    let Some(profile) = load_profile(db, profile_id).await? else {
+        return Ok(RuntimeBindingSummary {
+            source: RuntimeBindingSource::ProjectPin,
+            state: RuntimeBindingState::Missing,
+            profile_id: Some(profile_id.to_owned()),
+            runtime_class: None,
+            display_name: "Missing runtime profile".to_owned(),
+        });
+    };
+    let state =
+        if profile.availability_state == "available" && profile.connection.state == "summarized" {
+            RuntimeBindingState::Ready
+        } else {
+            RuntimeBindingState::Unavailable
+        };
+    Ok(RuntimeBindingSummary {
+        source: RuntimeBindingSource::ProjectPin,
+        state,
+        profile_id: Some(profile.id),
+        runtime_class: Some(profile.runtime_class),
+        display_name: profile.display_name,
+    })
+}
+
+fn canonical_project_ids(project_ids: &[String]) -> (Vec<String>, bool) {
+    let mut canonical = project_ids.to_vec();
+    canonical.sort();
+    canonical.dedup();
+    let over_limit = canonical.len() > MAX_MIGRATION_PROJECTS;
+    if over_limit {
+        canonical.truncate(MAX_MIGRATION_PROJECTS);
+    }
+    (canonical, over_limit)
+}
+
+fn active_work_fingerprint(running_jobs: i64, running_watch: i64) -> String {
+    stable_suffix(&format!("jobs={running_jobs};watch={running_watch};"))
+}
+
+fn migration_excluded_categories() -> Vec<String> {
+    [
+        "images",
+        "containers",
+        "volumes",
+        "networks",
+        "registry_credentials",
+        "runtime_settings",
+        "runtime_ownership",
+        "project_files",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 /// Commit a previously previewed migration by its opaque plan id. Accepts no
@@ -532,7 +683,6 @@ pub async fn commit_migration(
     };
 
     let started = now_ms();
-    // Revalidate the inventory fingerprint captured at preview.
     let target = match load_profile(db, &plan.target_profile_id).await {
         Ok(Some(target)) => target,
         _ => {
@@ -548,10 +698,33 @@ pub async fn commit_migration(
             .await;
         }
     };
-    let fresh = migration_fingerprint(db, &plan.source_profile_id, &target, &plan.project_ids)
-        .await
-        .unwrap_or_default();
-    if fresh != plan.fingerprint {
+    let compatibility =
+        migration_target_compatibility(db, &target)
+            .await
+            .unwrap_or(MigrationTargetCompatibility {
+                allowed: false,
+                fingerprint: String::new(),
+            });
+    if target.observation_revision != plan.target_observation_revision
+        || !compatibility.allowed
+        || compatibility.fingerprint != plan.compatibility_fingerprint
+    {
+        store.finish(&claimed.plan_id, crate::action_plans::PlanState::Failed);
+        return fail_commit(
+            db,
+            ActionKind::MigrationCommit,
+            Some(plan.target_profile_id.clone()),
+            "target_incompatible",
+            "Target runtime changed or is no longer compatible. Preview the migration again.",
+            started,
+        )
+        .await;
+    }
+    let fresh_bindings =
+        migration_fingerprint(db, &plan.source_profile_id, &target, &plan.project_ids)
+            .await
+            .unwrap_or_default();
+    if fresh_bindings != plan.binding_inventory_fingerprint {
         store.finish(&claimed.plan_id, crate::action_plans::PlanState::Failed);
         return fail_commit(
             db,
@@ -563,10 +736,25 @@ pub async fn commit_migration(
         )
         .await;
     }
-    let (running_jobs, running_watch) = active_work(db, &plan.source_profile_id)
-        .await
-        .unwrap_or((0, 0));
-    if running_jobs > 0 || running_watch > 0 {
+    let (running_jobs, running_watch) = match active_work(db, &plan.source_profile_id).await {
+        Ok(active_work) => active_work,
+        Err(_) => {
+            store.finish(&claimed.plan_id, crate::action_plans::PlanState::Failed);
+            return fail_commit(
+                db,
+                ActionKind::MigrationCommit,
+                Some(plan.source_profile_id.clone()),
+                "active_work_unavailable",
+                "Studio could not verify active work. Preview the migration again.",
+                started,
+            )
+            .await;
+        }
+    };
+    if active_work_fingerprint(running_jobs, running_watch) != plan.active_work_fingerprint
+        || running_jobs > 0
+        || running_watch > 0
+    {
         store.finish(&claimed.plan_id, crate::action_plans::PlanState::Failed);
         return fail_commit(
             db,
@@ -583,9 +771,14 @@ pub async fn commit_migration(
     let now = now_ms();
     let project_ids_json = serde_json::to_string(&plan.project_ids).unwrap_or_else(|_| "[]".into());
     let skipped = vec![
-        "volume data".to_owned(),
-        "registry credentials".to_owned(),
-        "runtime ownership".to_owned(),
+        "images".to_owned(),
+        "containers".to_owned(),
+        "volumes".to_owned(),
+        "networks".to_owned(),
+        "registry_credentials".to_owned(),
+        "runtime_settings".to_owned(),
+        "runtime_ownership".to_owned(),
+        "project_files".to_owned(),
     ];
     let skipped_json = serde_json::to_string(&skipped).unwrap_or_else(|_| "[]".into());
 
@@ -646,12 +839,7 @@ pub async fn commit_migration(
         }
         Ok(false) => {
             store.finish(&claimed.plan_id, crate::action_plans::PlanState::Failed);
-            let result = failed_result(
-                &plan,
-                vec![
-                    "Project bindings changed during commit; no migration was applied.".to_owned(),
-                ],
-            );
+            let result = failed_result(&plan, vec!["binding_race".to_owned()]);
             persist_failed_migration(db, &plan, &result).await.ok();
             let _ = action_audit::record(
                 db,
@@ -742,29 +930,57 @@ pub async fn preview_migration_rollback(
     else {
         return Ok(None);
     };
+    let source_summary = migration_binding_summary(db, &source).await?;
+    let target_summary = migration_binding_summary(db, &target).await?;
+    let project_ids: Vec<String> = serde_json::from_str(&project_ids_json).unwrap_or_default();
+    let excluded_categories = migration_excluded_categories();
     let restorable = status == "completed" && rollback_available == 1;
     if !restorable {
         return Ok(Some(MigrationRollbackPreview {
             migration_id: migration_id.to_owned(),
+            source: source_summary,
+            target: target_summary,
+            project_count: project_ids.len(),
+            excluded_categories,
             restorable: false,
             blocker: Some("This migration can no longer be rolled back.".to_owned()),
             plan_id: None,
             expires_in_seconds: None,
         }));
     }
-    let project_ids: Vec<String> = serde_json::from_str(&project_ids_json).unwrap_or_default();
-    let fingerprint =
+    let (running_jobs, running_watch) = active_work(db, &target).await?;
+    if running_jobs > 0 || running_watch > 0 {
+        return Ok(Some(MigrationRollbackPreview {
+            migration_id: migration_id.to_owned(),
+            source: source_summary,
+            target: target_summary,
+            project_count: project_ids.len(),
+            excluded_categories,
+            restorable: false,
+            blocker: Some(
+                "Stop running work on the migrated runtime before preparing rollback.".to_owned(),
+            ),
+            plan_id: None,
+            expires_in_seconds: None,
+        }));
+    }
+    let binding_inventory_fingerprint =
         rollback_fingerprint(db, migration_id, &source, &target, &project_ids).await?;
     let ticket = store.prepare(
         owner,
         ActionKind::MigrationRollback,
         ActionPlanPayload::MigrationRollback(MigrationRollbackPlan {
             migration_id: migration_id.to_owned(),
-            fingerprint,
+            binding_inventory_fingerprint,
+            active_work_fingerprint: active_work_fingerprint(running_jobs, running_watch),
         }),
     );
     Ok(Some(MigrationRollbackPreview {
         migration_id: migration_id.to_owned(),
+        source: source_summary,
+        target: target_summary,
+        project_count: project_ids.len(),
+        excluded_categories,
         restorable: true,
         blocker: None,
         plan_id: Some(ticket.plan_id),
@@ -829,7 +1045,12 @@ pub async fn commit_migration_rollback(
     let fresh = rollback_fingerprint(db, &plan.migration_id, &source, &target, &project_ids)
         .await
         .unwrap_or_default();
-    if fresh != plan.fingerprint {
+    let (running_jobs, running_watch) = active_work(db, &target).await.unwrap_or((-1, -1));
+    if fresh != plan.binding_inventory_fingerprint
+        || active_work_fingerprint(running_jobs, running_watch) != plan.active_work_fingerprint
+        || running_jobs > 0
+        || running_watch > 0
+    {
         store.finish(&claimed.plan_id, crate::action_plans::PlanState::Failed);
         reject_and_audit(db, ActionKind::MigrationRollback, None, "stale_preview").await;
         return Ok(MigrationRollbackResult {
@@ -1558,15 +1779,14 @@ async fn migration_projects(
     for id in ids {
         let mut rows = conn
             .query(
-                "SELECT id, name, runtime_profile_id FROM projects WHERE id = ?1 LIMIT 1",
+                "SELECT id, runtime_profile_id FROM projects WHERE id = ?1 LIMIT 1",
                 params![id.clone()],
             )
             .await?;
         if let Some(row) = rows.next().await? {
-            let bound: Option<String> = row.get(2)?;
+            let bound: Option<String> = row.get(1)?;
             projects.push(MigrationProject {
-                id: row.get(0)?,
-                name: row.get(1)?,
+                project_id: row.get(0)?,
                 currently_bound_to_source: bound.as_deref() == Some(source_profile_id),
             });
         }
@@ -1731,8 +1951,12 @@ async fn migration_fingerprint(
     let mut sorted = project_ids.to_vec();
     sorted.sort();
     let mut canonical = format!(
-        "src={source_id};tgt={};tavail={};tsel={};tconn={};",
-        target.id, target.availability_state, target.management.can_select, target.connection.state
+        "src={source_id};tgt={};tavail={};tsel={};tconn={};trev={};",
+        target.id,
+        target.availability_state,
+        target.management.can_select,
+        target.connection.state,
+        target.observation_revision,
     );
     for project_id in &sorted {
         let mut rows = conn

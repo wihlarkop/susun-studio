@@ -354,6 +354,46 @@ async fn rollback_prepare_and_commit_restore_bindings() -> TestResult {
 }
 
 #[tokio::test]
+async fn rollback_preview_blocks_active_work_on_the_migrated_runtime() -> TestResult {
+    let (db, path, source, target) = fixture().await?;
+    let store = ActionPlanStore::default();
+    let preview = preview_migration(
+        &db,
+        &store,
+        OWNER,
+        &MigrationRequest {
+            source_profile_id: source,
+            target_profile_id: target.clone(),
+            project_ids: vec!["p1".to_owned()],
+        },
+    )
+    .await?
+    .ok_or("preview")?;
+    let Ok(result) = commit_migration(&db, &store, OWNER, &preview.plan_id.ok_or("plan")?).await
+    else {
+        return Err("commit rejected".into());
+    };
+    let conn = db.connect()?;
+    conn.execute(
+        "INSERT INTO jobs (id, kind, status, project_id, engine_id, request_json,
+            created_at_ms, updated_at_ms, runtime_profile_id, runtime_class)
+         VALUES ('rollback-active','up','running','p1','engine-docker-local','{}',1,1,?1,'external_local')",
+        params![target],
+    )
+    .await?;
+
+    let rollback = preview_migration_rollback(&db, &store, OWNER, &result.migration_id)
+        .await?
+        .ok_or("rollback")?;
+    assert!(!rollback.restorable);
+    assert!(rollback.plan_id.is_none());
+    assert!(rollback.blocker.is_some());
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[tokio::test]
 async fn destructive_preview_never_allows_external_runtime() -> TestResult {
     let (db, path, source, _) = fixture().await?;
     let store = ActionPlanStore::default();
@@ -616,6 +656,107 @@ async fn migration_history_is_bounded_newest_first_and_redacts_legacy_json() -> 
     let serialized = serde_json::to_string(&history)?;
     assert!(!serialized.contains("C:/secret"));
     assert!(!serialized.contains("p1"));
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn migration_preview_allows_recovery_from_a_missing_pinned_source() -> TestResult {
+    let (db, path, source, target) = fixture().await?;
+    let store = ActionPlanStore::default();
+    let conn = db.connect()?;
+    conn.execute(
+        "DELETE FROM runtime_profiles WHERE id = ?1",
+        params![source.clone()],
+    )
+    .await?;
+
+    let preview = preview_migration(
+        &db,
+        &store,
+        OWNER,
+        &MigrationRequest {
+            source_profile_id: source,
+            target_profile_id: target,
+            project_ids: vec!["p1".to_owned(), "p1".to_owned()],
+        },
+    )
+    .await?
+    .ok_or("preview")?;
+    assert_eq!(
+        preview.source.state,
+        super::super::policy::RuntimeBindingState::Missing
+    );
+    assert!(preview.can_migrate);
+    assert_eq!(preview.projects.len(), 1);
+    assert!(preview.projects[0].currently_bound_to_source);
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn migration_commit_rejects_target_observation_change() -> TestResult {
+    let (db, path, source, target) = fixture().await?;
+    let store = ActionPlanStore::default();
+    let preview = preview_migration(
+        &db,
+        &store,
+        OWNER,
+        &MigrationRequest {
+            source_profile_id: source.clone(),
+            target_profile_id: target.clone(),
+            project_ids: vec!["p1".to_owned()],
+        },
+    )
+    .await?
+    .ok_or("preview")?;
+    let plan_id = preview.plan_id.ok_or("plan")?;
+    let conn = db.connect()?;
+    conn.execute(
+        "UPDATE runtime_profiles SET observation_revision = observation_revision + 1 WHERE id = ?1",
+        params![target],
+    )
+    .await?;
+
+    assert!(
+        commit_migration(&db, &store, OWNER, &plan_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(binding(&conn, "p1").await?, source);
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn migration_commit_fails_closed_when_active_work_cannot_be_revalidated() -> TestResult {
+    let (db, path, source, target) = fixture().await?;
+    let store = ActionPlanStore::default();
+    let preview = preview_migration(
+        &db,
+        &store,
+        OWNER,
+        &MigrationRequest {
+            source_profile_id: source.clone(),
+            target_profile_id: target,
+            project_ids: vec!["p1".to_owned()],
+        },
+    )
+    .await?
+    .ok_or("preview")?;
+    let plan_id = preview.plan_id.ok_or("plan")?;
+    let conn = db.connect()?;
+    conn.execute("DROP TABLE jobs", ()).await?;
+
+    assert!(
+        commit_migration(&db, &store, OWNER, &plan_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(binding(&conn, "p1").await?, source);
 
     let _ = std::fs::remove_file(path);
     Ok(())
