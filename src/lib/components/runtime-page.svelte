@@ -13,7 +13,6 @@
     forgetRuntimeProfile,
     readRuntimeLogs,
     readRuntimeProfileResources,
-    readRuntimeStatus,
     prepareRuntimeAction,
     prepareRuntimeResourceUpdate,
     setPreferredRuntime,
@@ -45,11 +44,20 @@
     Wrench,
   } from "@lucide/svelte";
 
-  let { onChooseRuntime }: { onChooseRuntime: () => void } = $props();
+  let {
+    runtimeStatus,
+    refreshing,
+    onRecheck,
+    onChooseRuntime,
+  }: {
+    runtimeStatus: RuntimeStatus | undefined;
+    refreshing: boolean;
+    onRecheck: () => Promise<void>;
+    onChooseRuntime: () => void;
+  } = $props();
 
-  let status = $state<RuntimeStatus | null>(null);
   let logs = $state<RuntimeLogLine[]>([]);
-  let loading = $state(false);
+  let logsLoading = $state(false);
   let errorMessage = $state<string | null>(null);
   let expandedProviders = $state<Set<string>>(new Set());
   let ownershipDialogOpen = $state(false);
@@ -75,6 +83,7 @@
     restart: RotateCw,
   } as const;
 
+  const status = $derived(runtimeStatus ?? null);
   const providers = $derived(status?.providers ?? []);
   const runtimePreference = $derived(status?.policy ?? null);
   const pruneEngineId = $derived(
@@ -104,32 +113,35 @@
 
   $effect(() => {
     const controller = new AbortController();
-    void refresh(controller.signal);
+    if (status) {
+      void refreshLogs(controller.signal);
+    } else {
+      logs = [];
+    }
     return () => controller.abort();
   });
 
-  async function refresh(signal?: AbortSignal) {
-    loading = true;
+  async function refreshLogs(signal?: AbortSignal) {
+    logsLoading = true;
     try {
-      const [nextStatus, nextLogs] = await Promise.all([
-        readRuntimeStatus({ signal }),
-        readRuntimeLogs({ signal }),
-      ]);
-      status = nextStatus;
-      logs = nextLogs;
+      logs = await readRuntimeLogs({ signal });
       errorMessage = null;
-      for (const profile of nextStatus.providers
-        .filter((provider) => expandedProviders.has(provider.provider_id))
-        .flatMap((provider) => provider.profiles)
-        .filter((profile) => profile.runtime_class === "built_in")) {
-        void loadResources(profile, signal);
-      }
     } catch (error) {
       if (!signal?.aborted) {
         errorMessage = error instanceof Error ? error.message : String(error);
       }
     } finally {
-      loading = false;
+      logsLoading = false;
+    }
+  }
+
+  async function refreshRuntime() {
+    await onRecheck();
+    for (const profile of providers
+      .filter((provider) => expandedProviders.has(provider.provider_id))
+      .flatMap((provider) => provider.profiles)
+      .filter((profile) => profile.runtime_class === "built_in")) {
+      void loadResources(profile);
     }
   }
 
@@ -176,7 +188,7 @@
 
   async function handleSelect(profile: RuntimeProfile) {
     await setPreferredRuntime(profile.id);
-    await refresh();
+    await refreshRuntime();
   }
 
   function isPreferred(profile: RuntimeProfile): boolean {
@@ -190,7 +202,7 @@
     } catch (error) {
       errorMessage = error instanceof Error ? error.message : String(error);
     }
-    await refresh();
+    await refreshRuntime();
   }
 
   function requestOwnershipAction(profile: RuntimeProfile, action: "forget") {
@@ -352,9 +364,9 @@
         actions. Existing Docker-compatible engines can still be used as the platform default.
       </p>
     </div>
-    <Button size="sm" variant="outline" disabled={loading} onclick={() => refresh()}>
+    <Button size="sm" variant="outline" disabled={refreshing} onclick={refreshRuntime}>
       <RefreshCw />
-      {loading ? "Checking" : "Recheck"}
+      {refreshing ? "Checking" : "Recheck"}
     </Button>
     <Button size="sm" variant="outline" onclick={() => (migrationDialogOpen = true)}>
       <ArrowRightLeft />
@@ -666,7 +678,7 @@
         <TerminalSquare class="size-4 text-muted-foreground" />
         <h4 class="text-sm font-semibold">Runtime logs</h4>
       </div>
-      <Badge variant="outline">{logs.length}</Badge>
+      <Badge variant="outline">{logsLoading ? "…" : logs.length}</Badge>
     </div>
     {#if logs.length === 0}
       <p class="p-4 text-sm text-muted-foreground">No runtime observations recorded.</p>
@@ -689,7 +701,7 @@
   <RuntimeActionDialog
     request={runtimeActionRequest}
     bind:open={runtimeActionDialogOpen}
-    oncompleted={refresh}
+    oncompleted={refreshRuntime}
   />
 
   <Dialog.Root bind:open={ownershipDialogOpen}>
@@ -726,12 +738,12 @@
   <RuntimeMigrationDialog
     profiles={providers.flatMap((provider) => provider.profiles)}
     bind:open={migrationDialogOpen}
-    oncompleted={() => refresh()}
+    oncompleted={refreshRuntime}
   />
   <RuntimeDataScopeDialog
     profile={dataScopeProfile}
     bind:open={dataScopeDialogOpen}
-    oncompleted={() => refresh()}
+    oncompleted={refreshRuntime}
   />
   {#if pruneEngineId}
     <PruneDialog
@@ -740,7 +752,7 @@
         ? `${pruneProfile.display_name} (${pruneProfile.provider_runtime_key})`
         : undefined}
       bind:open={pruneDialogOpen}
-      oncompleted={() => refresh()}
+      oncompleted={refreshRuntime}
     />
   {/if}
 </div>

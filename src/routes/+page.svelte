@@ -175,7 +175,12 @@
       {:else if activeView === "jobs"}
         <JobsPage projects={daemonState.projects} />
       {:else if activeView === "runtime"}
-        <RuntimePage onChooseRuntime={openRuntimeSetup} />
+        <RuntimePage
+          runtimeStatus={daemonState.runtimeStatus}
+          refreshing={daemonState.refreshing}
+          onRecheck={daemonState.refresh}
+          onChooseRuntime={openRuntimeSetup}
+        />
       {:else if activeView === "artifacts"}
         <ArtifactsPage
           profiles={daemonState.runtimeProfiles}
