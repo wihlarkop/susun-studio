@@ -269,7 +269,12 @@ export type ProjectRuntimeImpactPreview = {
   impact_fingerprint: string;
 };
 
-export type RuntimeCompatibilityLevel = "supported" | "limited" | "unsupported" | "unavailable" | "unknown";
+export type RuntimeCompatibilityLevel =
+  | "supported"
+  | "limited"
+  | "unsupported"
+  | "unavailable"
+  | "unknown";
 
 export type RuntimeWorkflowCompatibility = {
   id: string;
@@ -813,7 +818,7 @@ export async function previewPreferredRuntime(
 
 export async function setPreferredRuntime(
   preferredProfileId: string | null,
-  expectedImpactFingerprint: string,
+  expectedImpactFingerprint?: string,
   options: DaemonRequestOptions = {},
 ): Promise<RuntimePreference> {
   return readJson("/v1/runtime/policy", {
@@ -1145,7 +1150,7 @@ export async function readRuntimeUninstallPolicy(
 export async function setProjectEngine(
   projectId: string,
   runtimeProfileId: string | null,
-  expectedImpactFingerprint: string,
+  expectedImpactFingerprint?: string,
   options: DaemonRequestOptions = {},
 ): Promise<StudioProject> {
   return readJson(`/v1/projects/${encodeURIComponent(projectId)}/engine`, {
