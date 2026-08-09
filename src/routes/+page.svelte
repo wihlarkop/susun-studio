@@ -161,7 +161,6 @@
         />
         <ProjectsTable
           projects={daemonState.projects}
-          profiles={daemonState.runtimeProfiles}
           workspaceDetail={daemonState.workspaceDetail}
           selectedId={selectedProject?.id ?? null}
           onSelect={(project) => selectProject(project.id)}
