@@ -206,14 +206,21 @@
   }
 
   function openTrayRuntimeAction(actionId: "start" | "stop") {
-    const profile = managedBuiltIn;
+    const selectedProfileId = runtimePreference?.binding.profile_id;
+    const profile = selectedProfileId
+      ? profileEntries.find((entry) => entry.profile.id === selectedProfileId)?.profile
+      : undefined;
     const provider = profile
       ? providers.find((candidate) => candidate.provider_id === profile.provider_id)
       : undefined;
     const action = provider?.actions.find(
       (candidate) => candidate.id === actionId && candidate.enabled,
     );
-    if (!profile || !provider || !action) {
+    const selectedBuiltIn =
+      profile?.runtime_class === "built_in" &&
+      profile.ownership_state === "studio_managed" &&
+      runtimePreference?.binding.runtime_class === "built_in";
+    if (!selectedBuiltIn || !profile || !provider || !action) {
       errorMessage = "The requested built-in runtime action is no longer available.";
       return;
     }
