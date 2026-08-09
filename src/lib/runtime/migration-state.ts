@@ -1,6 +1,7 @@
 import type {
   RuntimeMigrationInventory,
   RuntimeMigrationInventoryProfile,
+  RuntimeMigrationHistory,
   RuntimeMigrationPreview,
   RuntimeMigrationResult,
   RuntimeMigrationRollbackPreview,
@@ -73,6 +74,24 @@ export const migrationExcludedCategories = [
   "runtime_ownership",
   "project_files",
 ] as const;
+
+export const externalRuntimeMigrationDocsPath = "docs/public/external-runtime-migration.md";
+
+export type MigrationHistoryPresentationEntry = {
+  migrationId: string;
+  status: "completed" | "failed" | "rolled_back" | "unknown";
+  recovery: "available" | "blocked" | "not_applicable";
+  statusLabel: string;
+  sourceLabel: "Recorded source runtime";
+  targetLabel: "Recorded target runtime";
+  projectCount: number;
+  skippedLabels: string[];
+  failureLabels: string[];
+  canPrepareRollback: boolean;
+  createdAtMs: number;
+  completedAtMs: number;
+  rolledBackAtMs: number | null;
+};
 
 export function createMigrationState(): MigrationState {
   return {
@@ -251,6 +270,25 @@ export function beginRollbackPreview(state: MigrationState): MigrationState {
     rollbackExpiresAtMs: null,
     rollbackConfirmed: false,
     error: null,
+  };
+}
+
+export function beginHistoryRollback(state: MigrationState, migrationId: string): MigrationState {
+  return {
+    ...createMigrationState(),
+    phase: "rollback_previewing",
+    generation: state.generation + 1,
+    workflow: "migrate",
+    result: {
+      migration_id: migrationId,
+      status: "completed",
+      source_profile_id: "",
+      target_profile_id: "",
+      project_count: 0,
+      skipped_items: [],
+      failures: [],
+      rollback_available: true,
+    },
   };
 }
 
@@ -513,6 +551,39 @@ export function migrationConfirmationDetails(preview: RuntimeMigrationPreview): 
   };
 }
 
+export function migrationHistoryPresentation(
+  history: RuntimeMigrationHistory,
+): MigrationHistoryPresentationEntry[] {
+  return history.entries
+    .slice()
+    .sort((left, right) => right.created_at_ms - left.created_at_ms)
+    .slice(0, 50)
+    .map((entry) => {
+      const canPrepareRollback = entry.status === "completed" && entry.rollback_available;
+      const recovery =
+        entry.status === "completed"
+          ? canPrepareRollback
+            ? "available"
+            : "blocked"
+          : "not_applicable";
+      return {
+        migrationId: entry.migration_id,
+        status: entry.status,
+        recovery,
+        statusLabel: migrationHistoryStatusLabel(entry.status, recovery),
+        sourceLabel: "Recorded source runtime",
+        targetLabel: "Recorded target runtime",
+        projectCount: entry.project_count,
+        skippedLabels: entry.skipped_categories.map(migrationCategoryLabel),
+        failureLabels: entry.failure_codes.map(migrationFailureLabel),
+        canPrepareRollback,
+        createdAtMs: entry.created_at_ms,
+        completedAtMs: entry.completed_at_ms,
+        rolledBackAtMs: entry.rolled_back_at_ms,
+      };
+    });
+}
+
 export function canAcceptMigrationResponse(
   state: MigrationState,
   responseGeneration: number,
@@ -543,6 +614,57 @@ export function boundedRollbackBlocker(blocker: string | null): string {
       return "Rollback is no longer available because the recorded bindings changed.";
     default:
       return "Rollback is not available for the current migration state.";
+  }
+}
+
+function migrationHistoryStatusLabel(
+  status: MigrationHistoryPresentationEntry["status"],
+  recovery: MigrationHistoryPresentationEntry["recovery"],
+): string {
+  if (status === "completed" && recovery === "available") return "Completed - rollback available";
+  if (status === "completed" && recovery === "blocked") return "Completed - rollback unavailable";
+  if (status === "rolled_back") return "Rolled back";
+  if (status === "failed") return "Failed";
+  return "Unknown historical state";
+}
+
+function migrationCategoryLabel(category: string): string {
+  switch (category) {
+    case "images":
+      return "Images were not copied.";
+    case "containers":
+      return "Containers were not copied.";
+    case "volumes":
+      return "Volumes were not copied.";
+    case "networks":
+      return "Networks were not copied.";
+    case "registry_credentials":
+      return "Registry credentials were not copied.";
+    case "runtime_settings":
+      return "Runtime settings were not copied.";
+    case "runtime_ownership":
+      return "Runtime ownership was not transferred.";
+    case "project_files":
+      return "Project files were not copied.";
+    default:
+      return "Additional runtime data was not copied.";
+  }
+}
+
+function migrationFailureLabel(code: string): string {
+  switch (code) {
+    case "stale_preview":
+      return "The migration context changed before commit.";
+    case "active_work":
+      return "Active work prevented the migration.";
+    case "target_missing":
+      return "The target runtime was no longer available.";
+    case "target_incompatible":
+      return "The target runtime was no longer compatible.";
+    case "binding_race":
+      return "Project bindings changed before commit.";
+    default:
+      return "The migration failed before bindings changed.";
   }
 }
 

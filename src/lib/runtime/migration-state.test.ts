@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type {
   RuntimeMigrationInventory,
+  RuntimeMigrationHistory,
   RuntimeMigrationPreview,
   RuntimeMigrationRollbackPreview,
 } from "$lib/daemon/client";
@@ -13,6 +14,7 @@ import {
   beginMigrationCommit,
   beginMigrationInventory,
   beginMigrationPreview,
+  beginHistoryRollback,
   beginRollbackCommit,
   beginRollbackPreview,
   boundedMigrationError,
@@ -29,6 +31,8 @@ import {
   migrationConfirmationDetails,
   migrationExcludedCategories,
   invalidateMigrationForRuntimeRefresh,
+  migrationHistoryPresentation,
+  externalRuntimeMigrationDocsPath,
   migrationProjectsForSource,
   updateMigrationSelection,
 } from "./migration-state";
@@ -376,5 +380,133 @@ describe("runtime migration state", () => {
       rollbackConfirmed: false,
     });
     expect(canCommitRollback(refreshedRollback, 1_003)).toBe(false);
+  });
+
+  it("renders bounded migration history newest first without current-profile reconstruction", () => {
+    const history = {
+      entries: [
+        {
+          migration_id: "older",
+          source_profile_id: "old-source",
+          target_profile_id: "old-target",
+          status: "completed",
+          project_count: 2,
+          skipped_categories: ["images", "runtime_ownership"],
+          failure_codes: [],
+          rollback_available: false,
+          created_at_ms: 1,
+          completed_at_ms: 2,
+          rolled_back_at_ms: null,
+        },
+        {
+          migration_id: "newer",
+          source_profile_id: "new-source",
+          target_profile_id: "new-target",
+          status: "completed",
+          project_count: 1,
+          skipped_categories: ["volumes"],
+          failure_codes: [],
+          rollback_available: true,
+          created_at_ms: 3,
+          completed_at_ms: 4,
+          rolled_back_at_ms: null,
+        },
+        {
+          migration_id: "failed",
+          source_profile_id: "failed-source",
+          target_profile_id: "failed-target",
+          status: "failed",
+          project_count: 1,
+          skipped_categories: [],
+          failure_codes: ["stale_preview", "raw error C:/secret"],
+          rollback_available: false,
+          created_at_ms: 2,
+          completed_at_ms: 2,
+          rolled_back_at_ms: null,
+        },
+        {
+          migration_id: "rolled-back",
+          source_profile_id: "rollback-source",
+          target_profile_id: "rollback-target",
+          status: "rolled_back",
+          project_count: 1,
+          skipped_categories: [],
+          failure_codes: [],
+          rollback_available: false,
+          created_at_ms: 0,
+          completed_at_ms: 1,
+          rolled_back_at_ms: 5,
+        },
+      ],
+    } as RuntimeMigrationHistory;
+    const originalOrder = history.entries.map((entry) => entry.migration_id);
+    const entries = migrationHistoryPresentation(history);
+
+    expect(entries.map((entry) => entry.migrationId)).toEqual([
+      "newer",
+      "failed",
+      "older",
+      "rolled-back",
+    ]);
+    expect(history.entries.map((entry) => entry.migration_id)).toEqual(originalOrder);
+    expect(entries[0]).toMatchObject({ status: "completed", recovery: "available" });
+    expect(entries[1]).toMatchObject({ status: "failed", recovery: "not_applicable" });
+    expect(entries[2]).toMatchObject({ status: "completed", recovery: "blocked" });
+    expect(entries[3]).toMatchObject({ status: "rolled_back", recovery: "not_applicable" });
+    expect(entries[0].sourceLabel).toBe("Recorded source runtime");
+    expect(entries[0].targetLabel).toBe("Recorded target runtime");
+    expect(entries[1].failureLabels).toEqual([
+      "The migration context changed before commit.",
+      "The migration failed before bindings changed.",
+    ]);
+    expect(entries[1].failureLabels.join(" ")).not.toContain("secret");
+  });
+
+  it("offers recovery only when daemon history retains rollback and keeps documentation local", () => {
+    const history = {
+      entries: [
+        {
+          migration_id: "available",
+          source_profile_id: "source",
+          target_profile_id: "target",
+          status: "completed",
+          project_count: 1,
+          skipped_categories: [],
+          failure_codes: [],
+          rollback_available: true,
+          created_at_ms: 2,
+          completed_at_ms: 2,
+          rolled_back_at_ms: null,
+        },
+        {
+          migration_id: "blocked",
+          source_profile_id: "source",
+          target_profile_id: "target",
+          status: "completed",
+          project_count: 1,
+          skipped_categories: [],
+          failure_codes: [],
+          rollback_available: false,
+          created_at_ms: 1,
+          completed_at_ms: 1,
+          rolled_back_at_ms: null,
+        },
+      ],
+    } as RuntimeMigrationHistory;
+    const [available, blocked] = migrationHistoryPresentation(history);
+    expect(available.canPrepareRollback).toBe(true);
+    expect(blocked.canPrepareRollback).toBe(false);
+    expect(externalRuntimeMigrationDocsPath).toBe("docs/public/external-runtime-migration.md");
+    expect(externalRuntimeMigrationDocsPath).not.toMatch(/^https?:/);
+  });
+
+  it("opens historical recovery directly into a rollback preview without recreating migration selection", () => {
+    const recovery = beginHistoryRollback(createMigrationState(), "migration-a");
+    expect(recovery).toMatchObject({
+      workflow: "migrate",
+      phase: "rollback_previewing",
+      result: { migration_id: "migration-a", rollback_available: true },
+      preview: null,
+    });
   });
 });

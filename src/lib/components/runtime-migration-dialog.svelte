@@ -22,6 +22,7 @@
     beginMigrationCommit,
     beginMigrationInventory,
     beginMigrationPreview,
+    beginHistoryRollback,
     beginRollbackCommit,
     beginRollbackPreview,
     boundedMigrationError,
@@ -49,11 +50,15 @@
     open = $bindable(false),
     oncompleted,
     onconnect,
+    rollbackMigrationId = null,
+    onhistoryrollbackhandled,
   }: {
     profiles: RuntimeProfile[];
     open?: boolean;
     oncompleted: () => void | Promise<void>;
     onconnect: (profileId: string) => void;
+    rollbackMigrationId?: string | null;
+    onhistoryrollbackhandled?: () => void;
   } = $props();
 
   let migrationState = $state(createMigrationState());
@@ -62,6 +67,7 @@
   let wasOpen = false;
   let previousProfileRevision = "";
   let hasProfileRevision = false;
+  let lastHistoryRollbackId: string | null = null;
 
   const profileRevision = $derived(
     profiles
@@ -95,6 +101,17 @@
     abortActiveRequest();
     migrationState = open ? resetMigrationDialog(migrationState) : cancelMigration(migrationState);
     connectProfileId = "";
+    if (!open) lastHistoryRollbackId = null;
+  });
+
+  $effect(() => {
+    const migrationId = rollbackMigrationId;
+    if (!open || !migrationId || migrationId === lastHistoryRollbackId) return;
+    lastHistoryRollbackId = migrationId;
+    onhistoryrollbackhandled?.();
+    abortActiveRequest();
+    migrationState = beginHistoryRollback(migrationState, migrationId);
+    void prepareRollback();
   });
 
   // Shared daemon refreshes invalidate a preview, but do not create component polling.
@@ -348,8 +365,9 @@
             <p class="rounded-md border p-3 text-muted-foreground">No selectable external runtime is available.</p>
           {/if}
         </div>
-      {:else if migrationState.workflow === "migrate" && inventory}
+      {:else if migrationState.workflow === "migrate"}
         <div class="grid gap-4">
+          {#if inventory}
           <div class="grid gap-3 sm:grid-cols-[1fr_auto_1fr] sm:items-end">
             <label class="grid gap-1 font-medium">
               Source runtime
@@ -433,6 +451,7 @@
                 <span>{migrationExcludedCategories.map((category) => category.replaceAll("_", " ")).join(", ")}</span>
               </div>
             </div>
+          {/if}
           {/if}
 
           {#if migrationState.phase === "committed" && migrationState.result}

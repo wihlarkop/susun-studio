@@ -4,6 +4,7 @@
   import { Badge } from "$lib/components/ui/badge/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
   import RuntimeMigrationDialog from "$lib/components/runtime-migration-dialog.svelte";
+  import RuntimeMigrationHistory from "$lib/components/runtime-migration-history.svelte";
   import RuntimeDataScopeDialog from "$lib/components/runtime-data-scope-dialog.svelte";
   import RuntimeActionDialog from "$lib/components/runtime-action-dialog.svelte";
   import RuntimeActionAudit from "$lib/components/runtime-action-audit.svelte";
@@ -76,6 +77,7 @@
   let runtimeActionRequest = $state<RuntimeActionDialogRequest | null>(null);
   let runtimeActionDialogOpen = $state(false);
   let migrationDialogOpen = $state(false);
+  let historyRollbackMigrationId = $state<string | null>(null);
   let dataScopeDialogOpen = $state(false);
   let dataScopeProfile = $state<RuntimeProfile | null>(null);
   let pruneDialogOpen = $state(false);
@@ -126,6 +128,12 @@
   );
   const profileEntries = $derived(
     providers.flatMap((provider) => provider.profiles.map((profile) => ({ profile, provider }))),
+  );
+  const migrationProfileRevision = $derived(
+    profileEntries
+      .map((entry) => `${entry.profile.id}:${entry.profile.observation_revision}`)
+      .sort()
+      .join("|"),
   );
   const builtInEntries = $derived(
     profileEntries.filter((entry) => entry.profile.runtime_class === "built_in"),
@@ -179,6 +187,11 @@
       .filter((profile) => profile.runtime_class === "built_in")) {
       void loadResources(profile);
     }
+  }
+
+  function prepareHistoryRollback(migrationId: string) {
+    historyRollbackMigrationId = migrationId;
+    migrationDialogOpen = true;
   }
 
   async function loadResources(profile: RuntimeProfile, signal?: AbortSignal) {
@@ -811,6 +824,11 @@
 
   <RuntimeActionAudit />
 
+  <RuntimeMigrationHistory
+    profileRevision={migrationProfileRevision}
+    onprepareRollback={prepareHistoryRollback}
+  />
+
   <RuntimeActionDialog
     request={runtimeActionRequest}
     bind:open={runtimeActionDialogOpen}
@@ -853,6 +871,8 @@
     bind:open={migrationDialogOpen}
     oncompleted={refreshRuntime}
     onconnect={(profileId) => onContextChange({ kind: "preference", profileId })}
+    rollbackMigrationId={historyRollbackMigrationId}
+    onhistoryrollbackhandled={() => (historyRollbackMigrationId = null)}
   />
   <RuntimeDataScopeDialog
     profile={dataScopeProfile}
