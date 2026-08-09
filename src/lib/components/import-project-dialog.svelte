@@ -5,6 +5,8 @@
   import { Badge } from "$lib/components/ui/badge/index.js";
   import { ChevronDown, FolderOpen, X } from "@lucide/svelte";
   import { displayPath } from "$lib/utils";
+  import RuntimeIdentity from "./runtime-identity.svelte";
+  import { presentRuntimeBinding, presentRuntimeProfile } from "$lib/runtime/presentation";
   import type {
     ImportProjectRequest,
     ImportProjectResponse,
@@ -34,6 +36,20 @@
   let submitting = $state(false);
   let errorMessage = $state<string | null>(null);
   let lastResult = $state<ImportProjectResponse | null>(null);
+  const selectableProfiles = $derived(
+    runtimeProfiles.filter(
+      (profile) => profile.availability_state === "available" && profile.management.can_select,
+    ),
+  );
+  const builtInProfiles = $derived(
+    selectableProfiles.filter((profile) => profile.runtime_class === "built_in"),
+  );
+  const externalProfiles = $derived(
+    selectableProfiles.filter((profile) => profile.runtime_class !== "built_in"),
+  );
+  const selectedProfile = $derived(
+    selectableProfiles.find((profile) => profile.id === engineProfileId) ?? null,
+  );
 
   function resetForm() {
     files = [];
@@ -111,10 +127,6 @@
         runtime_profile_id: engineProfileId || null,
       });
       lastResult = response;
-      if (response.project) {
-        open = false;
-        resetForm();
-      }
     } catch (error) {
       errorMessage = error instanceof Error ? error.message : "Import failed";
     } finally {
@@ -207,21 +219,35 @@
       </label>
 
       <label class="flex flex-col gap-1 text-sm">
-        <span class="font-medium">Engine (optional)</span>
+        <span class="font-medium">Runtime (optional)</span>
         <div class="relative">
           <select
             class="h-9 w-full appearance-none rounded-md border bg-background bg-none pr-8 pl-3 text-sm"
             bind:value={engineProfileId}
           >
-            <option value="">Use global preference</option>
-            {#each runtimeProfiles as profile (profile.id)}
-              <option value={profile.id}>{profile.display_name}</option>
-            {/each}
+            <option value="">Use preferred runtime</option>
+            {#if builtInProfiles.length > 0}
+              <optgroup label="Susun Runtime">
+                {#each builtInProfiles as profile (profile.id)}
+                  <option value={profile.id}>{presentRuntimeProfile(profile).title}</option>
+                {/each}
+              </optgroup>
+            {/if}
+            {#if externalProfiles.length > 0}
+              <optgroup label="Existing runtimes">
+                {#each externalProfiles as profile (profile.id)}
+                  <option value={profile.id}>{presentRuntimeProfile(profile).title}</option>
+                {/each}
+              </optgroup>
+            {/if}
           </select>
           <ChevronDown
             class="pointer-events-none absolute top-1/2 right-2 size-4 -translate-y-1/2 text-muted-foreground"
           />
         </div>
+        {#if selectedProfile}
+          <RuntimeIdentity presentation={presentRuntimeProfile(selectedProfile)} compact />
+        {/if}
       </label>
 
       {#if errorMessage}
@@ -235,9 +261,19 @@
         </p>
       {/if}
 
+      {#if lastResult?.project}
+        <div class="space-y-2 rounded-md border bg-muted/20 p-3 text-sm">
+          <p class="font-medium">Imported {lastResult.project.name}</p>
+          <RuntimeIdentity
+            presentation={presentRuntimeBinding(lastResult.project.runtime_binding)}
+            compact
+          />
+        </div>
+      {/if}
+
       <Dialog.Footer>
-        <Button type="button" variant="outline" onclick={() => (open = false)}>Cancel</Button>
-        <Button type="submit" disabled={!connected || submitting}>
+        <Button type="button" variant="outline" onclick={() => { open = false; resetForm(); }}>Close</Button>
+        <Button type="submit" disabled={!connected || submitting || Boolean(lastResult?.project)}>
           {submitting ? "Importing…" : "Import"}
         </Button>
       </Dialog.Footer>

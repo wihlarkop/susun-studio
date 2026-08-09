@@ -36,6 +36,8 @@ export function createDaemonState() {
   let runtimeStatus = $state<RuntimeStatus | undefined>(undefined);
   let runtimeOnboarding = $state<RuntimeOnboardingState | undefined>(undefined);
   let settings = $state<StudioSettings | undefined>(undefined);
+  let refreshing = $state(false);
+  let refreshGeneration = 0;
   let workspaceDetail = $state(
     "Persisted projects will appear here after the daemon API is wired.",
   );
@@ -47,6 +49,9 @@ export function createDaemonState() {
   }
 
   async function refresh(signal?: AbortSignal) {
+    const generation = ++refreshGeneration;
+    refreshing = true;
+
     try {
       const health = await readDaemonHealth(getDaemonBaseUrl(), signal);
       const [projectList, daemonSettings, nextRuntimeStatus, nextRuntimeOnboarding] =
@@ -56,6 +61,10 @@ export function createDaemonState() {
           readRuntimeStatus({ signal }),
           readRuntimeOnboarding({ signal }),
         ]);
+
+      if (signal?.aborted || generation !== refreshGeneration) {
+        return;
+      }
 
       projects = projectList;
       settings = daemonSettings;
@@ -70,7 +79,7 @@ export function createDaemonState() {
         health,
       };
     } catch (error) {
-      if (signal?.aborted) {
+      if (signal?.aborted || generation !== refreshGeneration) {
         return;
       }
 
@@ -85,6 +94,10 @@ export function createDaemonState() {
         label: "Disconnected",
         detail: error instanceof Error ? error.message : "Daemon health request failed",
       };
+    } finally {
+      if (generation === refreshGeneration) {
+        refreshing = false;
+      }
     }
   }
 
@@ -143,6 +156,9 @@ export function createDaemonState() {
     },
     get runtimeOnboarding() {
       return runtimeOnboarding;
+    },
+    get refreshing() {
+      return refreshing;
     },
     get settings() {
       return settings;

@@ -25,6 +25,8 @@
   } from "$lib/artifacts/scoped-fetch";
   import { isBuildJobActive, isImageBuildResult, visibleBuildProgress } from "$lib/jobs/build-job";
   import { relativeTime } from "$lib/utils";
+  import RuntimeIdentity from "./runtime-identity.svelte";
+  import { presentRuntimeBinding } from "$lib/runtime/presentation";
 
   let {
     engineId,
@@ -33,6 +35,9 @@
   }: { engineId: string; connected: boolean; projects: StudioProject[] } = $props();
 
   let selectedProjectId = $state<string | null>(null);
+  const selectedProject = $derived(
+    projects.find((project) => project.id === selectedProjectId) ?? null,
+  );
   let targetsState = $state(initialScopedFetchState<BuildTargetsResponse>());
   let buildsState = $state(initialScopedFetchState<StudioJob[]>());
   let expandedId = $state<string | null>(null);
@@ -246,6 +251,15 @@
       </Button>
     {/if}
   </div>
+
+  {#if selectedProject}
+    <div class="rounded-md border bg-muted/20 p-3">
+      <div class="text-xs text-muted-foreground">Project runtime</div>
+      <div class="mt-1 min-w-0">
+        <RuntimeIdentity presentation={presentRuntimeBinding(selectedProject.runtime_binding)} compact />
+      </div>
+    </div>
+  {/if}
 
   {#if !selectedProjectId}
     <p class="text-sm text-muted-foreground">

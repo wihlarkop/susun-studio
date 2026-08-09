@@ -10,6 +10,9 @@
   import LogsViewer from "./logs-viewer.svelte";
   import EventsViewer from "./events-viewer.svelte";
   import { setProjectEngine, type RuntimeProfile, type StudioProject } from "$lib/daemon/client";
+  import RuntimeIdentity from "./runtime-identity.svelte";
+  import { presentRuntimeBinding } from "$lib/runtime/presentation";
+  import { presentProjectBinding } from "$lib/runtime/project-binding-state";
   import { ChevronDown } from "@lucide/svelte";
 
   let {
@@ -25,9 +28,22 @@
   let showLogs = $state(false);
   let logsAutoStartToken = $state(0);
   let bindingBusy = $state(false);
+  let bindingSelect = $state<HTMLSelectElement | null>(null);
 
-  const bindingBroken = $derived(
-    project?.runtime_binding.source === "project_pin" && project.runtime_binding.state !== "ready",
+  const bindingView = $derived(
+    project ? presentProjectBinding(project.runtime_binding) : null,
+  );
+  const bindingBlocked = $derived(bindingView?.blocked ?? false);
+  const selectableProfiles = $derived(
+    profiles.filter(
+      (profile) => profile.availability_state === "available" && profile.management.can_select,
+    ),
+  );
+  const builtInProfiles = $derived(
+    selectableProfiles.filter((profile) => profile.runtime_class === "built_in"),
+  );
+  const externalProfiles = $derived(
+    selectableProfiles.filter((profile) => profile.runtime_class !== "built_in"),
   );
 
   function handleJobFinished() {
@@ -48,53 +64,89 @@
   }
 </script>
 
-{#if project}
-  <div class="flex flex-wrap items-center gap-2 text-sm">
-    <span class="text-muted-foreground">Engine:</span>
-    <div class="relative">
+{#if project && bindingView}
+  <div class="flex flex-col gap-3 rounded-md border p-3 text-sm">
+    <div class="flex flex-wrap items-center gap-2">
+      <span class="text-muted-foreground">Runtime:</span>
+      <RuntimeIdentity presentation={presentRuntimeBinding(project.runtime_binding)} compact />
+    </div>
+    <div class="flex flex-wrap items-center gap-2">
+      <span class="text-muted-foreground">{bindingView.selectorLabel}:</span>
+      <div class="relative">
       <select
+        bind:this={bindingSelect}
         class="h-8 appearance-none rounded-md border bg-background bg-none pr-8 pl-3 text-sm"
         disabled={bindingBusy}
         value={project.runtime_profile_id ?? ""}
         onchange={changeBinding}
-        aria-label="Project engine binding"
+        aria-label="Project runtime binding"
       >
-        <option value="">Use global preference</option>
-        {#each profiles as profile (profile.id)}
-          <option value={profile.id}>{profile.display_name}</option>
-        {/each}
+        <option value="">Use preferred runtime</option>
+        {#if builtInProfiles.length > 0}
+          <optgroup label="Susun Runtime">
+            {#each builtInProfiles as profile (profile.id)}
+              <option value={profile.id}>{profile.display_name}</option>
+            {/each}
+          </optgroup>
+        {/if}
+        {#if externalProfiles.length > 0}
+          <optgroup label="Existing runtimes">
+            {#each externalProfiles as profile (profile.id)}
+              <option value={profile.id}>{profile.display_name}</option>
+            {/each}
+          </optgroup>
+        {/if}
       </select>
       <ChevronDown
         class="pointer-events-none absolute top-1/2 right-2 size-4 -translate-y-1/2 text-muted-foreground"
       />
+      </div>
+      {#if bindingView.canClear}
+        <Button size="sm" variant="ghost" disabled={bindingBusy} onclick={() => bindingSelect?.focus()}>
+          Change runtime
+        </Button>
+      {/if}
     </div>
-    {#if bindingBroken}
-      <Badge variant="destructive" class="text-xs">
-        Pinned runtime unavailable; project actions are blocked until it returns or you change the pin.
-      </Badge>
+    {#if bindingBlocked}
+      <div class="flex flex-wrap items-center gap-2 text-destructive">
+        <Badge variant="destructive">Actions blocked</Badge>
+        <span>{bindingView.blockedReason}</span>
+      </div>
     {/if}
   </div>
 
   <Tabs.Root value="overview" class="w-full">
     <Tabs.List>
       <Tabs.Trigger value="overview">Overview</Tabs.Trigger>
-      <Tabs.Trigger value="services">Services</Tabs.Trigger>
+      <Tabs.Trigger value="services" disabled={bindingBlocked}>Services</Tabs.Trigger>
       <Tabs.Trigger value="events">Events</Tabs.Trigger>
     </Tabs.List>
     <Tabs.Content value="overview" class="flex flex-col gap-6 pt-4">
       <ProjectDetail {project} />
-      <PlanningPanel {project} />
+      {#if bindingBlocked}
+        <p class="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
+          Runtime-backed planning is unavailable until you change or recover this runtime binding.
+        </p>
+      {:else}
+        <PlanningPanel {project} />
+      {/if}
     </Tabs.Content>
     <Tabs.Content value="services" class="flex flex-col gap-4 pt-4">
-      <JobPanel {project} onJobFinished={handleJobFinished} />
-      <Button size="sm" variant="ghost" class="self-start" onclick={() => (showLogs = !showLogs)}>
-        {showLogs ? "Hide logs" : "Show logs"}
-      </Button>
-      {#if showLogs}
-        <LogsViewer {project} autoStartToken={logsAutoStartToken} />
+      {#if bindingBlocked}
+        <p class="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
+          Service actions are blocked until you change or recover this runtime binding.
+        </p>
+      {:else}
+        <JobPanel {project} onJobFinished={handleJobFinished} />
+        <Button size="sm" variant="ghost" class="self-start" onclick={() => (showLogs = !showLogs)}>
+          {showLogs ? "Hide logs" : "Show logs"}
+        </Button>
+        {#if showLogs}
+          <LogsViewer {project} autoStartToken={logsAutoStartToken} />
+        {/if}
+        <WatchPanel {project} />
+        <ServicesPanel {project} />
       {/if}
-      <WatchPanel {project} />
-      <ServicesPanel {project} />
     </Tabs.Content>
     <Tabs.Content value="events" class="pt-4">
       <EventsViewer {project} />

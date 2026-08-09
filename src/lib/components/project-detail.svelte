@@ -4,6 +4,8 @@
   import { Separator } from "$lib/components/ui/separator/index.js";
   import { displayPath, formatTimestamp, relativeTime } from "$lib/utils";
   import type { StudioProject } from "$lib/daemon/client";
+  import RuntimeIdentity from "./runtime-identity.svelte";
+  import { presentRuntimeBinding } from "$lib/runtime/presentation";
 
   let { project }: { project: StudioProject | null } = $props();
 </script>
@@ -34,6 +36,11 @@
     <Separator />
 
     <Card.Content class="flex flex-col gap-4 p-4">
+      <div class="space-y-1">
+        <span class="text-xs text-muted-foreground">Runtime binding</span>
+        <RuntimeIdentity presentation={presentRuntimeBinding(project.runtime_binding)} compact />
+      </div>
+
       {#if project.summary}
         {@const summary = project.summary}
         <div class="grid grid-cols-2 gap-3 text-sm sm:grid-cols-5">

@@ -1,4 +1,5 @@
 import type { RuntimeBindingSummary } from "$lib/daemon/client";
+import { isRuntimeBindingRequestable } from "$lib/runtime/presentation";
 
 /**
  * Matches the daemon's `PLATFORM_DEFAULT_ENGINE_ID`: used only for the
@@ -13,9 +14,13 @@ export const PLATFORM_DEFAULT_ENGINE_ID = "engine-docker-local";
  * silently sending work to the platform default.
  */
 export function resolveActiveEngineId(binding: RuntimeBindingSummary): string | null {
-  if (binding.source === "platform_default" && binding.state === "unconfigured") {
+  if (!isRuntimeBindingRequestable(binding)) {
+    return null;
+  }
+
+  if (binding.source === "platform_default") {
     return PLATFORM_DEFAULT_ENGINE_ID;
   }
 
-  return binding.state === "ready" ? binding.profile_id : null;
+  return binding.profile_id;
 }

@@ -6,31 +6,24 @@
   import { Button } from "$lib/components/ui/button/index.js";
   import { Trash2 } from "@lucide/svelte";
   import RemoveProjectDialog from "./remove-project-dialog.svelte";
+  import RuntimeIdentity from "./runtime-identity.svelte";
   import { cn, displayPath, formatTimestamp, relativeTime } from "$lib/utils";
-  import type { RuntimeProfile, StudioProject } from "$lib/daemon/client";
+  import type { StudioProject } from "$lib/daemon/client";
+  import { presentRuntimeBinding } from "$lib/runtime/presentation";
 
   let {
     projects,
-    profiles,
     workspaceDetail,
     selectedId,
     onSelect,
     onRemoved,
   }: {
     projects: StudioProject[];
-    profiles: RuntimeProfile[];
     workspaceDetail: string;
     selectedId: string | null;
     onSelect: (project: StudioProject) => void;
     onRemoved: (projectId: string) => void;
   } = $props();
-
-  const profilesById = $derived(new Map(profiles.map((profile) => [profile.id, profile])));
-
-  function engineLabel(project: StudioProject): string {
-    if (!project.runtime_profile_id) return "Active";
-    return profilesById.get(project.runtime_profile_id)?.display_name ?? "Missing engine";
-  }
 
   let removeTarget = $state<StudioProject | null>(null);
   let removeDialogOpen = $state(false);
@@ -81,7 +74,7 @@
           <Table.Head>Name</Table.Head>
           <Table.Head>Path</Table.Head>
           <Table.Head class="text-right">Services</Table.Head>
-          <Table.Head>Engine</Table.Head>
+          <Table.Head>Runtime</Table.Head>
           <Table.Head>Status</Table.Head>
           <Table.Head class="w-10"></Table.Head>
         </Table.Row>
@@ -123,16 +116,7 @@
                   {project.summary ? project.summary.service_count : "—"}
                 </Table.Cell>
                 <Table.Cell>
-                  <Badge
-                    variant={project.runtime_profile_id
-                      ? profilesById.has(project.runtime_profile_id)
-                        ? "secondary"
-                        : "destructive"
-                      : "outline"}
-                    class="text-xs"
-                  >
-                    {engineLabel(project)}
-                  </Badge>
+                  <RuntimeIdentity presentation={presentRuntimeBinding(project.runtime_binding)} compact />
                 </Table.Cell>
                 <Table.Cell>
                   {#if project.has_errors === null}
