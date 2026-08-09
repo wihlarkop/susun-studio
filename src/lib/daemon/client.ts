@@ -244,6 +244,31 @@ export type RuntimePreference = {
   binding: RuntimeBindingSummary;
 };
 
+export type RuntimePreferenceImpactPreview = {
+  current: RuntimeBindingSummary;
+  target: RuntimeBindingSummary;
+  inheriting_project_count: number;
+  explicitly_pinned_project_count: number;
+  affected_active_jobs: number;
+  affected_active_watch_sessions: number;
+  change_allowed: boolean;
+  reason_code: string | null;
+  is_noop: boolean;
+  impact_fingerprint: string;
+};
+
+export type ProjectRuntimeImpactPreview = {
+  project_id: string;
+  current: RuntimeBindingSummary;
+  target: RuntimeBindingSummary;
+  affected_active_jobs: number;
+  affected_active_watch_sessions: number;
+  change_allowed: boolean;
+  reason_code: string | null;
+  is_noop: boolean;
+  impact_fingerprint: string;
+};
+
 export type RuntimeOnboardingChoice = "built_in" | "existing";
 
 export type RuntimeOnboardingState = {
@@ -747,14 +772,29 @@ export async function readRuntimePolicy(
   return readJson("/v1/runtime/policy", options);
 }
 
+export async function previewPreferredRuntime(
+  preferredProfileId: string | null,
+  options: DaemonRequestOptions = {},
+): Promise<RuntimePreferenceImpactPreview> {
+  return readJson("/v1/runtime/policy/preview", {
+    ...options,
+    method: "POST",
+    body: { preferred_profile_id: preferredProfileId },
+  });
+}
+
 export async function setPreferredRuntime(
   preferredProfileId: string | null,
+  expectedImpactFingerprint: string,
   options: DaemonRequestOptions = {},
 ): Promise<RuntimePreference> {
   return readJson("/v1/runtime/policy", {
     ...options,
     method: "PUT",
-    body: { preferred_profile_id: preferredProfileId },
+    body: {
+      preferred_profile_id: preferredProfileId,
+      expected_impact_fingerprint: expectedImpactFingerprint,
+    },
   });
 }
 
@@ -1077,22 +1117,28 @@ export async function readRuntimeUninstallPolicy(
 export async function setProjectEngine(
   projectId: string,
   runtimeProfileId: string | null,
+  expectedImpactFingerprint: string,
   options: DaemonRequestOptions = {},
 ): Promise<StudioProject> {
   return readJson(`/v1/projects/${encodeURIComponent(projectId)}/engine`, {
     ...options,
     method: "PUT",
-    body: { runtime_profile_id: runtimeProfileId },
+    body: {
+      runtime_profile_id: runtimeProfileId,
+      expected_impact_fingerprint: expectedImpactFingerprint,
+    },
   });
 }
 
-export async function selectRuntimeProfile(
-  profileId: string,
+export async function previewProjectEngine(
+  projectId: string,
+  runtimeProfileId: string | null,
   options: DaemonRequestOptions = {},
-): Promise<{ selected: boolean }> {
-  return readJson(`/v1/runtime/profiles/${encodeURIComponent(profileId)}/select`, {
+): Promise<ProjectRuntimeImpactPreview> {
+  return readJson(`/v1/projects/${encodeURIComponent(projectId)}/engine/preview`, {
     ...options,
     method: "POST",
+    body: { runtime_profile_id: runtimeProfileId },
   });
 }
 

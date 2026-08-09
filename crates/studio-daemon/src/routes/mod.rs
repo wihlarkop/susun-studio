@@ -77,6 +77,10 @@ pub fn app(state: AppState) -> Router {
             "/v1/projects/{id}/engine",
             put(projects::set_project_engine),
         )
+        .route(
+            "/v1/projects/{id}/engine/preview",
+            post(projects::preview_project_engine),
+        )
         .route("/v1/projects/{id}/plans/up", post(plans::create_up_plan))
         .route(
             "/v1/projects/{id}/plans/down",
@@ -144,6 +148,10 @@ pub fn app(state: AppState) -> Router {
             get(runtime::read_runtime_policy).put(runtime::set_runtime_policy),
         )
         .route(
+            "/v1/runtime/policy/preview",
+            post(runtime::preview_runtime_policy),
+        )
+        .route(
             "/v1/runtime/onboarding",
             get(runtime::read_runtime_onboarding),
         )
@@ -204,10 +212,6 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/v1/runtime/uninstall-policy",
             get(runtime_transitions::uninstall_policy),
-        )
-        .route(
-            "/v1/runtime/profiles/{id}/select",
-            post(runtime::select_runtime_profile),
         )
         .route(
             "/v1/runtime/profiles/{id}/forget",

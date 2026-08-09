@@ -12,6 +12,13 @@ use crate::{auth::authorize, error::ApiError, logging, runtime, state::AppState}
 #[serde(deny_unknown_fields)]
 pub struct RuntimePolicyUpdateRequest {
     pub preferred_profile_id: Option<String>,
+    pub expected_impact_fingerprint: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimePolicyPreviewRequest {
+    pub preferred_profile_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,29 +70,38 @@ pub async fn read_runtime_policy(
     Ok(Json(runtime::policy::read_preference(&state.db).await?))
 }
 
+pub async fn preview_runtime_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RuntimePolicyPreviewRequest>,
+) -> Result<Json<runtime::policy::RuntimePreferenceImpactPreview>, ApiError> {
+    authorize(&state, &headers)?;
+    Ok(Json(
+        runtime::policy::preview_preference_change(
+            &state.db,
+            request.preferred_profile_id.as_deref(),
+        )
+        .await?,
+    ))
+}
+
 pub async fn set_runtime_policy(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<RuntimePolicyUpdateRequest>,
 ) -> Result<Json<runtime::RuntimePreference>, ApiError> {
     authorize(&state, &headers)?;
-    let preference =
-        set_preferred_runtime(&state.db, request.preferred_profile_id.as_deref()).await?;
-    Ok(Json(preference))
-}
-
-async fn set_preferred_runtime(
-    db: &turso::Database,
-    preferred_profile_id: Option<&str>,
-) -> Result<runtime::RuntimePreference, ApiError> {
-    match runtime::policy::set_preferred(db, preferred_profile_id).await? {
-        runtime::policy::SetPreferredOutcome::Updated => {
-            Ok(runtime::policy::read_preference(db).await?)
+    let preference = runtime::policy::commit_preference_change(
+        &state.db,
+        request.preferred_profile_id.as_deref(),
+        &request.expected_impact_fingerprint,
+    )
+    .await?;
+    match preference {
+        runtime::policy::ContextChangeCommit::Updated(preference) => Ok(Json(preference)),
+        runtime::policy::ContextChangeCommit::Rejected(rejection) => {
+            Err(ApiError::ActionUnavailable(rejection.detail().to_owned()))
         }
-        runtime::policy::SetPreferredOutcome::NotFound => Err(ApiError::RuntimeProfileNotFound),
-        runtime::policy::SetPreferredOutcome::Unavailable => Err(ApiError::ActionUnavailable(
-            "This runtime is missing or its built-in ownership is not proven.".to_owned(),
-        )),
     }
 }
 
@@ -161,20 +177,6 @@ pub async fn prepare_runtime_resource_update(
         Ok(plan) => Ok(Json(serde_json::json!({ "plan": plan }))),
         Err(result) => Ok(Json(serde_json::json!({ "result": result }))),
     }
-}
-
-pub async fn select_runtime_profile(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(profile_id): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers)?;
-    logging::info(
-        "runtime_profile_select_requested",
-        &[("profile_id", profile_id.clone())],
-    );
-    set_preferred_runtime(&state.db, Some(&profile_id)).await?;
-    Ok(Json(serde_json::json!({ "selected": true })))
 }
 
 pub async fn forget_runtime_profile(
@@ -313,7 +315,7 @@ fn reject_trusted_plan_content(body: &Bytes) -> Result<(), ApiError> {
 
 #[cfg(test)]
 mod tests {
-    use axum::{Json, extract::Path};
+    use axum::Json;
     use turso::params;
 
     use super::*;
@@ -389,15 +391,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_routes_are_typed_and_legacy_select_does_not_write_profiles() -> TestResult {
+    async fn policy_routes_require_fresh_impact_previews_and_reject_stale_commits() -> TestResult {
         let state = test_state(fresh_db("runtime-policy-routes").await?);
         insert_available_profile(&state, "profile-ready").await?;
+        let preview = preview_runtime_policy(
+            State(state.clone()),
+            authorized_headers(),
+            Json(RuntimePolicyPreviewRequest {
+                preferred_profile_id: Some("profile-ready".to_owned()),
+            }),
+        )
+        .await?
+        .0;
+        assert!(preview.change_allowed);
 
         let response = set_runtime_policy(
             State(state.clone()),
             authorized_headers(),
             Json(RuntimePolicyUpdateRequest {
                 preferred_profile_id: Some("profile-ready".to_owned()),
+                expected_impact_fingerprint: preview.impact_fingerprint,
             }),
         )
         .await?
@@ -413,11 +426,21 @@ mod tests {
             .0;
         assert_eq!(read.preferred_profile_id, response.preferred_profile_id);
 
+        let clear_preview = preview_runtime_policy(
+            State(state.clone()),
+            authorized_headers(),
+            Json(RuntimePolicyPreviewRequest {
+                preferred_profile_id: None,
+            }),
+        )
+        .await?
+        .0;
         let cleared = set_runtime_policy(
             State(state.clone()),
             authorized_headers(),
             Json(RuntimePolicyUpdateRequest {
                 preferred_profile_id: None,
+                expected_impact_fingerprint: clear_preview.impact_fingerprint,
             }),
         )
         .await?
@@ -425,41 +448,50 @@ mod tests {
         assert_eq!(cleared.preferred_profile_id, None);
 
         let conn = state.db.connect()?;
-        let mut rows = conn
-            .query(
-                "SELECT updated_at_ms FROM runtime_profiles WHERE id = 'profile-ready'",
-                (),
-            )
-            .await?;
-        let before: i64 = rows.next().await?.ok_or("profile")?.get(0)?;
-        drop(rows);
-        let legacy = select_runtime_profile(
+        let stale_preview = preview_runtime_policy(
             State(state.clone()),
             authorized_headers(),
-            Path("profile-ready".to_owned()),
+            Json(RuntimePolicyPreviewRequest {
+                preferred_profile_id: Some("profile-ready".to_owned()),
+            }),
         )
         .await?
         .0;
-        assert_eq!(legacy["selected"], true);
-        let mut rows = conn
-            .query(
-                "SELECT updated_at_ms FROM runtime_profiles WHERE id = 'profile-ready'",
-                (),
-            )
-            .await?;
-        let after: i64 = rows.next().await?.ok_or("profile")?.get(0)?;
-        assert_eq!(after, before);
-        drop(rows);
+        conn.execute(
+            "UPDATE runtime_policy SET preferred_profile_id = 'changed' WHERE singleton = 1",
+            (),
+        )
+        .await?;
+        let stale = set_runtime_policy(
+            State(state.clone()),
+            authorized_headers(),
+            Json(RuntimePolicyUpdateRequest {
+                preferred_profile_id: Some("profile-ready".to_owned()),
+                expected_impact_fingerprint: stale_preview.impact_fingerprint,
+            }),
+        )
+        .await;
+        assert!(matches!(stale, Err(ApiError::ActionUnavailable(_))));
 
+        let missing_preview = preview_runtime_policy(
+            State(state.clone()),
+            authorized_headers(),
+            Json(RuntimePolicyPreviewRequest {
+                preferred_profile_id: Some("missing".to_owned()),
+            }),
+        )
+        .await?
+        .0;
         let unknown = set_runtime_policy(
             State(state.clone()),
             authorized_headers(),
             Json(RuntimePolicyUpdateRequest {
                 preferred_profile_id: Some("missing".to_owned()),
+                expected_impact_fingerprint: missing_preview.impact_fingerprint,
             }),
         )
         .await;
-        assert!(matches!(unknown, Err(ApiError::RuntimeProfileNotFound)));
+        assert!(matches!(unknown, Err(ApiError::ActionUnavailable(_))));
 
         conn.execute(
             "UPDATE runtime_profiles
@@ -468,11 +500,21 @@ mod tests {
             (),
         )
         .await?;
+        let unavailable_preview = preview_runtime_policy(
+            State(state.clone()),
+            authorized_headers(),
+            Json(RuntimePolicyPreviewRequest {
+                preferred_profile_id: Some("profile-ready".to_owned()),
+            }),
+        )
+        .await?
+        .0;
         let unavailable = set_runtime_policy(
             State(state),
             authorized_headers(),
             Json(RuntimePolicyUpdateRequest {
                 preferred_profile_id: Some("profile-ready".to_owned()),
+                expected_impact_fingerprint: unavailable_preview.impact_fingerprint,
             }),
         )
         .await;
@@ -502,6 +544,25 @@ mod tests {
             .is_err()
         );
         Ok(())
+    }
+
+    #[test]
+    fn runtime_policy_context_requests_reject_unknown_fields() {
+        assert!(
+            serde_json::from_value::<RuntimePolicyPreviewRequest>(serde_json::json!({
+                "preferred_profile_id": "profile",
+                "endpoint": "//./pipe/secret"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<RuntimePolicyUpdateRequest>(serde_json::json!({
+                "preferred_profile_id": "profile",
+                "expected_impact_fingerprint": "fingerprint",
+                "argv": ["unsafe"]
+            }))
+            .is_err()
+        );
     }
 
     #[tokio::test]

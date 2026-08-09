@@ -393,8 +393,33 @@ fn canonicalize_path(path: &str) -> Result<PathBuf, ApiError> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetProjectEngineRequest {
     pub runtime_profile_id: Option<String>,
+    pub expected_impact_fingerprint: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectEnginePreviewRequest {
+    pub runtime_profile_id: Option<String>,
+}
+
+pub async fn preview_project_engine(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(request): Json<ProjectEnginePreviewRequest>,
+) -> Result<Json<runtime::policy::ProjectRuntimeImpactPreview>, ApiError> {
+    authorize(&state, &headers)?;
+    let preview = runtime::policy::preview_project_binding_change(
+        &state.db,
+        &project_id,
+        request.runtime_profile_id.as_deref(),
+    )
+    .await?
+    .ok_or(ApiError::ProjectNotFound)?;
+    Ok(Json(preview))
 }
 
 pub async fn set_project_engine(
@@ -405,31 +430,19 @@ pub async fn set_project_engine(
 ) -> Result<Json<ProjectResponse>, ApiError> {
     authorize(&state, &headers)?;
     let runtime_profile_id = request.runtime_profile_id;
-
-    if let Some(profile_id) = runtime_profile_id.as_deref() {
-        match runtime::policy::validate_profile_for_binding(&state.db, profile_id).await? {
-            runtime::policy::SetPreferredOutcome::Updated => {}
-            runtime::policy::SetPreferredOutcome::NotFound => {
-                return Err(ApiError::RuntimeProfileNotFound);
-            }
-            runtime::policy::SetPreferredOutcome::Unavailable => {
-                return Err(ApiError::ActionUnavailable(
-                    "the runtime profile is not available for project binding".to_owned(),
-                ));
-            }
+    let committed = runtime::policy::commit_project_binding_change(
+        &state.db,
+        &project_id,
+        runtime_profile_id.as_deref(),
+        &request.expected_impact_fingerprint,
+    )
+    .await?;
+    match committed {
+        None => return Err(ApiError::ProjectNotFound),
+        Some(runtime::policy::ContextChangeCommit::Updated(())) => {}
+        Some(runtime::policy::ContextChangeCommit::Rejected(rejection)) => {
+            return Err(ApiError::ActionUnavailable(rejection.detail().to_owned()));
         }
-    }
-
-    let conn = state.db.connect()?;
-    // Policy validation above completes before the pin is persisted.
-    let affected = conn
-        .execute(
-            "UPDATE projects SET runtime_profile_id = ?1 WHERE id = ?2",
-            params![runtime_profile_id.clone(), project_id.clone()],
-        )
-        .await?;
-    if affected == 0 {
-        return Err(ApiError::ProjectNotFound);
     }
 
     logging::info(
@@ -617,12 +630,23 @@ mod tests {
             runtime::RuntimeBindingState::Unavailable
         );
 
+        let preview = preview_project_engine(
+            State(state.clone()),
+            authorized_headers(),
+            Path("pinned-ready".to_owned()),
+            Json(ProjectEnginePreviewRequest {
+                runtime_profile_id: None,
+            }),
+        )
+        .await?
+        .0;
         let cleared = set_project_engine(
             State(state.clone()),
             authorized_headers(),
             Path("pinned-ready".to_owned()),
             Json(SetProjectEngineRequest {
                 runtime_profile_id: None,
+                expected_impact_fingerprint: preview.impact_fingerprint,
             }),
         )
         .await?
@@ -664,18 +688,48 @@ mod tests {
         insert_profile(&state, "conflicted", "available", "ownership_conflict").await?;
 
         for profile_id in ["unavailable", "conflicted"] {
+            let preview = preview_project_engine(
+                State(state.clone()),
+                authorized_headers(),
+                Path("project".to_owned()),
+                Json(ProjectEnginePreviewRequest {
+                    runtime_profile_id: Some(profile_id.to_owned()),
+                }),
+            )
+            .await?
+            .0;
             let result = set_project_engine(
                 State(state.clone()),
                 authorized_headers(),
                 Path("project".to_owned()),
                 Json(SetProjectEngineRequest {
                     runtime_profile_id: Some(profile_id.to_owned()),
+                    expected_impact_fingerprint: preview.impact_fingerprint,
                 }),
             )
             .await;
             assert!(matches!(result, Err(ApiError::ActionUnavailable(_))));
         }
         Ok(())
+    }
+
+    #[test]
+    fn project_engine_context_requests_reject_unknown_fields() {
+        assert!(
+            serde_json::from_value::<ProjectEnginePreviewRequest>(serde_json::json!({
+                "runtime_profile_id": "profile",
+                "endpoint": "//./pipe/secret"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<SetProjectEngineRequest>(serde_json::json!({
+                "runtime_profile_id": "profile",
+                "expected_impact_fingerprint": "fingerprint",
+                "command": "unsafe"
+            }))
+            .is_err()
+        );
     }
 
     #[tokio::test]
