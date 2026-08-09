@@ -36,6 +36,7 @@
   function selectProject(id: string) {
     selectedProjectId = id;
     void daemonState.setLastProjectId(id);
+    void daemonState.markProjectOpened(id);
   }
 
   // Restore the last-viewed project once, the first time both settings and

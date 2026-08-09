@@ -2,6 +2,7 @@ import {
   getDaemonBaseUrl,
   importProject as importProjectRequest,
   listProjects,
+  markProjectOpened as markProjectOpenedRequest,
   readDaemonHealth,
   readRuntimeOnboarding,
   readRuntimeStatus,
@@ -138,6 +139,16 @@ export function createDaemonState() {
     }
   }
 
+  async function markProjectOpened(projectId: string): Promise<void> {
+    try {
+      const updated = await markProjectOpenedRequest(projectId);
+      projects = projects.map((project) => (project.id === updated.id ? updated : project));
+    } catch {
+      // Opening remains local and immediate. A transient daemon write failure
+      // leaves the existing recency ordering in place until the next refresh.
+    }
+  }
+
   return {
     get healthState() {
       return healthState;
@@ -167,6 +178,7 @@ export function createDaemonState() {
       return workspaceDetail;
     },
     importProject,
+    markProjectOpened,
     refresh: () => refresh(),
     setLastProjectId,
   };
