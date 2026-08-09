@@ -50,3 +50,10 @@ export function selectableExternalProfiles(profiles: RuntimeProfileSnapshot[]): 
     .filter((profile) => profile.runtime_class !== "built_in" && profile.management.can_select)
     .map((profile) => profile.id);
 }
+
+export function canDismissInitialOnboarding(input: {
+  reopened: boolean;
+  onboarding: OnboardingStateSnapshot;
+}): boolean {
+  return !input.reopened && input.onboarding.state === "pending" && input.onboarding.choice === null;
+}

@@ -45,6 +45,8 @@
     Wrench,
   } from "@lucide/svelte";
 
+  let { onChooseRuntime }: { onChooseRuntime: () => void } = $props();
+
   let status = $state<RuntimeStatus | null>(null);
   let logs = $state<RuntimeLogLine[]>([]);
   let loading = $state(false);
@@ -357,6 +359,10 @@
     <Button size="sm" variant="outline" onclick={() => (migrationDialogOpen = true)}>
       <ArrowRightLeft />
       Migrate projects
+    </Button>
+    <Button size="sm" variant="outline" onclick={onChooseRuntime}>
+      <Server />
+      Choose runtime
     </Button>
   </div>
 

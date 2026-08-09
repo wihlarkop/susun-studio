@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   canCompleteBuiltInOnboarding,
+  canDismissInitialOnboarding,
   resolveOnboardingView,
   selectableExternalProfiles,
 } from "./onboarding-state";
@@ -79,5 +80,11 @@ describe("runtime onboarding state", () => {
     expect(resolveOnboardingView({ connected: true, onboarding: completedExisting })).toEqual({
       kind: "hidden",
     });
+  });
+
+  it("allows only the initial pending flow to persist dismissal", () => {
+    expect(canDismissInitialOnboarding({ reopened: false, onboarding: pending })).toBe(true);
+    expect(canDismissInitialOnboarding({ reopened: true, onboarding: pending })).toBe(false);
+    expect(canDismissInitialOnboarding({ reopened: false, onboarding: completedExisting })).toBe(false);
   });
 });

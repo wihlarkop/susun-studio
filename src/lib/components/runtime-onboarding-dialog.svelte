@@ -16,6 +16,7 @@
   import type { RuntimeActionDialogRequest } from "$lib/components/runtime-action-dialog.svelte";
   import {
     canCompleteBuiltInOnboarding,
+    canDismissInitialOnboarding,
     selectableExternalProfiles,
   } from "$lib/runtime/onboarding-state";
   import { ArrowLeft, HardDrive, RefreshCw, Server } from "@lucide/svelte";
@@ -24,12 +25,16 @@
     status,
     onboarding,
     open = $bindable(true),
+    reopened = false,
     onchanged,
+    onfinished,
   }: {
     status: RuntimeStatus;
     onboarding: RuntimeOnboardingState;
     open?: boolean;
+    reopened?: boolean;
     onchanged: () => void | Promise<void>;
+    onfinished?: () => void;
   } = $props();
 
   let screen = $state<"choice" | "existing">("choice");
@@ -68,8 +73,12 @@
     void completeBuiltIn();
   });
 
-  function preventDismiss(next: boolean) {
-    if (next) open = true;
+  function setOpen(next: boolean) {
+    if (next || !reopened) {
+      open = true;
+      return;
+    }
+    open = false;
   }
 
   function providerFor(profile: RuntimeProfile): RuntimeProviderStatus | null {
@@ -102,6 +111,8 @@
       await onchanged();
       message = null;
       waitingForBuiltIn = false;
+      open = false;
+      onfinished?.();
     } catch {
       message = "Susun Runtime is ready, but onboarding could not be completed. Try again.";
     } finally {
@@ -116,6 +127,8 @@
       await setPreferredRuntime(profile.id);
       await completeRuntimeOnboarding("existing");
       await onchanged();
+      open = false;
+      onfinished?.();
     } catch {
       message = "This runtime could not be selected. Recheck it and try again.";
     } finally {
@@ -124,11 +137,14 @@
   }
 
   async function dismiss() {
+    if (!canDismissInitialOnboarding({ reopened, onboarding })) return;
     busy = true;
     message = null;
     try {
       await dismissRuntimeOnboarding();
       await onchanged();
+      open = false;
+      onfinished?.();
     } catch {
       message = "Onboarding could not be dismissed right now. Try again.";
     } finally {
@@ -137,7 +153,7 @@
   }
 </script>
 
-<Dialog.Root bind:open={() => open, preventDismiss}>
+<Dialog.Root bind:open={() => open, setOpen}>
   <Dialog.Content class="sm:max-w-2xl">
     <Dialog.Header>
       <Dialog.Title>{screen === "choice" ? "Choose a runtime" : "Use an existing runtime"}</Dialog.Title>
@@ -237,9 +253,11 @@
       </div>
     {/if}
 
-    <Dialog.Footer>
-      <Button type="button" variant="ghost" disabled={busy} onclick={dismiss}>Not now</Button>
-    </Dialog.Footer>
+    {#if canDismissInitialOnboarding({ reopened, onboarding })}
+      <Dialog.Footer>
+        <Button type="button" variant="ghost" disabled={busy} onclick={dismiss}>Not now</Button>
+      </Dialog.Footer>
+    {/if}
   </Dialog.Content>
 </Dialog.Root>
 
