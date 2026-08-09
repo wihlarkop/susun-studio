@@ -1,5 +1,6 @@
 mod command;
 mod endpoint_policy;
+pub mod onboarding;
 mod package_source;
 pub mod policy;
 mod provider;

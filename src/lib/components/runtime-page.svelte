@@ -5,21 +5,19 @@
   import { Button } from "$lib/components/ui/button/index.js";
   import RuntimeMigrationDialog from "$lib/components/runtime-migration-dialog.svelte";
   import RuntimeDataScopeDialog from "$lib/components/runtime-data-scope-dialog.svelte";
+  import RuntimeActionDialog from "$lib/components/runtime-action-dialog.svelte";
   import RuntimeActionAudit from "$lib/components/runtime-action-audit.svelte";
   import RuntimeResourcePanel from "$lib/components/runtime-resource-panel.svelte";
+  import RuntimeIdentity from "$lib/components/runtime-identity.svelte";
   import PruneDialog from "$lib/components/prune-dialog.svelte";
   import {
-    cancelRuntimePlan,
-    executeRuntimePlan,
     forgetRuntimeProfile,
     readRuntimeLogs,
     readRuntimeProfileResources,
-    readRuntimeStatus,
     prepareRuntimeAction,
     prepareRuntimeResourceUpdate,
     setPreferredRuntime,
     type RuntimeAction,
-    type RuntimeActionResult,
     type RuntimeDimension,
     type RuntimeEndpointSummary,
     type RuntimeLogLine,
@@ -27,9 +25,10 @@
     type RuntimeResourceSnapshot,
     type RuntimeProviderStatus,
     type RuntimeStatus,
-    type TrustedRuntimePlan,
   } from "$lib/daemon/client";
   import { resolveActiveEngineId } from "$lib/engine-identity";
+  import { presentRuntimeBinding, presentRuntimeProfile } from "$lib/runtime/presentation";
+  import type { RuntimeActionDialogRequest } from "$lib/components/runtime-action-dialog.svelte";
   import {
     AlertCircle,
     ArrowRightLeft,
@@ -47,19 +46,32 @@
     Wrench,
   } from "@lucide/svelte";
 
-  let status = $state<RuntimeStatus | null>(null);
+  let {
+    runtimeStatus,
+    refreshing,
+    onRecheck,
+    onChooseRuntime,
+    trayRuntimeAction = null,
+    onTrayRuntimeActionHandled,
+  }: {
+    runtimeStatus: RuntimeStatus | undefined;
+    refreshing: boolean;
+    onRecheck: () => Promise<void>;
+    onChooseRuntime: () => void;
+    trayRuntimeAction?: { action: "start" | "stop"; requestId: number } | null;
+    onTrayRuntimeActionHandled?: () => void;
+  } = $props();
+
   let logs = $state<RuntimeLogLine[]>([]);
-  let loading = $state(false);
-  let actionResult = $state<RuntimeActionResult | null>(null);
+  let logsLoading = $state(false);
   let errorMessage = $state<string | null>(null);
   let expandedProviders = $state<Set<string>>(new Set());
   let ownershipDialogOpen = $state(false);
   let ownershipDialogBusy = $state(false);
   let pendingOwnershipProfile = $state<RuntimeProfile | null>(null);
   let pendingOwnershipAction = $state<"forget" | null>(null);
-  let trustedPlan = $state<TrustedRuntimePlan | null>(null);
-  let trustedPlanDialogOpen = $state(false);
-  let trustedPlanBusy = $state(false);
+  let runtimeActionRequest = $state<RuntimeActionDialogRequest | null>(null);
+  let runtimeActionDialogOpen = $state(false);
   let migrationDialogOpen = $state(false);
   let dataScopeDialogOpen = $state(false);
   let dataScopeProfile = $state<RuntimeProfile | null>(null);
@@ -68,6 +80,8 @@
   let resourceSnapshots = $state<Record<string, RuntimeResourceSnapshot>>({});
   let resourceLoading = $state<Record<string, boolean>>({});
   let resourceErrors = $state<Record<string, string>>({});
+  let builtInExpanded = $state(false);
+  let existingExpanded = $state(false);
 
   const actionIcons = {
     install: Wrench,
@@ -77,6 +91,7 @@
     restart: RotateCw,
   } as const;
 
+  const status = $derived(runtimeStatus ?? null);
   const providers = $derived(status?.providers ?? []);
   const runtimePreference = $derived(status?.policy ?? null);
   const pruneEngineId = $derived(
@@ -103,41 +118,63 @@
     providers.find((provider) => provider.provider_id === "windows-podman"),
   );
   const setupAction = $derived(podmanProvider?.actions.find((action) => action.id === "setup"));
+  const preferredPresentation = $derived(
+    runtimePreference ? presentRuntimeBinding(runtimePreference.binding) : null,
+  );
+  const profileEntries = $derived(
+    providers.flatMap((provider) => provider.profiles.map((profile) => ({ profile, provider }))),
+  );
+  const builtInEntries = $derived(
+    profileEntries.filter((entry) => entry.profile.runtime_class === "built_in"),
+  );
+  const externalEntries = $derived(
+    profileEntries.filter((entry) => entry.profile.runtime_class !== "built_in"),
+  );
+  const builtInNeedsAttention = $derived(
+    !managedBuiltIn ||
+      builtInEntries.some(
+        (entry) =>
+          entry.profile.management.requires_recovery || entry.profile.availability_state !== "available",
+      ),
+  );
 
   $effect(() => {
-    const controller = new AbortController();
-    void refresh(controller.signal);
-    return () => controller.abort();
-  });
-
-  $effect(() => {
-    if (!trustedPlanDialogOpen && trustedPlan && !trustedPlanBusy) {
-      void cancelPreparedPlan();
+    if (builtInNeedsAttention) {
+      builtInExpanded = true;
     }
   });
 
-  async function refresh(signal?: AbortSignal) {
-    loading = true;
+  $effect(() => {
+    const controller = new AbortController();
+    if (status) {
+      void refreshLogs(controller.signal);
+    } else {
+      logs = [];
+    }
+    return () => controller.abort();
+  });
+
+  async function refreshLogs(signal?: AbortSignal) {
+    logsLoading = true;
     try {
-      const [nextStatus, nextLogs] = await Promise.all([
-        readRuntimeStatus({ signal }),
-        readRuntimeLogs({ signal }),
-      ]);
-      status = nextStatus;
-      logs = nextLogs;
+      logs = await readRuntimeLogs({ signal });
       errorMessage = null;
-      for (const profile of nextStatus.providers
-        .filter((provider) => expandedProviders.has(provider.provider_id))
-        .flatMap((provider) => provider.profiles)
-        .filter((profile) => profile.runtime_class === "built_in")) {
-        void loadResources(profile, signal);
-      }
     } catch (error) {
       if (!signal?.aborted) {
         errorMessage = error instanceof Error ? error.message : String(error);
       }
     } finally {
-      loading = false;
+      logsLoading = false;
+    }
+  }
+
+  async function refreshRuntime() {
+    await onRecheck();
+    for (const profile of providers
+      .filter((provider) => expandedProviders.has(provider.provider_id))
+      .flatMap((provider) => provider.profiles)
+      .filter((profile) => profile.runtime_class === "built_in")) {
+      void loadResources(profile);
     }
   }
 
@@ -160,77 +197,60 @@
     }
   }
 
-  async function handleAction(providerId: string, action: RuntimeAction) {
-    try {
-      const prepared = await prepareRuntimeAction(providerId, action.id);
-      if (prepared.result) {
-        actionResult = prepared.result;
-        await refresh();
-        return;
-      }
-      if (prepared.plan) {
-        trustedPlan = prepared.plan;
-        trustedPlanDialogOpen = true;
-      }
-    } catch (error) {
-      errorMessage = error instanceof Error ? error.message : String(error);
-    }
+  function handleAction(providerId: string, action: RuntimeAction) {
+    runtimeActionRequest = {
+      identity: { providerId, action: action.id },
+      prepare: () => prepareRuntimeAction(providerId, action.id),
+    };
+    runtimeActionDialogOpen = true;
   }
 
-  async function handleResourceUpdate(
+  function openTrayRuntimeAction(actionId: "start" | "stop") {
+    const selectedProfileId = runtimePreference?.binding.profile_id;
+    const profile = selectedProfileId
+      ? profileEntries.find((entry) => entry.profile.id === selectedProfileId)?.profile
+      : undefined;
+    const provider = profile
+      ? providers.find((candidate) => candidate.provider_id === profile.provider_id)
+      : undefined;
+    const action = provider?.actions.find(
+      (candidate) => candidate.id === actionId && candidate.enabled,
+    );
+    const selectedBuiltIn =
+      profile?.runtime_class === "built_in" &&
+      profile.ownership_state === "studio_managed" &&
+      runtimePreference?.binding.runtime_class === "built_in";
+    if (!selectedBuiltIn || !profile || !provider || !action) {
+      errorMessage = "The requested built-in runtime action is no longer available.";
+      return;
+    }
+    handleAction(provider.provider_id, action);
+  }
+
+  $effect(() => {
+    const request = trayRuntimeAction;
+    if (!request) return;
+    openTrayRuntimeAction(request.action);
+    onTrayRuntimeActionHandled?.();
+  });
+
+  function handleResourceUpdate(
     profile: RuntimeProfile,
     networkMode: "wsl" | "user_mode",
   ) {
-    try {
-      const prepared = await prepareRuntimeResourceUpdate(profile.id, networkMode);
-      if (prepared.result) {
-        actionResult = prepared.result;
-        return;
-      }
-      if (prepared.plan) {
-        trustedPlan = prepared.plan;
-        trustedPlanDialogOpen = true;
-      }
-    } catch (error) {
-      errorMessage = error instanceof Error ? error.message : String(error);
-    }
-  }
-
-  async function executePreparedPlan() {
-    if (!trustedPlan) return;
-    trustedPlanBusy = true;
-    try {
-      actionResult = await executeRuntimePlan(trustedPlan.plan_id);
-      trustedPlanDialogOpen = false;
-      trustedPlan = null;
-      await refresh();
-    } catch (error) {
-      errorMessage = error instanceof Error ? error.message : String(error);
-    } finally {
-      trustedPlanBusy = false;
-    }
-  }
-
-  async function cancelPreparedPlan() {
-    if (!trustedPlan) {
-      trustedPlanDialogOpen = false;
-      return;
-    }
-    trustedPlanBusy = true;
-    try {
-      actionResult = await cancelRuntimePlan(trustedPlan.plan_id);
-      trustedPlanDialogOpen = false;
-      trustedPlan = null;
-    } catch (error) {
-      errorMessage = error instanceof Error ? error.message : String(error);
-    } finally {
-      trustedPlanBusy = false;
-    }
+    runtimeActionRequest = {
+      identity: {
+        providerId: profile.provider_id,
+        action: `resource_network_${networkMode}:${profile.id}`,
+      },
+      prepare: () => prepareRuntimeResourceUpdate(profile.id, networkMode),
+    };
+    runtimeActionDialogOpen = true;
   }
 
   async function handleSelect(profile: RuntimeProfile) {
     await setPreferredRuntime(profile.id);
-    await refresh();
+    await refreshRuntime();
   }
 
   function isPreferred(profile: RuntimeProfile): boolean {
@@ -244,7 +264,7 @@
     } catch (error) {
       errorMessage = error instanceof Error ? error.message : String(error);
     }
-    await refresh();
+    await refreshRuntime();
   }
 
   function requestOwnershipAction(profile: RuntimeProfile, action: "forget") {
@@ -327,13 +347,6 @@
     return stateLabel(provider.connection.state);
   }
 
-  function profileStatus(profile: RuntimeProfile): string {
-    return [profile.installation.state, profile.process.state, profile.connection.state]
-      .filter(Boolean)
-      .map(stateLabel)
-      .join(" / ");
-  }
-
   function endpointLabel(summary: RuntimeProfile["endpoint_summary"]): string | null {
     if (!summary) return null;
     if (typeof summary !== "string") return summary.redacted;
@@ -377,15 +390,6 @@
     return expandedProviders.has(providerId);
   }
 
-  function showExistingRuntimes() {
-    expandedProviders = new Set(providers.map((provider) => provider.provider_id));
-    for (const profile of providers
-      .flatMap((provider) => provider.profiles)
-      .filter((profile) => profile.runtime_class === "built_in")) {
-      void loadResources(profile);
-    }
-  }
-
   function reviewDataScope(profile: RuntimeProfile) {
     dataScopeProfile = profile;
     dataScopeDialogOpen = true;
@@ -395,24 +399,32 @@
     pruneProfile = profile;
     pruneDialogOpen = true;
   }
+
+  function entryPresentation(profile: RuntimeProfile, provider: RuntimeProviderStatus) {
+    return presentRuntimeProfile(profile, provider);
+  }
 </script>
 
 <div class="flex flex-col gap-4">
   <div class="flex flex-wrap items-start justify-between gap-3">
     <div class="max-w-3xl">
-      <h3 class="text-lg font-semibold">Runtime</h3>
+      <h3 class="text-lg font-semibold">Runtime choices</h3>
       <p class="text-sm text-muted-foreground">
-        Manage local container providers and choose the profile Studio should use for project
-        actions. Existing Docker-compatible engines can still be used as the platform default.
+        Choose the runtime Studio prefers for new project actions. Existing runtimes remain
+        external; unavailable choices block actions instead of falling back silently.
       </p>
     </div>
-    <Button size="sm" variant="outline" disabled={loading} onclick={() => refresh()}>
+    <Button size="sm" variant="outline" disabled={refreshing} onclick={refreshRuntime}>
       <RefreshCw />
-      {loading ? "Checking" : "Recheck"}
+      {refreshing ? "Checking" : "Recheck"}
     </Button>
     <Button size="sm" variant="outline" onclick={() => (migrationDialogOpen = true)}>
       <ArrowRightLeft />
       Migrate projects
+    </Button>
+    <Button size="sm" variant="outline" onclick={onChooseRuntime}>
+      <Server />
+      Choose runtime
     </Button>
   </div>
 
@@ -430,11 +442,12 @@
     </div>
     <div class="rounded-md border p-3">
       <div class="text-xs font-medium text-muted-foreground">Preferred runtime</div>
-      <div class="mt-2 flex min-w-0 items-center gap-2">
-        <Server class="size-4 shrink-0 text-muted-foreground" />
-        <span class="min-w-0 truncate text-sm">
-          {runtimePreference?.binding.display_name ?? "Loading runtime policy"}
-        </span>
+      <div class="mt-2 min-w-0">
+        {#if preferredPresentation}
+          <RuntimeIdentity presentation={preferredPresentation} compact />
+        {:else}
+          <span class="text-sm text-muted-foreground">Loading runtime policy</span>
+        {/if}
       </div>
     </div>
     <div class="rounded-md border p-3">
@@ -455,50 +468,99 @@
     </div>
   {/if}
 
-  {#if actionResult}
-    <div class="rounded-md border bg-muted/30 p-3">
-      <div class="flex flex-wrap items-center gap-2">
-        <Badge variant={actionResult.status === "failed" ? "destructive" : "secondary"}>
-          {stateLabel(actionResult.status)}
-        </Badge>
-        <span class="text-sm">{actionResult.message}</span>
-      </div>
-      {#if actionResult.next_steps.length > 0}
-        <p class="mt-1 text-xs text-muted-foreground">{actionResult.next_steps.join(" ")}</p>
-      {/if}
-    </div>
-  {/if}
-
-  {#if status && !managedBuiltIn && podmanProvider}
-    <div class="grid gap-4 border-y py-4 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
+  <Card.Root class="gap-0 overflow-hidden p-0">
+    <button
+      type="button"
+      class="flex w-full items-center justify-between gap-3 border-b bg-primary/5 p-4 text-left"
+      aria-expanded={builtInExpanded}
+      onclick={() => (builtInExpanded = !builtInExpanded)}
+    >
       <div class="min-w-0">
         <div class="flex flex-wrap items-center gap-2">
-          <Server class="size-4 text-primary" />
+          <ChevronRight class="size-4 transition-transform {builtInExpanded ? 'rotate-90' : ''}" />
           <h4 class="text-sm font-semibold">Susun Runtime</h4>
+          <Badge>Built-in</Badge>
           <Badge variant="secondary">Recommended</Badge>
         </div>
-        <p class="mt-1 text-sm text-muted-foreground">
-          A dedicated local runtime managed by Studio. Powered by Podman.
-        </p>
+        <p class="mt-1 text-sm text-muted-foreground">Powered by Podman and managed by Studio.</p>
       </div>
-      <div class="flex flex-wrap gap-2 md:justify-end">
-        <Button size="sm" variant="outline" onclick={showExistingRuntimes}>
-          Use existing runtime
-        </Button>
-        {#if setupAction}
-          <Button
-            size="sm"
-            disabled={!setupAction.enabled}
-            title={setupAction.reason}
-            onclick={() => handleAction(podmanProvider.provider_id, setupAction)}
-          >
-            <HardDrive />
-            Set up Susun Runtime
-          </Button>
+      <Badge variant={builtInNeedsAttention ? "outline" : "secondary"}>
+        {builtInNeedsAttention ? "Needs attention" : "Ready"}
+      </Badge>
+    </button>
+    {#if builtInExpanded}
+      <div class="space-y-3 p-4">
+        {#if !managedBuiltIn && podmanProvider}
+          <div class="grid gap-3 rounded-md border p-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
+            <p class="text-sm text-muted-foreground">
+              Set up a dedicated local runtime without installing Docker Desktop.
+            </p>
+            {#if setupAction}
+              <Button
+                size="sm"
+                disabled={!setupAction.enabled}
+                title={setupAction.reason}
+                onclick={() => handleAction(podmanProvider.provider_id, setupAction)}
+              >
+                <HardDrive />
+                Set up Susun Runtime
+              </Button>
+            {/if}
+          </div>
+        {/if}
+        {#if builtInEntries.length === 0}
+          <p class="text-sm text-muted-foreground">No managed Susun Runtime has been observed yet.</p>
+        {:else}
+          <div class="space-y-2">
+            {#each builtInEntries as entry (entry.profile.id)}
+              <RuntimeIdentity presentation={entryPresentation(entry.profile, entry.provider)} />
+            {/each}
+          </div>
         {/if}
       </div>
-    </div>
-  {/if}
+    {/if}
+  </Card.Root>
+
+  <Card.Root class="gap-0 overflow-hidden p-0">
+    <button
+      type="button"
+      class="flex w-full items-center justify-between gap-3 border-b bg-muted/20 p-4 text-left"
+      aria-expanded={existingExpanded}
+      onclick={() => (existingExpanded = !existingExpanded)}
+    >
+      <div>
+        <div class="flex items-center gap-2">
+          <ChevronRight class="size-4 transition-transform {existingExpanded ? 'rotate-90' : ''}" />
+          <h4 class="text-sm font-semibold">Existing runtimes</h4>
+        </div>
+        <p class="mt-1 text-sm text-muted-foreground">External Podman, Docker Desktop, and remote runtimes.</p>
+      </div>
+      <Badge variant="outline">{externalEntries.length}</Badge>
+    </button>
+    {#if existingExpanded}
+      <div class="space-y-3 p-4">
+        {#if externalEntries.length === 0}
+          <p class="text-sm text-muted-foreground">No selectable external runtime has been observed.</p>
+        {:else}
+          {#each externalEntries as entry (entry.profile.id)}
+            <div class="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-md border p-3">
+              <div class="min-w-0 flex-1">
+                <RuntimeIdentity presentation={entryPresentation(entry.profile, entry.provider)} />
+              </div>
+              <Button
+                size="sm"
+                variant={isPreferred(entry.profile) ? "secondary" : "outline"}
+                disabled={isPreferred(entry.profile) || !entry.profile.management.can_select}
+                onclick={() => handleSelect(entry.profile)}
+              >
+                {isPreferred(entry.profile) ? "Preferred" : "Make preferred"}
+              </Button>
+            </div>
+          {/each}
+        {/if}
+      </div>
+    {/if}
+  </Card.Root>
 
   {#if !status && !errorMessage}
     <div class="rounded-md border p-4 text-sm text-muted-foreground">
@@ -508,10 +570,9 @@
 
   <div class="flex flex-wrap items-end justify-between gap-2">
     <div>
-      <h4 class="text-sm font-semibold">Runtime providers</h4>
+      <h4 class="text-sm font-semibold">Advanced provider diagnostics</h4>
       <p class="text-xs text-muted-foreground">
-        Installed and available runtimes are listed together. Expand one to manage profiles and
-        lifecycle actions.
+        Inspect provider health and the safe actions currently supported by the daemon.
       </p>
     </div>
     <Badge variant="outline">{providers.length}</Badge>
@@ -634,12 +695,9 @@
                 <li class="grid gap-3 p-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-start">
                   <div class="min-w-0">
                     <div class="flex flex-wrap items-center gap-2">
-                      <span class="min-w-0 truncate text-sm font-medium">
-                        {profile.display_name}
-                      </span>
-                      {#if profile.runtime_class === "built_in"}
-                        <span class="text-xs text-muted-foreground">Powered by Podman</span>
-                      {/if}
+                      <div class="min-w-0 flex-1">
+                        <RuntimeIdentity presentation={entryPresentation(profile, provider)} compact />
+                      </div>
                       {#if isPreferred(profile)}
                         <Badge variant="default" class="text-xs">
                           <CheckCircle2 />
@@ -649,9 +707,8 @@
                       {#each ownershipBadges(profile) as badge (badge.label)}
                         <Badge variant={badge.variant} class="text-xs">{badge.label}</Badge>
                       {/each}
-                      <Badge variant="secondary" class="text-xs">{profileStatus(profile)}</Badge>
                     </div>
-                    <div class="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                    <div class="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground [overflow-wrap:anywhere]">
                       <span>{profile.provider_runtime_key}</span>
                       <span>{profile.freshness}</span>
                       {#if endpoint}
@@ -730,7 +787,7 @@
         <TerminalSquare class="size-4 text-muted-foreground" />
         <h4 class="text-sm font-semibold">Runtime logs</h4>
       </div>
-      <Badge variant="outline">{logs.length}</Badge>
+      <Badge variant="outline">{logsLoading ? "…" : logs.length}</Badge>
     </div>
     {#if logs.length === 0}
       <p class="p-4 text-sm text-muted-foreground">No runtime observations recorded.</p>
@@ -750,74 +807,11 @@
 
   <RuntimeActionAudit />
 
-  <Dialog.Root bind:open={trustedPlanDialogOpen}>
-    <Dialog.Content class="sm:max-w-lg">
-      <Dialog.Header>
-        <Dialog.Title>{trustedPlan?.label ?? "Approve runtime action"}</Dialog.Title>
-        <Dialog.Description>
-          Review the exact consequence before allowing this single-use runtime plan.
-        </Dialog.Description>
-      </Dialog.Header>
-      {#if trustedPlan}
-        <div class="grid gap-3 text-sm">
-          <div class="grid gap-1">
-            <span class="font-medium">Consequence</span>
-            <span class="text-muted-foreground">{trustedPlan.consequence}</span>
-          </div>
-          <div class="grid gap-1">
-            <span class="font-medium">Verified operation</span>
-            <span class="text-muted-foreground">{trustedPlan.command_summary}</span>
-          </div>
-          {#if trustedPlan.software_provenance}
-            <dl class="grid grid-cols-[minmax(7rem,auto)_minmax(0,1fr)] gap-x-4 gap-y-1 border-y py-3 text-xs">
-              <dt class="text-muted-foreground">Package</dt>
-              <dd class="min-w-0 font-mono [overflow-wrap:anywhere]">
-                {trustedPlan.software_provenance.package_id}
-              </dd>
-              <dt class="text-muted-foreground">Source</dt>
-              <dd class="min-w-0 [overflow-wrap:anywhere]">
-                {trustedPlan.software_provenance.source} · {trustedPlan.software_provenance.source_url}
-              </dd>
-              <dt class="text-muted-foreground">Expected publisher</dt>
-              <dd>{trustedPlan.software_provenance.expected_publisher}</dd>
-              <dt class="text-muted-foreground">Version</dt>
-              <dd>{trustedPlan.software_provenance.version_intent}</dd>
-              <dt class="text-muted-foreground">Restart impact</dt>
-              <dd>{trustedPlan.software_provenance.restart_impact}</dd>
-            </dl>
-          {/if}
-          <div class="flex flex-wrap gap-2">
-            <Badge variant={trustedPlan.destructive ? "destructive" : "secondary"}>
-              {trustedPlan.destructive ? "Destructive" : "Runtime mutation"}
-            </Badge>
-            <Badge variant="outline">
-              {trustedPlan.elevation === "os_mediated_consent"
-                ? "Administrator consent expected"
-                : "Current user"}
-            </Badge>
-            <Badge variant="outline">Expires in {trustedPlan.expires_in_seconds}s</Badge>
-          </div>
-          <p class="text-xs text-muted-foreground">
-            Executable paths, arguments, environment values, and credentials are intentionally
-            hidden. They are fixed by Studio and cannot be changed from this dialog.
-          </p>
-        </div>
-      {/if}
-      <Dialog.Footer>
-        <Button type="button" variant="outline" disabled={trustedPlanBusy} onclick={cancelPreparedPlan}>
-          Cancel
-        </Button>
-        <Button
-          type="button"
-          variant={trustedPlan?.destructive ? "destructive" : "default"}
-          disabled={trustedPlanBusy || !trustedPlan}
-          onclick={executePreparedPlan}
-        >
-          {trustedPlanBusy ? "Working..." : "Approve and run"}
-        </Button>
-      </Dialog.Footer>
-    </Dialog.Content>
-  </Dialog.Root>
+  <RuntimeActionDialog
+    request={runtimeActionRequest}
+    bind:open={runtimeActionDialogOpen}
+    oncompleted={refreshRuntime}
+  />
 
   <Dialog.Root bind:open={ownershipDialogOpen}>
     <Dialog.Content class="sm:max-w-lg">
@@ -853,12 +847,12 @@
   <RuntimeMigrationDialog
     profiles={providers.flatMap((provider) => provider.profiles)}
     bind:open={migrationDialogOpen}
-    oncompleted={() => refresh()}
+    oncompleted={refreshRuntime}
   />
   <RuntimeDataScopeDialog
     profile={dataScopeProfile}
     bind:open={dataScopeDialogOpen}
-    oncompleted={() => refresh()}
+    oncompleted={refreshRuntime}
   />
   {#if pruneEngineId}
     <PruneDialog
@@ -867,7 +861,7 @@
         ? `${pruneProfile.display_name} (${pruneProfile.provider_runtime_key})`
         : undefined}
       bind:open={pruneDialogOpen}
-      oncompleted={() => refresh()}
+      oncompleted={refreshRuntime}
     />
   {/if}
 </div>

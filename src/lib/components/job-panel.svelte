@@ -3,6 +3,7 @@
   import * as Dialog from "$lib/components/ui/dialog/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
   import StatusBadge from "./status-badge.svelte";
+  import RuntimeIdentity from "./runtime-identity.svelte";
   import {
     ArrowDown,
     ArrowUp,
@@ -29,6 +30,7 @@
   import { isImageBuildResult } from "$lib/jobs/build-job";
   import { isJobExecutionResult } from "$lib/jobs/transfer-job";
   import { relativeTime } from "$lib/utils";
+  import { presentRuntimeAttribution } from "$lib/runtime/presentation";
 
   type StepStatus = "pending" | "running" | "succeeded" | "failed" | "skipped" | "cancelled";
   type Step = {
@@ -388,6 +390,9 @@
           <li class="flex items-center gap-2 rounded-md border px-2 py-1">
             <span class="font-medium">{pastJob.kind}</span>
             <StatusBadge status={pastJob.status} />
+            <div class="min-w-0 flex-1">
+              <RuntimeIdentity presentation={presentRuntimeAttribution(pastJob)} compact />
+            </div>
             <span class="text-muted-foreground ml-auto text-xs">
               {relativeTime(pastJob.created_at_ms)}
             </span>

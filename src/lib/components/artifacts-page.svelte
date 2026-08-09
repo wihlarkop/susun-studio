@@ -3,31 +3,26 @@
   import { Badge } from "$lib/components/ui/badge/index.js";
   import { Boxes } from "@lucide/svelte";
   import { resolveActiveEngineId } from "$lib/engine-identity";
-  import type { RuntimePreference, RuntimeProfile, StudioProject } from "$lib/daemon/client";
+  import type { RuntimePreference, StudioProject } from "$lib/daemon/client";
   import ArtifactsContainersTab from "./artifacts-containers-tab.svelte";
   import ArtifactsImagesTab from "./artifacts-images-tab.svelte";
   import ArtifactsBuildsTab from "./artifacts-builds-tab.svelte";
   import ArtifactsBuildCacheTab from "./artifacts-build-cache-tab.svelte";
   import ArtifactsRegistryTab from "./artifacts-registry-tab.svelte";
+  import RuntimeIdentity from "./runtime-identity.svelte";
+  import { presentRuntimeBinding } from "$lib/runtime/presentation";
 
   let {
-    profiles,
     runtimePreference,
     connected,
     projects,
   }: {
-    profiles: RuntimeProfile[];
     runtimePreference: RuntimePreference | undefined;
     connected: boolean;
     projects: StudioProject[];
   } = $props();
 
   const binding = $derived(runtimePreference?.binding ?? null);
-  const selected = $derived(
-    binding?.profile_id
-      ? (profiles.find((profile) => profile.id === binding.profile_id) ?? null)
-      : null,
-  );
   const engineId = $derived(binding ? resolveActiveEngineId(binding) : null);
 </script>
 
@@ -36,18 +31,8 @@
     <Boxes class="size-4 text-muted-foreground" />
     <h3 class="text-lg font-semibold">Artifacts</h3>
     <span class="text-sm text-muted-foreground">on</span>
-    {#if binding?.state === "unconfigured"}
-      <Badge variant="outline">Platform default (Local Docker)</Badge>
-    {:else if binding}
-      <span class="text-sm font-medium">{binding.display_name}</span>
-      <Badge variant={binding.state === "ready" ? "secondary" : "destructive"}>
-        {binding.state}
-      </Badge>
-      {#if selected}
-        <Badge variant={selected.runtime_class === "built_in" ? "default" : "secondary"}>
-          {selected.runtime_class === "built_in" ? "Built-in" : "External"}
-        </Badge>
-      {/if}
+    {#if binding}
+      <RuntimeIdentity presentation={presentRuntimeBinding(binding)} compact />
     {:else}
       <Badge variant="outline">Loading runtime policy</Badge>
     {/if}

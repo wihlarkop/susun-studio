@@ -96,6 +96,7 @@ export type StudioProject = {
   name: string;
   path: string;
   created_at_ms: number;
+  last_opened_at_ms: number | null;
   last_analyzed_at_ms: number | null;
   has_errors: boolean | null;
   summary: StudioProjectSummary | null;
@@ -241,6 +242,15 @@ export type RuntimeBindingSummary = {
 export type RuntimePreference = {
   preferred_profile_id: string | null;
   binding: RuntimeBindingSummary;
+};
+
+export type RuntimeOnboardingChoice = "built_in" | "existing";
+
+export type RuntimeOnboardingState = {
+  state: "pending" | "completed" | "dismissed";
+  choice: RuntimeOnboardingChoice | null;
+  completed_at_ms: number | null;
+  updated_at_ms: number;
 };
 
 /** Redacted runtime provenance persisted with work and immediate responses. */
@@ -621,6 +631,16 @@ export async function listProjects(options: DaemonRequestOptions = {}): Promise<
   return response.projects;
 }
 
+export async function markProjectOpened(
+  projectId: string,
+  options: DaemonRequestOptions = {},
+): Promise<StudioProject> {
+  return readJson(`/v1/projects/${encodeURIComponent(projectId)}/opened`, {
+    ...options,
+    method: "POST",
+  });
+}
+
 export async function createProject(
   project: Pick<StudioProject, "name" | "path">,
   options: DaemonRequestOptions = {},
@@ -736,6 +756,35 @@ export async function setPreferredRuntime(
     method: "PUT",
     body: { preferred_profile_id: preferredProfileId },
   });
+}
+
+export async function readRuntimeOnboarding(
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeOnboardingState> {
+  return readJson("/v1/runtime/onboarding", options);
+}
+
+export async function completeRuntimeOnboarding(
+  choice: RuntimeOnboardingChoice,
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeOnboardingState> {
+  return readJson("/v1/runtime/onboarding/complete", {
+    ...options,
+    method: "POST",
+    body: { choice },
+  });
+}
+
+export async function dismissRuntimeOnboarding(
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeOnboardingState> {
+  return readJson("/v1/runtime/onboarding/dismiss", { ...options, method: "POST" });
+}
+
+export async function reopenRuntimeOnboarding(
+  options: DaemonRequestOptions = {},
+): Promise<RuntimeOnboardingState> {
+  return readJson("/v1/runtime/onboarding/reopen", { ...options, method: "POST" });
 }
 
 export async function prepareRuntimeAction(

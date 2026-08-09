@@ -98,6 +98,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "runtime_policy",
         sql: include_str!("../migrations/0019_runtime_policy.sql"),
     },
+    Migration {
+        version: 20,
+        name: "runtime_onboarding",
+        sql: include_str!("../migrations/0020_runtime_onboarding.sql"),
+    },
+    Migration {
+        version: 21,
+        name: "project_recency",
+        sql: include_str!("../migrations/0021_project_recency.sql"),
+    },
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -304,6 +314,16 @@ mod tests {
             .await?;
         let conn = db.connect()?;
         apply_migrations_upto(&conn, 18).await?;
+        Ok((db, conn, path))
+    }
+
+    async fn version_nineteen_database() -> TestResult<(Database, Connection, PathBuf)> {
+        let path = unique_db_path();
+        let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
+            .build()
+            .await?;
+        let conn = db.connect()?;
+        apply_migrations_upto(&conn, 19).await?;
         Ok((db, conn, path))
     }
 
@@ -596,6 +616,94 @@ mod tests {
             .await?
             .ok_or_else(|| std::io::Error::other("singleton runtime policy row"))?;
         assert!(row.get::<Option<String>>(0)?.is_none());
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_onboarding_migration_enforces_singleton_vocabulary_and_preserves_state()
+    -> TestResult {
+        let (_db, conn, path) = version_nineteen_database().await?;
+
+        apply_pending_migrations(&conn).await?;
+
+        assert_eq!(
+            strings(
+                &conn,
+                "SELECT state || '|' || COALESCE(choice, '') || '|' ||
+                        COALESCE(CAST(completed_at_ms AS TEXT), '')
+                 FROM runtime_onboarding WHERE singleton = 1",
+            )
+            .await?,
+            vec!["pending||".to_owned()]
+        );
+        for sql in [
+            "INSERT INTO runtime_onboarding (singleton, state, choice, completed_at_ms, updated_at_ms)
+             VALUES (2, 'pending', NULL, NULL, 1)",
+            "UPDATE runtime_onboarding SET state = 'unknown' WHERE singleton = 1",
+            "UPDATE runtime_onboarding SET choice = 'other' WHERE singleton = 1",
+        ] {
+            assert!(conn.execute(sql, ()).await.is_err());
+        }
+
+        conn.execute(
+            "UPDATE runtime_onboarding
+             SET state = 'dismissed', choice = NULL, completed_at_ms = NULL, updated_at_ms = 2
+             WHERE singleton = 1",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "UPDATE runtime_onboarding
+             SET state = 'pending', choice = NULL, completed_at_ms = NULL, updated_at_ms = 3
+             WHERE singleton = 1",
+            (),
+        )
+        .await?;
+        assert_eq!(
+            strings(
+                &conn,
+                "SELECT state FROM runtime_onboarding WHERE singleton = 1"
+            )
+            .await?,
+            vec!["pending".to_owned()]
+        );
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn project_recency_migration_is_registered() {
+        assert_eq!(latest_migration_version(), 21);
+    }
+
+    #[tokio::test]
+    async fn project_recency_migration_preserves_existing_projects_with_null_recency() -> TestResult
+    {
+        let (_db, conn, path) = version_nineteen_database().await?;
+        conn.execute(
+            "INSERT INTO projects (id, name, path, created_at_ms)
+             VALUES ('existing', 'Existing', 'C:/projects/existing', 1)",
+            (),
+        )
+        .await?;
+
+        apply_pending_migrations(&conn).await?;
+
+        let mut rows = conn
+            .query(
+                "SELECT id, last_opened_at_ms FROM projects WHERE id = 'existing'",
+                (),
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| std::io::Error::other("existing project"))?;
+        assert_eq!(row.get::<String>(0)?, "existing");
+        assert_eq!(row.get::<Option<i64>>(1)?, None);
 
         let _ = std::fs::remove_file(path);
         Ok(())

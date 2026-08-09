@@ -68,6 +68,10 @@ pub fn app(state: AppState) -> Router {
             get(projects::list_projects).post(projects::create_project),
         )
         .route("/v1/projects/import", post(projects::import_project))
+        .route(
+            "/v1/projects/{id}/opened",
+            post(projects::mark_project_opened),
+        )
         .route("/v1/projects/{id}", delete(projects::delete_project))
         .route(
             "/v1/projects/{id}/engine",
@@ -138,6 +142,22 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/v1/runtime/policy",
             get(runtime::read_runtime_policy).put(runtime::set_runtime_policy),
+        )
+        .route(
+            "/v1/runtime/onboarding",
+            get(runtime::read_runtime_onboarding),
+        )
+        .route(
+            "/v1/runtime/onboarding/complete",
+            post(runtime::complete_runtime_onboarding),
+        )
+        .route(
+            "/v1/runtime/onboarding/dismiss",
+            post(runtime::dismiss_runtime_onboarding),
+        )
+        .route(
+            "/v1/runtime/onboarding/reopen",
+            post(runtime::reopen_runtime_onboarding),
         )
         .route("/v1/runtime/logs", get(runtime::runtime_logs))
         .route("/v1/runtime/profiles", get(runtime::list_runtime_profiles))

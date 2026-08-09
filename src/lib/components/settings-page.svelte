@@ -15,11 +15,20 @@
   import {
     readRuntimeUninstallPolicy,
     setDaemonConnection,
+    type RuntimeOnboardingState,
     type RuntimeUninstallPolicy,
   } from "$lib/daemon/client";
   import { checkForUpdate, type UpdateCheckResult } from "$lib/tauri/updater";
 
   type UpdateUiState = "idle" | "checking" | "none" | "available" | "installing" | "failed";
+
+  let {
+    onboarding,
+    onRunRuntimeSetup,
+  }: {
+    onboarding: RuntimeOnboardingState | undefined;
+    onRunRuntimeSetup: () => void;
+  } = $props();
 
   type RestorePreview = {
     compatible: boolean;
@@ -237,6 +246,14 @@
     if (updateState === "failed") return "Failed";
     return "Not checked";
   }
+
+  function onboardingLabel(): string {
+    if (!onboarding) return "Waiting for daemon";
+    if (onboarding.state === "completed") {
+      return onboarding.choice === "built_in" ? "Susun Runtime" : "Existing runtime";
+    }
+    return onboarding.state === "dismissed" ? "Dismissed" : "Not chosen";
+  }
 </script>
 
 <div class="flex flex-col gap-4">
@@ -246,6 +263,31 @@
       Manage app maintenance actions that are outside a single project or runtime.
     </p>
   </div>
+
+  <Card.Root class="gap-0 overflow-hidden p-0">
+    <div class="grid gap-4 p-4 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
+      <div class="flex min-w-0 gap-3">
+        <div class="flex size-9 shrink-0 items-center justify-center rounded-md border bg-background">
+          <ShieldCheck class="size-4 text-muted-foreground" />
+        </div>
+        <div class="min-w-0">
+          <div class="flex flex-wrap items-center gap-2">
+            <h4 class="text-base font-semibold">Runtime setup</h4>
+            <Badge variant={onboarding?.state === "completed" ? "default" : "secondary"}>
+              {onboardingLabel()}
+            </Badge>
+          </div>
+          <p class="mt-1 max-w-2xl text-sm text-muted-foreground">
+            Review Susun Runtime or choose an external runtime without changing the current preference until you confirm.
+          </p>
+        </div>
+      </div>
+      <Button variant="outline" disabled={!onboarding} onclick={onRunRuntimeSetup}>
+        <RefreshCw />
+        Run setup again
+      </Button>
+    </div>
+  </Card.Root>
 
   <Card.Root class="gap-0 overflow-hidden p-0">
     <div class="border-b bg-muted/20 p-4">

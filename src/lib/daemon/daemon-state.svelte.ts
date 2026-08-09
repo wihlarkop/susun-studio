@@ -2,7 +2,9 @@ import {
   getDaemonBaseUrl,
   importProject as importProjectRequest,
   listProjects,
+  markProjectOpened as markProjectOpenedRequest,
   readDaemonHealth,
+  readRuntimeOnboarding,
   readRuntimeStatus,
   readSettings,
   updateSettings as updateSettingsRequest,
@@ -11,10 +13,12 @@ import {
   type ImportProjectResponse,
   type RuntimeProfile,
   type RuntimePreference,
+  type RuntimeOnboardingState,
   type RuntimeStatus,
   type StudioProject,
   type StudioSettings,
 } from "$lib/daemon/client";
+import { syncTrayRuntimeSummary } from "$lib/tauri/tray";
 
 export type HealthState =
   | { kind: "checking"; label: "Checking"; detail: string; health?: undefined }
@@ -32,7 +36,10 @@ export function createDaemonState() {
   let projects = $state<StudioProject[]>([]);
   let runtimeProfiles = $state<RuntimeProfile[]>([]);
   let runtimeStatus = $state<RuntimeStatus | undefined>(undefined);
+  let runtimeOnboarding = $state<RuntimeOnboardingState | undefined>(undefined);
   let settings = $state<StudioSettings | undefined>(undefined);
+  let refreshing = $state(false);
+  let refreshGeneration = 0;
   let workspaceDetail = $state(
     "Persisted projects will appear here after the daemon API is wired.",
   );
@@ -44,18 +51,29 @@ export function createDaemonState() {
   }
 
   async function refresh(signal?: AbortSignal) {
+    const generation = ++refreshGeneration;
+    refreshing = true;
+
     try {
       const health = await readDaemonHealth(getDaemonBaseUrl(), signal);
-      const [projectList, daemonSettings, nextRuntimeStatus] = await Promise.all([
-        listProjects({ signal }),
-        readSettings({ signal }),
-        readRuntimeStatus({ signal }),
-      ]);
+      const [projectList, daemonSettings, nextRuntimeStatus, nextRuntimeOnboarding] =
+        await Promise.all([
+          listProjects({ signal }),
+          readSettings({ signal }),
+          readRuntimeStatus({ signal }),
+          readRuntimeOnboarding({ signal }),
+        ]);
+
+      if (signal?.aborted || generation !== refreshGeneration) {
+        return;
+      }
 
       projects = projectList;
       settings = daemonSettings;
       runtimeStatus = nextRuntimeStatus;
+      runtimeOnboarding = nextRuntimeOnboarding;
       runtimeProfiles = nextRuntimeStatus.providers.flatMap((provider) => provider.profiles);
+      void syncTrayRuntimeSummary(nextRuntimeStatus);
       workspaceDetail = describeWorkspace(projectList);
       healthState = {
         kind: "connected",
@@ -64,13 +82,15 @@ export function createDaemonState() {
         health,
       };
     } catch (error) {
-      if (signal?.aborted) {
+      if (signal?.aborted || generation !== refreshGeneration) {
         return;
       }
 
       projects = [];
       runtimeProfiles = [];
       runtimeStatus = undefined;
+      void syncTrayRuntimeSummary(undefined);
+      runtimeOnboarding = undefined;
       settings = undefined;
       workspaceDetail = "Start the local daemon to load projects and settings.";
       healthState = {
@@ -78,6 +98,10 @@ export function createDaemonState() {
         label: "Disconnected",
         detail: error instanceof Error ? error.message : "Daemon health request failed",
       };
+    } finally {
+      if (generation === refreshGeneration) {
+        refreshing = false;
+      }
     }
   }
 
@@ -118,6 +142,16 @@ export function createDaemonState() {
     }
   }
 
+  async function markProjectOpened(projectId: string): Promise<void> {
+    try {
+      const updated = await markProjectOpenedRequest(projectId);
+      projects = projects.map((project) => (project.id === updated.id ? updated : project));
+    } catch {
+      // Opening remains local and immediate. A transient daemon write failure
+      // leaves the existing recency ordering in place until the next refresh.
+    }
+  }
+
   return {
     get healthState() {
       return healthState;
@@ -134,6 +168,12 @@ export function createDaemonState() {
     get runtimePreference(): RuntimePreference | undefined {
       return runtimeStatus?.policy;
     },
+    get runtimeOnboarding() {
+      return runtimeOnboarding;
+    },
+    get refreshing() {
+      return refreshing;
+    },
     get settings() {
       return settings;
     },
@@ -141,6 +181,7 @@ export function createDaemonState() {
       return workspaceDetail;
     },
     importProject,
+    markProjectOpened,
     refresh: () => refresh(),
     setLastProjectId,
   };
