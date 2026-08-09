@@ -481,11 +481,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_onboarding_completion_request_is_strict() {
+    fn runtime_onboarding_completion_request_is_strict() -> Result<(), serde_json::Error> {
         let request = serde_json::from_value::<RuntimeOnboardingCompleteRequest>(
             serde_json::json!({ "choice": "existing" }),
-        )
-        .expect("valid onboarding choice");
+        )?;
         assert_eq!(
             request.choice,
             runtime::onboarding::OnboardingChoice::Existing
@@ -502,6 +501,7 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
     }
 
     #[tokio::test]
