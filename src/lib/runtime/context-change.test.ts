@@ -8,6 +8,7 @@ import {
   canCommitContextChange,
   createContextChangeState,
   resolveContextCommit,
+  isProjectImpactPreview,
 } from "./context-change";
 
 const preview: RuntimePreferenceImpactPreview = {
@@ -57,5 +58,28 @@ describe("runtime context change state", () => {
     expect(boundedContextReason("active_work")).toBe(
       "Stop the running work, then preview this change again.",
     );
+  });
+
+  it("keeps global inherited impact separate from a single project pin", () => {
+    expect(isProjectImpactPreview(preview)).toBe(false);
+    const projectPreview = {
+      ...preview,
+      project_id: "project-a",
+    };
+    delete (projectPreview as Partial<RuntimePreferenceImpactPreview>).inheriting_project_count;
+    delete (projectPreview as Partial<RuntimePreferenceImpactPreview>)
+      .explicitly_pinned_project_count;
+    expect(isProjectImpactPreview(projectPreview)).toBe(true);
+  });
+
+  it("disables commits for unavailable targets and active-work blockers", () => {
+    const target = { kind: "preference" as const, profileId: "new" };
+    const loading = beginContextPreview(createContextChangeState(), target);
+    const unavailable = acceptContextPreview(loading, loading.generation, target, {
+      ...preview,
+      change_allowed: false,
+      reason_code: "target_unavailable",
+    });
+    expect(canCommitContextChange(unavailable)).toBe(false);
   });
 });

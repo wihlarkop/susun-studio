@@ -126,3 +126,11 @@ export function acceptsCompatibilityResult(
 ): boolean {
   return requestedProfileId === currentProfileId && requestGeneration === currentGeneration;
 }
+
+export function shouldRequestCompatibility(
+  expanded: boolean,
+  requestedProfileId: string,
+  currentProfileId: string | null,
+): boolean {
+  return expanded && requestedProfileId === currentProfileId;
+}

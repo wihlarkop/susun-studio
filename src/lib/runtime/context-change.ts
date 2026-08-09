@@ -111,3 +111,9 @@ export function sameTarget(
     left.kind !== "project" || (right.kind === "project" && left.projectId === right.projectId)
   );
 }
+
+export function isProjectImpactPreview(
+  preview: ContextImpactPreview,
+): preview is ProjectRuntimeImpactPreview {
+  return "project_id" in preview;
+}

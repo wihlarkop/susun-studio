@@ -5,6 +5,7 @@ import {
   boundedCompatibilityError,
   compatibilityGroups,
   compatibilityLevelLabel,
+  shouldRequestCompatibility,
 } from "./compatibility";
 
 describe("runtime compatibility presentation", () => {
@@ -41,5 +42,11 @@ describe("runtime compatibility presentation", () => {
   it("rejects stale compatibility responses after a profile change", () => {
     expect(acceptsCompatibilityResult("old", 1, "new", 2)).toBe(false);
     expect(acceptsCompatibilityResult("current", 3, "current", 3)).toBe(true);
+  });
+
+  it("only requests compatibility for the expanded current profile", () => {
+    expect(shouldRequestCompatibility(false, "podman", "podman")).toBe(false);
+    expect(shouldRequestCompatibility(true, "podman", "docker")).toBe(false);
+    expect(shouldRequestCompatibility(true, "podman", "podman")).toBe(true);
   });
 });
