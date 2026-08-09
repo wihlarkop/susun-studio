@@ -2,6 +2,7 @@ mod backup;
 mod daemon;
 mod diagnostics;
 mod restore;
+mod tray;
 
 use daemon::DaemonSupervisor;
 use log::{error, info};
@@ -26,6 +27,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(DaemonSupervisor::default())
+        .setup(|app| Ok(tray::setup(app)?))
         .invoke_handler(tauri::generate_handler![
             resolve_daemon_connection,
             export_diagnostics_bundle,
